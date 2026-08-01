@@ -1,0 +1,4 @@
+title,company,description,location,work_mode
+Machine Learning Engineer,DataForge Inc,"Build and deploy ML models using Python, PyTorch, and scikit-learn. Work with large datasets and MLOps pipelines. 2+ years experience required.",Detroit,hybrid
+Backend Engineer (Python),Cloudspan,"Design REST APIs with FastAPI and PostgreSQL. Docker and AWS experience preferred. 1-3 years experience.",Remote,remote
+AI Research Assistant,Lakeshore Labs,"Support LLM evaluation and RAG experiments. Python, LangChain, and FAISS. Entry level welcome.",Ann Arbor,onsite
