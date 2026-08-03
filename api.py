@@ -1,7 +1,8 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.responses import HTMLResponse
 import psycopg2, os
 from dotenv import load_dotenv
+from agent import run_agent
 
 load_dotenv()
 app = FastAPI(title="AgentOps Monitor")
@@ -27,6 +28,8 @@ def dashboard():
     h1 { margin: 0; font-size: 20px; }
     .sub { color: #8b8f9c; font-size: 13px; margin-top: 4px; }
     .container { padding: 24px 32px; }
+    button { background: #2563eb; color: white; border: none; padding: 10px 18px; border-radius: 6px; font-size: 14px; cursor: pointer; margin-bottom: 20px; }
+    button:disabled { background: #374151; cursor: default; }
     table { width: 100%; border-collapse: collapse; }
     th { text-align: left; padding: 10px 12px; color: #8b8f9c; font-size: 12px; text-transform: uppercase; border-bottom: 1px solid #2a2e3a; }
     td { padding: 10px 12px; border-bottom: 1px solid #1e2129; font-size: 14px; }
@@ -35,6 +38,7 @@ def dashboard():
     .success { background: #14361f; color: #4ade80; }
     .errors { background: #3a2814; color: #fbbf24; }
     .failed { background: #3a1518; color: #f87171; }
+    .running { background: #1e2a4a; color: #60a5fa; }
     .detail { margin-top: 24px; }
     .step { background: #171a22; border: 1px solid #2a2e3a; border-radius: 6px; padding: 12px 16px; margin-bottom: 8px; }
     .review { border-color: #fbbf24; }
@@ -49,6 +53,7 @@ def dashboard():
     <div class="sub">AI job-search agent observability</div>
   </header>
   <div class="container">
+    <button id="startBtn" onclick="startRun()">&#9654; Start New Run</button>
     <table id="runs">
       <thead><tr><th>Run</th><th>Status</th><th>Started</th><th>Tokens</th><th>Cost</th></tr></thead>
       <tbody></tbody>
@@ -63,7 +68,10 @@ def dashboard():
       const tbody = document.querySelector('#runs tbody');
       tbody.innerHTML = '';
       for (const r of runs) {
-        const cls = r.status === 'success' ? 'success' : r.status === 'failed' ? 'failed' : 'errors';
+        let cls = 'errors';
+        if (r.status === 'success') cls = 'success';
+        else if (r.status === 'failed') cls = 'failed';
+        else if (r.status === 'running') cls = 'running';
         const tr = document.createElement('tr');
         tr.innerHTML = `<td>#${r.id}</td>
           <td><span class="status ${cls}">${r.status}</span></td>
@@ -94,6 +102,18 @@ def dashboard():
       d.scrollIntoView({ behavior: 'smooth' });
     }
 
+    async function startRun() {
+      const btn = document.getElementById('startBtn');
+      btn.disabled = true;
+      btn.textContent = 'Starting...';
+      const res = await fetch('/runs', { method: 'POST' });
+      const data = await res.json();
+      alert(data.message);
+      btn.disabled = false;
+      btn.innerHTML = '&#9654; Start New Run';
+      setTimeout(loadRuns, 2000);
+    }
+
     loadRuns();
   </script>
 </body>
@@ -117,6 +137,12 @@ def list_runs(limit: int = 20):
          "total_tokens": r[3], "total_cost": float(r[4]) if r[4] else 0}
         for r in rows
     ]
+
+
+@app.post("/runs")
+def start_run(background_tasks: BackgroundTasks):
+    background_tasks.add_task(run_agent)
+    return {"message": "Run started in background. Refresh the run list to watch it appear."}
 
 
 @app.get("/runs/{run_id}")
