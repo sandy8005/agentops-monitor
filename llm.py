@@ -165,30 +165,48 @@ def finish_run(run_id, status="success"):
 
 def logged_llm_call(prompt, run_id, step_id):
     start = time.time()
-    result = real_llm(prompt)
-    end = time.time()
+    try:
+        result = real_llm(prompt)
+        end = time.time()
+        latency_ms = int((end - start) * 1000)
 
-    latency_ms = int((end - start) * 1000)
+        prompt_tokens = result["prompt_tokens"]
+        completion_tokens = result["completion_tokens"]
+        cost_usd = (prompt_tokens + completion_tokens) * 0.000001
 
-    prompt_tokens = result["prompt_tokens"]
-    completion_tokens = result["completion_tokens"]
-    cost_usd = (prompt_tokens + completion_tokens) * 0.000001
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO llm_calls
+            (run_id, step_id, model, prompt, response,
+             prompt_tokens, completion_tokens, latency_ms, cost_usd, created_at, status)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'success')
+        """, (
+            run_id, step_id, "gemini-flash-latest", prompt, result["text"],
+            prompt_tokens, completion_tokens, latency_ms, cost_usd, datetime.now()
+        ))
+        conn.commit()
+        conn.close()
+        return result["text"]
 
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO llm_calls
-        (run_id, step_id, model, prompt, response,
-         prompt_tokens, completion_tokens, latency_ms, cost_usd, created_at)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-    """, (
-        run_id, step_id, "gemini-flash-latest", prompt, result["text"],
-        prompt_tokens, completion_tokens, latency_ms, cost_usd, datetime.now()
-    ))
-    conn.commit()
-    conn.close()
+    except Exception as e:
+        end = time.time()
+        latency_ms = int((end - start) * 1000)
 
-    return result["text"]
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO llm_calls
+            (run_id, step_id, model, prompt, response,
+             prompt_tokens, completion_tokens, latency_ms, cost_usd, created_at, status, error_message)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'failed', %s)
+        """, (
+            run_id, step_id, "gemini-flash-latest", prompt, None,
+            0, 0, latency_ms, 0, datetime.now(), str(e)
+        ))
+        conn.commit()
+        conn.close()
+        raise
 
 
 def logged_tool_call(tool_name, tool_func, tool_input, run_id, step_id):

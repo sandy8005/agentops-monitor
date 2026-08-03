@@ -57,6 +57,8 @@ def run_agent():
             "receive_user_input", receive_user_input,
             "user_input.json", run_id, step_id
         )
+        if user_input is None:
+            raise RuntimeError("receive_user_input returned no data")
         finish_step(step_id, "success")
     except Exception as e:
         fail_step(step_id, e)
@@ -74,6 +76,8 @@ def run_agent():
             "read_resume_file", read_resume_file,
             user_input["resume_file"], run_id, step_id
         )
+        if not resume_text:
+            raise RuntimeError("read_resume_file returned no text")
         finish_step(step_id, "success")
     except Exception as e:
         fail_step(step_id, e)
@@ -104,6 +108,8 @@ def run_agent():
             lambda _: search_jobs(user_input["target_role"], user_input["location"]),
             "query", run_id, step_id
         )
+        if not jobs:
+            raise RuntimeError("search_jobs returned no jobs")
         finish_step(step_id, "success")
     except Exception as e:
         fail_step(step_id, e)
@@ -127,6 +133,8 @@ def run_agent():
                 {"resume": resume_text, "job_description": job["description"]},
                 run_id, step_id
             )
+            if overlap is None:
+                raise RuntimeError("keyword_overlap_tool returned no result")
 
             requirements = extract_requirements(job, run_id, step_id)
 
@@ -159,8 +167,6 @@ def run_agent():
                 "candidate_years": parsed["years_experience"]
             })
 
-            finish_step(step_id, "success")
-
             results.append({
                 "title": job["title"],
                 "company": job["company"],
@@ -186,6 +192,9 @@ def run_agent():
                 print(f"\n  STRATEGY: {strategy.strip()}")
                 print(f"\n  RESUME EDITS: {edits.strip()}\n")
 
+            # only mark the step complete once ALL its work (including advice) is done
+            finish_step(step_id, "success")
+
         except Exception as e:
             failures += 1
             fail_step(step_id, e)
@@ -193,12 +202,25 @@ def run_agent():
 
         print("-" * 60)
 
+    # Step N+1: rank jobs — now a monitored step
+    rank_step_id = create_step(run_id, "rank_jobs", len(jobs) + 4)
+    try:
+        ranked = logged_tool_call(
+            "rank_jobs", lambda _: rank_jobs(results),
+            "results", run_id, rank_step_id
+        )
+        if ranked is None:
+            ranked = []
+        finish_step(rank_step_id, "success")
+    except Exception as e:
+        fail_step(rank_step_id, e)
+        ranked = results  # fall back to unranked so we still print something
+
     overall_status = "success" if failures == 0 else "completed_with_errors"
     finish_run(run_id, overall_status)
     print(f"Run {run_id} complete. {failures} failure(s).")
 
-    # Step 8: rank and display
-    ranked = rank_jobs(results)
+    # display ranked results
     print("\n" + "=" * 60)
     print("RANKED JOBS (best match first):")
     print("=" * 60)
