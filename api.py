@@ -4,6 +4,7 @@ from datetime import datetime
 import psycopg2, os
 from dotenv import load_dotenv
 from agent import run_agent
+from llm import create_run
 
 load_dotenv()
 app = FastAPI(title="AgentOps Monitor")
@@ -49,6 +50,8 @@ def dashboard():
     .flag { color: #fbbf24; font-size: 12px; font-weight: 600; }
     .agree { color: #4ade80; }
     .reviewed { color: #60a5fa; font-size: 12px; font-weight: 600; }
+    .call { color: #8b8f9c; font-size: 12px; margin-left: 16px; margin-top: 4px; }
+    .call-failed { color: #f87171; }
     h2 { font-size: 16px; margin: 8px 0 16px; }
     .section-title { font-size: 14px; color: #8b8f9c; text-transform: uppercase; margin: 24px 0 8px; }
   </style>
@@ -98,7 +101,7 @@ def dashboard():
     async function review(stepId, decision) {
       const res = await fetch('/steps/' + stepId + '/review?decision=' + decision, { method: 'POST' });
       if (res.ok) {
-        loadPending();   // refresh the queue
+        loadPending();
       } else {
         const err = await res.json();
         alert('Error: ' + (err.detail || 'failed'));
@@ -145,6 +148,16 @@ def dashboard():
             html += ` <span class="agree">&#10003;</span>`;
           }
         }
+        // tool calls
+        for (const t of (s.tool_calls || [])) {
+          const fc = t.status === 'failed' ? 'call-failed' : '';
+          html += `<div class="call ${fc}">tool: ${t.tool_name} [${t.status}] ${t.latency_ms}ms</div>`;
+        }
+        // llm calls
+        for (const l of (s.llm_calls || [])) {
+          const fc = l.status === 'failed' ? 'call-failed' : '';
+          html += `<div class="call ${fc}">llm: ${l.prompt_tokens}+${l.completion_tokens} tok, ${l.latency_ms}ms, $${l.cost_usd} [${l.status}]</div>`;
+        }
         html += `</div>`;
       }
       d.innerHTML = html;
@@ -160,7 +173,7 @@ def dashboard():
       alert(data.message);
       btn.disabled = false;
       btn.innerHTML = '&#9654; Start New Run';
-      setTimeout(loadRuns, 2000);
+      setTimeout(() => { loadRuns(); loadDetail(data.run_id); }, 2000);
     }
 
     loadPending();
@@ -191,8 +204,9 @@ def list_runs(limit: int = 20):
 
 @app.post("/runs")
 def start_run(background_tasks: BackgroundTasks):
-    background_tasks.add_task(run_agent)
-    return {"message": "Run started in background. Refresh the run list to watch it appear."}
+    run_id = create_run("job search run (dashboard)")
+    background_tasks.add_task(run_agent, run_id)
+    return {"run_id": run_id, "message": f"Run {run_id} started in background."}
 
 
 @app.get("/runs/{run_id}")
@@ -214,13 +228,39 @@ def get_run(run_id: int):
                llm_decision, needs_human_review, review_status
         FROM steps WHERE run_id = %s ORDER BY step_order
     """, (run_id,))
-    steps = [
-        {"id": s[0], "step_name": s[1], "status": s[2],
-         "match_score": float(s[3]) if s[3] is not None else None,
-         "score_decision": s[4], "llm_decision": s[5],
-         "needs_human_review": s[6], "review_status": s[7]}
-        for s in cur.fetchall()
-    ]
+    step_rows = cur.fetchall()
+
+    steps = []
+    for s in step_rows:
+        step_id = s[0]
+        # tool calls for this step
+        cur.execute("""
+            SELECT tool_name, status, latency_ms
+            FROM tool_calls WHERE step_id = %s ORDER BY id
+        """, (step_id,))
+        tool_calls = [
+            {"tool_name": t[0], "status": t[1], "latency_ms": t[2]}
+            for t in cur.fetchall()
+        ]
+        # llm calls for this step
+        cur.execute("""
+            SELECT prompt_tokens, completion_tokens, latency_ms, cost_usd, status
+            FROM llm_calls WHERE step_id = %s ORDER BY id
+        """, (step_id,))
+        llm_calls = [
+            {"prompt_tokens": l[0], "completion_tokens": l[1], "latency_ms": l[2],
+             "cost_usd": float(l[3]) if l[3] is not None else 0, "status": l[4]}
+            for l in cur.fetchall()
+        ]
+
+        steps.append({
+            "id": step_id, "step_name": s[1], "status": s[2],
+            "match_score": float(s[3]) if s[3] is not None else None,
+            "score_decision": s[4], "llm_decision": s[5],
+            "needs_human_review": s[6], "review_status": s[7],
+            "tool_calls": tool_calls, "llm_calls": llm_calls
+        })
+
     conn.close()
 
     return {

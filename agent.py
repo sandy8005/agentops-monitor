@@ -53,13 +53,16 @@ Reason: <one sentence explaining why>
     return prompt
 
 
-def run_agent():
+def run_agent(run_id=None):
     # Pre-check: don't waste time if the daily quota is already spent
     if not quota_available():
         print("⚠ API quota exhausted — skipping run. Try again after reset.")
+        if run_id is not None:
+            finish_run(run_id, "failed")
         return
 
-    run_id = create_run("job search run")
+    if run_id is None:
+        run_id = create_run("job search run")
     failures = 0
 
     # Step 0: receive_user_input
