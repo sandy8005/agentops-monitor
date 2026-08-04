@@ -15,6 +15,18 @@ from llm import (
 from tools import keyword_overlap_tool
 
 
+def normalize_decision(raw):
+    """Map any LLM decision text to one of: Apply, Maybe, Skip, or Unknown."""
+    text = raw.lower()
+    if "apply" in text:
+        return "Apply"
+    if "maybe" in text:
+        return "Maybe"
+    if "skip" in text:
+        return "Skip"
+    return "Unknown"
+
+
 def build_prompt(resume_text, parsed, job, overlap, requirements):
     prompt = f"""
 You are a hiring assistant. Compare the candidate below against the job posting.
@@ -141,11 +153,11 @@ def run_agent():
             prompt = build_prompt(resume_text, parsed, job, overlap, requirements)
             result = logged_llm_call(prompt, run_id, step_id)
 
-            # extract the LLM's decision word
+            # extract and normalize the LLM's decision
             llm_decision = "Unknown"
             for line in result.splitlines():
                 if line.lower().startswith("decision:"):
-                    llm_decision = line.split(":", 1)[1].strip()
+                    llm_decision = normalize_decision(line.split(":", 1)[1])
                     break
 
             # deterministic score
@@ -202,7 +214,7 @@ def run_agent():
 
         print("-" * 60)
 
-    # Step N+1: rank jobs — now a monitored step
+    # Step N+1: rank jobs — a monitored step
     rank_step_id = create_step(run_id, "rank_jobs", len(jobs) + 4)
     try:
         ranked = logged_tool_call(
