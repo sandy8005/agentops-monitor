@@ -1,4 +1,5 @@
 import requests
+import re
 import psycopg2, os
 from dotenv import load_dotenv
 load_dotenv()
@@ -16,7 +17,7 @@ def import_jobs_from_api(search_term="python", limit=5):
     params = {"search": search_term, "limit": limit}
 
     resp = requests.get(url, params=params, timeout=15)
-    resp.raise_for_status()          # raise on HTTP error (4xx/5xx)
+    resp.raise_for_status()
     data = resp.json()
 
     jobs = data.get("jobs", [])[:limit]
@@ -27,14 +28,15 @@ def import_jobs_from_api(search_term="python", limit=5):
     conn = get_connection()
     cur = conn.cursor()
 
+    # idempotent: clear previous API imports so re-running doesn't duplicate
+    cur.execute("DELETE FROM job_postings WHERE source = 'api'")
+
     imported = 0
     for job in jobs:
         title = job.get("title", "").strip()
         company = job.get("company_name", "").strip()
-        # the API returns HTML in the description — strip tags crudely for now
         description = job.get("description", "")
-        import re
-        description = re.sub(r"<[^>]+>", " ", description)     # remove HTML tags
+        description = re.sub(r"<[^>]+>", " ", description)          # strip HTML tags
         description = re.sub(r"\s+", " ", description).strip()[:2000]  # collapse whitespace, cap length
 
         if not title or not description:

@@ -1,5 +1,5 @@
-import os
 import psycopg2
+import os
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -24,6 +24,7 @@ CREATE TABLE IF NOT EXISTS runs (
     total_cost NUMERIC(12,6) DEFAULT 0
 )
 """)
+
 cur.execute("""
 CREATE TABLE IF NOT EXISTS steps (
     id SERIAL PRIMARY KEY,
@@ -34,6 +35,13 @@ CREATE TABLE IF NOT EXISTS steps (
     ended_at TIMESTAMP,
     status TEXT,
     error_message TEXT,
+    match_score NUMERIC(5,1),
+    score_decision TEXT,
+    llm_decision TEXT,
+    needs_human_review BOOLEAN DEFAULT FALSE,
+    retrieved_context JSONB,
+    review_status TEXT,
+    reviewed_at TIMESTAMP,
     FOREIGN KEY (run_id) REFERENCES runs(id)
 )
 """)
@@ -51,6 +59,8 @@ CREATE TABLE IF NOT EXISTS llm_calls (
     latency_ms INTEGER,
     cost_usd NUMERIC(12,6),
     created_at TIMESTAMP,
+    status TEXT DEFAULT 'success',
+    error_message TEXT,
     FOREIGN KEY (run_id) REFERENCES runs(id),
     FOREIGN KEY (step_id) REFERENCES steps(id)
 )
@@ -75,4 +85,4 @@ CREATE TABLE IF NOT EXISTS tool_calls (
 
 conn.commit()
 conn.close()
-print("Postgres tables ready")
+print("Postgres tables ready (complete schema)")

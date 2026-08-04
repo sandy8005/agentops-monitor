@@ -19,6 +19,9 @@ def import_jobs_from_csv(csv_path):
     conn = get_connection()
     cur = conn.cursor()
 
+    # idempotent: clear previous CSV imports so re-running doesn't duplicate
+    cur.execute("DELETE FROM job_postings WHERE source = 'csv'")
+
     imported = 0
     with open(csv_path, newline="", encoding="utf-8") as f:
         reader = csv.DictReader(f)
