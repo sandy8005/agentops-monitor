@@ -1,4 +1,5 @@
 import time
+import sys
 from input_handler import receive_user_input
 from pdf_reader import read_resume_file
 from parser import parse_resume
@@ -7,10 +8,11 @@ from scorer import calculate_match_score
 from ranker import rank_jobs
 from job_source import search_jobs
 from advisor import application_strategy, resume_edit_advice
+from evaluator import evaluate_decision
 from llm import (
     create_run, create_step, logged_llm_call, logged_tool_call,
     finish_step, finish_run, fail_step, record_score, record_context,
-    quota_available
+    save_evaluation, quota_available
 )
 from tools import keyword_overlap_tool
 
@@ -53,7 +55,7 @@ Reason: <one sentence explaining why>
     return prompt
 
 
-def run_agent(run_id=None):
+def run_agent(run_id=None, evaluate=False):
     # Pre-check: don't waste time if the daily quota is already spent
     if not quota_available():
         print("⚠ API quota exhausted — skipping run. Try again after reset.")
@@ -133,6 +135,8 @@ def run_agent(run_id=None):
         return
 
     print(f"Found {len(jobs)} jobs")
+    if evaluate:
+        print("(evaluation enabled — LLM-as-judge will grade each decision)")
     print("=" * 60)
 
     results = []
@@ -207,7 +211,23 @@ def run_agent(run_id=None):
                 print(f"\n  STRATEGY: {strategy.strip()}")
                 print(f"\n  RESUME EDITS: {edits.strip()}\n")
 
-            # only mark the step complete once ALL its work (including advice) is done
+            # Optional: LLM-as-judge evaluation of this decision.
+            # Guarded so a failed evaluation never fails the step — it is
+            # observability ABOUT the decision, not the decision itself.
+            if evaluate:
+                try:
+                    eval_result = evaluate_decision(
+                        resume_text, job, result, run_id, step_id
+                    )
+                    save_evaluation(run_id, step_id, eval_result)
+                    print(f"    eval: rel={eval_result['relevance_score']} "
+                          f"faith={eval_result['faithfulness_score']} "
+                          f"complete={eval_result['completeness_score']} "
+                          f"halluc={eval_result['hallucination_detected']}")
+                except Exception as eval_err:
+                    print(f"    (evaluation skipped: {eval_err})")
+
+            # only mark the step complete once ALL its work is done
             finish_step(step_id, "success")
 
         except Exception as e:
@@ -246,4 +266,5 @@ def run_agent(run_id=None):
 
 
 if __name__ == "__main__":
-    run_agent()
+    evaluate = "--evaluate" in sys.argv
+    run_agent(evaluate=evaluate)

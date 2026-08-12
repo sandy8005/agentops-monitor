@@ -142,6 +142,28 @@ def record_context(step_id, context):
     conn.close()
 
 
+def save_evaluation(run_id, step_id, evaluation):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO evaluations
+        (run_id, step_id, relevance_score, faithfulness_score, completeness_score,
+         hallucination_detected, hallucinated_claims, notes, created_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+    """, (
+        run_id, step_id,
+        evaluation["relevance_score"],
+        evaluation["faithfulness_score"],
+        evaluation["completeness_score"],
+        evaluation["hallucination_detected"],
+        json.dumps(evaluation["hallucinated_claims"]),
+        evaluation["notes"],
+        datetime.now()
+    ))
+    conn.commit()
+    conn.close()
+
+
 def finish_run(run_id, status="success"):
     conn = get_connection()
     cur = conn.cursor()
