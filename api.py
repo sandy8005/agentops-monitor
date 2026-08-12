@@ -52,6 +52,8 @@ def dashboard():
     .reviewed { color: #60a5fa; font-size: 12px; font-weight: 600; }
     .call { color: #8b8f9c; font-size: 12px; margin-left: 16px; margin-top: 4px; }
     .call-failed { color: #f87171; }
+    .io { background: #0d0f15; border: 1px solid #2a2e3a; border-radius: 4px; padding: 8px; font-size: 11px; white-space: pre-wrap; word-break: break-word; max-height: 300px; overflow-y: auto; color: #b0b4c0; margin-top: 4px; }
+    details summary { color: #60a5fa; font-size: 11px; cursor: pointer; margin-top: 4px; }
     h2 { font-size: 16px; margin: 8px 0 16px; }
     .section-title { font-size: 14px; color: #8b8f9c; text-transform: uppercase; margin: 24px 0 8px; }
   </style>
@@ -76,6 +78,10 @@ def dashboard():
   </div>
 
   <script>
+    function escapeHtml(s) {
+      return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    }
+
     async function loadPending() {
       const res = await fetch('/reviews/pending');
       const items = await res.json();
@@ -148,15 +154,21 @@ def dashboard():
             html += ` <span class="agree">&#10003;</span>`;
           }
         }
-        // tool calls
+        // tool calls (with expandable input/output)
         for (const t of (s.tool_calls || [])) {
           const fc = t.status === 'failed' ? 'call-failed' : '';
-          html += `<div class="call ${fc}">tool: ${t.tool_name} [${t.status}] ${t.latency_ms}ms</div>`;
+          html += `<div class="call ${fc}">tool: ${t.tool_name} [${t.status}] ${t.latency_ms}ms
+            <details><summary>view i/o</summary>
+              <pre class="io">IN: ${escapeHtml(t.input_json || '')}\n\nOUT: ${escapeHtml(t.output_json || '')}</pre>
+            </details></div>`;
         }
-        // llm calls
+        // llm calls (with expandable prompt/response)
         for (const l of (s.llm_calls || [])) {
           const fc = l.status === 'failed' ? 'call-failed' : '';
-          html += `<div class="call ${fc}">llm: ${l.prompt_tokens}+${l.completion_tokens} tok, ${l.latency_ms}ms, $${l.cost_usd} [${l.status}]</div>`;
+          html += `<div class="call ${fc}">llm: ${l.prompt_tokens}+${l.completion_tokens} tok, ${l.latency_ms}ms, $${l.cost_usd} [${l.status}]
+            <details><summary>view prompt/response</summary>
+              <pre class="io">PROMPT:\n${escapeHtml(l.prompt || '')}\n\nRESPONSE:\n${escapeHtml(l.response || '')}</pre>
+            </details></div>`;
         }
         html += `</div>`;
       }
@@ -233,23 +245,25 @@ def get_run(run_id: int):
     steps = []
     for s in step_rows:
         step_id = s[0]
-        # tool calls for this step
+        # tool calls for this step (with full input/output)
         cur.execute("""
-            SELECT tool_name, status, latency_ms
+            SELECT tool_name, status, latency_ms, input_json, output_json
             FROM tool_calls WHERE step_id = %s ORDER BY id
         """, (step_id,))
         tool_calls = [
-            {"tool_name": t[0], "status": t[1], "latency_ms": t[2]}
+            {"tool_name": t[0], "status": t[1], "latency_ms": t[2],
+             "input_json": t[3], "output_json": t[4]}
             for t in cur.fetchall()
         ]
-        # llm calls for this step
+        # llm calls for this step (with full prompt/response)
         cur.execute("""
-            SELECT prompt_tokens, completion_tokens, latency_ms, cost_usd, status
+            SELECT prompt_tokens, completion_tokens, latency_ms, cost_usd, status, prompt, response
             FROM llm_calls WHERE step_id = %s ORDER BY id
         """, (step_id,))
         llm_calls = [
             {"prompt_tokens": l[0], "completion_tokens": l[1], "latency_ms": l[2],
-             "cost_usd": float(l[3]) if l[3] is not None else 0, "status": l[4]}
+             "cost_usd": float(l[3]) if l[3] is not None else 0, "status": l[4],
+             "prompt": l[5], "response": l[6]}
             for l in cur.fetchall()
         ]
 
