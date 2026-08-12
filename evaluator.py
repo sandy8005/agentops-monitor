@@ -20,6 +20,7 @@ THE AGENT'S RECOMMENDATION:
 Evaluate the recommendation on these criteria:
 - relevance_score (0-10): Does the recommendation directly address THIS candidate and THIS job?
 - faithfulness_score (0-10): Is the reasoning grounded in what the resume actually says, with no invented facts?
+- completeness_score (0-10): Does the recommendation fully address the decision — a clear verdict AND a reason that covers the key required skills and experience, rather than only part of the picture?
 - hallucination_detected (true/false): Does the reasoning claim the candidate HAS a skill or experience that is NOT in the resume? (Saying the candidate LACKS a skill is NOT a hallucination — that is correct reasoning.)
 - hallucinated_claims: list any specific skills/facts the agent falsely claimed the candidate has (empty list if none).
 - notes: one sentence explaining your evaluation.
@@ -28,6 +29,7 @@ Return ONLY valid JSON, no markdown fences, no explanation, in exactly this shap
 {{
   "relevance_score": <0-10>,
   "faithfulness_score": <0-10>,
+  "completeness_score": <0-10>,
   "hallucination_detected": <true/false>,
   "hallucinated_claims": ["..."],
   "notes": "one sentence"

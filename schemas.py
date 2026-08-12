@@ -34,9 +34,11 @@ class JobRequirements(BaseModel):
     min_years_experience: float
     responsibilities: List[str]
 
+
 class Evaluation(BaseModel):
-    relevance_score: int        # 0-10
-    faithfulness_score: int     # 0-10
+    relevance_score: int
+    faithfulness_score: int
+    completeness_score: int
     hallucination_detected: bool
     hallucinated_claims: List[str]
     notes: str
