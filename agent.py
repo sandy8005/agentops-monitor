@@ -18,14 +18,27 @@ from tools import keyword_overlap_tool
 
 
 def normalize_decision(raw):
-    """Map any LLM decision text to one of: Apply, Maybe, Skip, or Unknown."""
-    text = raw.lower()
-    if "apply" in text:
-        return "Apply"
-    if "maybe" in text:
-        return "Maybe"
-    if "skip" in text:
+    """Map an LLM decision to Apply / Maybe / Skip / Unknown.
+
+    Guards against negation ("do not apply" must NOT become Apply) by
+    checking for negation words near the decision and by matching whole
+    words rather than substrings.
+    """
+    text = raw.lower().strip()
+
+    # if the text negates, don't let the negated word win
+    negated = any(neg in text for neg in ["not ", "n't", "do not", "don't", "avoid", "shouldn't"])
+
+    # match whole words, not substrings
+    words = text.replace(".", " ").replace(",", " ").split()
+
+    if "skip" in words:
         return "Skip"
+    if "maybe" in words:
+        return "Maybe"
+    if "apply" in words:
+        # "do not apply" / "don't apply" → treat as Skip, not Apply
+        return "Skip" if negated else "Apply"
     return "Unknown"
 
 
@@ -240,16 +253,17 @@ def run_agent(run_id=None, evaluate=False):
     # Step N+1: rank jobs — a monitored step
     rank_step_id = create_step(run_id, "rank_jobs", len(jobs) + 4)
     try:
-        ranked = logged_tool_call(
-            "rank_jobs", lambda _: rank_jobs(results),
-            "results", run_id, rank_step_id
-        )
+        ranked = rank_jobs(results)
         if ranked is None:
-            ranked = []
+            raise RuntimeError("rank_jobs returned None")
+        # log the ranking as a successful tool call for the trace
+        logged_tool_call("rank_jobs", lambda _: ranked, "results", run_id, rank_step_id)
         finish_step(rank_step_id, "success")
     except Exception as e:
+        failures += 1
         fail_step(rank_step_id, e)
         ranked = results  # fall back to unranked so we still print something
+        print(f"Ranking failed: {e}")
 
     overall_status = "success" if failures == 0 else "completed_with_errors"
     finish_run(run_id, overall_status)
