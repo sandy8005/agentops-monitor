@@ -180,8 +180,8 @@ def run_agent(run_id=None, evaluate=False):
                     llm_decision = normalize_decision(line.split(":", 1)[1])
                     break
 
-            # deterministic score
-            score_result = calculate_match_score(parsed, requirements, resume_text)
+            # deterministic score (now location-aware: job + user_input passed in)
+            score_result = calculate_match_score(parsed, requirements, resume_text, job, user_input)
 
             # record both + flag disagreement
             needs_review = record_score(
@@ -256,7 +256,6 @@ def run_agent(run_id=None, evaluate=False):
         ranked = rank_jobs(results)
         if ranked is None:
             raise RuntimeError("rank_jobs returned None")
-        # log the ranking as a successful tool call for the trace
         logged_tool_call("rank_jobs", lambda _: ranked, "results", run_id, rank_step_id)
         finish_step(rank_step_id, "success")
     except Exception as e:
