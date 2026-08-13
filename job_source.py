@@ -10,7 +10,7 @@ def get_connection():
     )
 
 
-def search_jobs(target_role=None, location=None, min_results=3):
+def search_jobs(target_role=None, location=None, work_mode=None, min_results=3):
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
@@ -26,23 +26,40 @@ def search_jobs(target_role=None, location=None, min_results=3):
         for r in rows
     ]
 
-    # no target role given → return everything
     if not target_role:
         return all_jobs
 
-    # build loose keyword list from the target role
-    keywords = [w.lower() for w in target_role.replace("/", " ").split() if len(w) > 2]
+    # --- role filter (keyword match on title + description) ---
+    keywords = [w.lower() for w in target_role.replace("/", " ").split()]
 
-    def matches(job):
+    def role_matches(job):
         haystack = f"{job['title']} {job['description']}".lower()
         return any(kw in haystack for kw in keywords)
 
-    filtered = [j for j in all_jobs if matches(j)]
+    filtered = [j for j in all_jobs if role_matches(j)]
 
-    # safety net: if filtering is too aggressive, fall back to all
+    # --- work_mode filter (only excludes jobs that HAVE a mode and clearly conflict) ---
+    if work_mode:
+        wm = work_mode.lower()
+
+        def mode_ok(job):
+            jm = (job.get("work_mode") or "").lower()
+            jl = (job.get("location") or "").lower()
+            # no mode data and not obviously remote → don't exclude (missing data is not a mismatch)
+            if not jm and "remote" not in jl:
+                return True
+            # remote jobs fit any preference
+            if "remote" in jm or "remote" in jl:
+                return True
+            # otherwise require the requested mode to appear
+            return wm in jm
+
+        filtered = [j for j in filtered if mode_ok(j)]
+
+    # --- safety net: never return an empty/too-small set, but say so ---
     if len(filtered) < min_results:
-        print(f"  (only {len(filtered)} matched '{target_role}' — returning all {len(all_jobs)} jobs)")
+        print(f"  ({len(filtered)} matched after filtering — returning all {len(all_jobs)} jobs)")
         return all_jobs
 
-    print(f"  ({len(filtered)} of {len(all_jobs)} jobs matched '{target_role}')")
+    print(f"  ({len(filtered)} of {len(all_jobs)} jobs matched filters)")
     return filtered

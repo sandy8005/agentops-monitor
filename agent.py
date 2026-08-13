@@ -130,12 +130,16 @@ def run_agent(run_id=None, evaluate=False):
 
     print(f"Parsed: {len(parsed['skills'])} skills, {len(parsed['projects'])} projects")
 
-    # Step 3: search_jobs
+    # Step 3: search_jobs (role + work_mode aware)
     step_id = create_step(run_id, "search_jobs", 3)
     try:
         jobs = logged_tool_call(
             "search_jobs",
-            lambda _: search_jobs(user_input["target_role"], user_input["location"]),
+            lambda _: search_jobs(
+                user_input["target_role"],
+                user_input["location"],
+                user_input.get("work_mode")
+            ),
             "query", run_id, step_id
         )
         if not jobs:
@@ -180,7 +184,7 @@ def run_agent(run_id=None, evaluate=False):
                     llm_decision = normalize_decision(line.split(":", 1)[1])
                     break
 
-            # deterministic score (now location-aware: job + user_input passed in)
+            # deterministic score (location-aware: job + user_input passed in)
             score_result = calculate_match_score(parsed, requirements, resume_text, job, user_input)
 
             # record both + flag disagreement
