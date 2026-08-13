@@ -1,10 +1,12 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, UploadFile, File, Form
 from fastapi.responses import HTMLResponse
 from datetime import datetime
+import tempfile
 import psycopg2, os
 from dotenv import load_dotenv
 from agent import run_agent
 from llm import create_run
+from pdf_reader import read_resume_file
 
 load_dotenv()
 app = FastAPI(title="AgentOps Monitor")
@@ -56,6 +58,10 @@ def dashboard():
     details summary { color: #60a5fa; font-size: 11px; cursor: pointer; margin-top: 4px; }
     h2 { font-size: 16px; margin: 8px 0 16px; }
     .section-title { font-size: 14px; color: #8b8f9c; text-transform: uppercase; margin: 24px 0 8px; }
+    .form-card { background: #171a22; border: 1px solid #2a2e3a; border-radius: 6px; padding: 16px; margin-bottom: 20px; max-width: 560px; }
+    .form-card label { display: block; font-size: 12px; color: #8b8f9c; margin: 8px 0 4px; }
+    .form-card input { width: 100%; box-sizing: border-box; background: #0d0f15; border: 1px solid #2a2e3a; border-radius: 4px; padding: 8px; color: #e4e6eb; font-size: 13px; }
+    .form-card .run-btn { margin-top: 14px; margin-bottom: 0; }
   </style>
 </head>
 <body>
@@ -64,7 +70,21 @@ def dashboard():
     <div class="sub">AI job-search agent observability</div>
   </header>
   <div class="container">
-    <button id="startBtn" onclick="startRun()">&#9654; Start New Run</button>
+
+    <div class="section-title">New Run</div>
+    <div class="form-card">
+      <label>Resume PDF</label>
+      <input type="file" id="resumeFile" accept="application/pdf">
+      <label>Label (optional)</label>
+      <input type="text" id="resumeName" placeholder="e.g. Backend-focused resume">
+      <label>Target role</label>
+      <input type="text" id="targetRole" placeholder="e.g. AI/ML Engineer">
+      <label>Location</label>
+      <input type="text" id="location" placeholder="e.g. Michigan">
+      <label>Work mode</label>
+      <input type="text" id="workMode" placeholder="e.g. hybrid / remote">
+      <button class="run-btn" id="uploadRunBtn" onclick="uploadAndRun()">&#9654; Upload &amp; Run</button>
+    </div>
 
     <div class="section-title">Pending Human Review</div>
     <div id="pending"></div>
@@ -80,6 +100,42 @@ def dashboard():
   <script>
     function escapeHtml(s) {
       return String(s).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+    }
+
+    async function uploadAndRun() {
+      const btn = document.getElementById('uploadRunBtn');
+      const fileInput = document.getElementById('resumeFile');
+      const role = document.getElementById('targetRole').value.trim();
+      if (!fileInput.files.length) { alert('Please choose a PDF resume.'); return; }
+      if (!role) { alert('Please enter a target role.'); return; }
+
+      btn.disabled = true;
+      btn.textContent = 'Uploading...';
+
+      const fd = new FormData();
+      fd.append('file', fileInput.files[0]);
+      fd.append('name', document.getElementById('resumeName').value.trim());
+      fd.append('target_role', role);
+      fd.append('location', document.getElementById('location').value.trim());
+      fd.append('work_mode', document.getElementById('workMode').value.trim());
+      fd.append('employment_type', '');
+
+      try {
+        const up = await fetch('/upload', { method: 'POST', body: fd });
+        if (!up.ok) { const e = await up.json(); throw new Error(e.detail || 'upload failed'); }
+        const upData = await up.json();
+
+        btn.textContent = 'Starting run...';
+        const run = await fetch('/runs?resume_id=' + upData.resume_id, { method: 'POST' });
+        const runData = await run.json();
+        alert(`Resume #${upData.resume_id} stored. ${runData.message}`);
+        setTimeout(() => { loadRuns(); loadDetail(runData.run_id); }, 2000);
+      } catch (err) {
+        alert('Error: ' + err.message);
+      } finally {
+        btn.disabled = false;
+        btn.innerHTML = '&#9654; Upload &amp; Run';
+      }
     }
 
     async function loadPending() {
@@ -154,7 +210,6 @@ def dashboard():
             html += ` <span class="agree">&#10003;</span>`;
           }
         }
-        // tool calls (with expandable input/output)
         for (const t of (s.tool_calls || [])) {
           const fc = t.status === 'failed' ? 'call-failed' : '';
           html += `<div class="call ${fc}">tool: ${t.tool_name} [${t.status}] ${t.latency_ms}ms
@@ -162,7 +217,6 @@ def dashboard():
               <pre class="io">IN: ${escapeHtml(t.input_json || '')}\n\nOUT: ${escapeHtml(t.output_json || '')}</pre>
             </details></div>`;
         }
-        // llm calls (with expandable prompt/response)
         for (const l of (s.llm_calls || [])) {
           const fc = l.status === 'failed' ? 'call-failed' : '';
           html += `<div class="call ${fc}">llm: ${l.prompt_tokens}+${l.completion_tokens} tok, ${l.latency_ms}ms, $${l.cost_usd} [${l.status}]
@@ -176,24 +230,56 @@ def dashboard():
       d.scrollIntoView({ behavior: 'smooth' });
     }
 
-    async function startRun() {
-      const btn = document.getElementById('startBtn');
-      btn.disabled = true;
-      btn.textContent = 'Starting...';
-      const res = await fetch('/runs', { method: 'POST' });
-      const data = await res.json();
-      alert(data.message);
-      btn.disabled = false;
-      btn.innerHTML = '&#9654; Start New Run';
-      setTimeout(() => { loadRuns(); loadDetail(data.run_id); }, 2000);
-    }
-
     loadPending();
     loadRuns();
   </script>
 </body>
 </html>
     """
+
+
+@app.post("/upload")
+async def upload_resume(
+    file: UploadFile = File(...),
+    name: str = Form(""),
+    target_role: str = Form(...),
+    location: str = Form(""),
+    work_mode: str = Form(""),
+    employment_type: str = Form("")
+):
+    if not file.filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Please upload a PDF file")
+
+    contents = await file.read()
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as tmp:
+        tmp.write(contents)
+        tmp_path = tmp.name
+
+    try:
+        resume_text = read_resume_file(tmp_path)
+    finally:
+        os.remove(tmp_path)
+
+    if not resume_text or not resume_text.strip():
+        raise HTTPException(status_code=400, detail="Could not extract text from the PDF")
+
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO resumes (name, resume_text, target_role, location, work_mode, employment_type, created_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s)
+        RETURNING id
+    """, (
+        name or file.filename,
+        resume_text, target_role, location, work_mode, employment_type,
+        datetime.now()
+    ))
+    resume_id = cur.fetchone()[0]
+    conn.commit()
+    conn.close()
+
+    return {"resume_id": resume_id, "name": name or file.filename,
+            "chars": len(resume_text), "message": f"Resume stored as #{resume_id}"}
 
 
 @app.get("/runs")
@@ -215,9 +301,9 @@ def list_runs(limit: int = 20):
 
 
 @app.post("/runs")
-def start_run(background_tasks: BackgroundTasks):
+def start_run(background_tasks: BackgroundTasks, resume_id: int = None):
     run_id = create_run("job search run (dashboard)")
-    background_tasks.add_task(run_agent, run_id)
+    background_tasks.add_task(run_agent, run_id, False, resume_id)
     return {"run_id": run_id, "message": f"Run {run_id} started in background."}
 
 
@@ -245,7 +331,6 @@ def get_run(run_id: int):
     steps = []
     for s in step_rows:
         step_id = s[0]
-        # tool calls for this step (with full input/output)
         cur.execute("""
             SELECT tool_name, status, latency_ms, input_json, output_json
             FROM tool_calls WHERE step_id = %s ORDER BY id
@@ -255,7 +340,6 @@ def get_run(run_id: int):
              "input_json": t[3], "output_json": t[4]}
             for t in cur.fetchall()
         ]
-        # llm calls for this step (with full prompt/response)
         cur.execute("""
             SELECT prompt_tokens, completion_tokens, latency_ms, cost_usd, status, prompt, response
             FROM llm_calls WHERE step_id = %s ORDER BY id

@@ -12,34 +12,44 @@ from evaluator import evaluate_decision
 from llm import (
     create_run, create_step, logged_llm_call, logged_tool_call,
     finish_step, finish_run, fail_step, record_score, record_context,
-    save_evaluation, quota_available
+    save_evaluation, quota_available, get_connection
 )
 from tools import keyword_overlap_tool
 
 
 def normalize_decision(raw):
-    """Map an LLM decision to Apply / Maybe / Skip / Unknown.
-
-    Guards against negation ("do not apply" must NOT become Apply) by
-    checking for negation words near the decision and by matching whole
-    words rather than substrings.
-    """
+    """Map an LLM decision to Apply / Maybe / Skip / Unknown, guarding against negation."""
     text = raw.lower().strip()
-
-    # if the text negates, don't let the negated word win
     negated = any(neg in text for neg in ["not ", "n't", "do not", "don't", "avoid", "shouldn't"])
-
-    # match whole words, not substrings
     words = text.replace(".", " ").replace(",", " ").split()
-
     if "skip" in words:
         return "Skip"
     if "maybe" in words:
         return "Maybe"
     if "apply" in words:
-        # "do not apply" / "don't apply" → treat as Skip, not Apply
         return "Skip" if negated else "Apply"
     return "Unknown"
+
+
+def load_resume_from_db(resume_id):
+    """Load a stored resume + its search config from the resumes table."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT resume_text, target_role, location, work_mode, employment_type
+        FROM resumes WHERE id = %s
+    """, (resume_id,))
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        raise RuntimeError(f"Resume {resume_id} not found")
+    return {
+        "resume_text": row[0],
+        "target_role": row[1],
+        "location": row[2] or "",
+        "work_mode": row[3] or "",
+        "employment_type": row[4] or ""
+    }
 
 
 def build_prompt(resume_text, parsed, job, overlap, requirements):
@@ -68,8 +78,7 @@ Reason: <one sentence explaining why>
     return prompt
 
 
-def run_agent(run_id=None, evaluate=False):
-    # Pre-check: don't waste time if the daily quota is already spent
+def run_agent(run_id=None, evaluate=False, resume_id=None):
     if not quota_available():
         print("⚠ API quota exhausted — skipping run. Try again after reset.")
         if run_id is not None:
@@ -80,42 +89,61 @@ def run_agent(run_id=None, evaluate=False):
         run_id = create_run("job search run")
     failures = 0
 
-    # Step 0: receive_user_input
-    step_id = create_step(run_id, "receive_user_input", 0)
-    try:
-        user_input = logged_tool_call(
-            "receive_user_input", receive_user_input,
-            "user_input.json", run_id, step_id
-        )
-        if user_input is None:
-            raise RuntimeError("receive_user_input returned no data")
-        finish_step(step_id, "success")
-    except Exception as e:
-        fail_step(step_id, e)
-        finish_run(run_id, "failed")
-        print(f"Input failed: {e}")
-        return
+    # --- Load inputs: from DB (uploaded resume) or user_input.json (CLI) ---
+    if resume_id is not None:
+        step_id = create_step(run_id, "load_resume_from_db", 0)
+        try:
+            db_resume = load_resume_from_db(resume_id)
+            user_input = {
+                "resume_file": None,
+                "target_role": db_resume["target_role"],
+                "location": db_resume["location"],
+                "work_mode": db_resume["work_mode"],
+                "employment_type": db_resume["employment_type"]
+            }
+            resume_text = db_resume["resume_text"]
+            if not resume_text:
+                raise RuntimeError("stored resume has no text")
+            finish_step(step_id, "success")
+        except Exception as e:
+            fail_step(step_id, e)
+            finish_run(run_id, "failed")
+            print(f"Resume load failed: {e}")
+            return
+    else:
+        step_id = create_step(run_id, "receive_user_input", 0)
+        try:
+            user_input = logged_tool_call(
+                "receive_user_input", receive_user_input,
+                "user_input.json", run_id, step_id
+            )
+            if user_input is None:
+                raise RuntimeError("receive_user_input returned no data")
+            finish_step(step_id, "success")
+        except Exception as e:
+            fail_step(step_id, e)
+            finish_run(run_id, "failed")
+            print(f"Input failed: {e}")
+            return
+
+        step_id = create_step(run_id, "read_resume_file", 1)
+        try:
+            resume_text = logged_tool_call(
+                "read_resume_file", read_resume_file,
+                user_input["resume_file"], run_id, step_id
+            )
+            if not resume_text:
+                raise RuntimeError("read_resume_file returned no text")
+            finish_step(step_id, "success")
+        except Exception as e:
+            fail_step(step_id, e)
+            finish_run(run_id, "failed")
+            print(f"PDF read failed: {e}")
+            return
 
     print(f"Target role: {user_input['target_role']}")
     print(f"Location: {user_input['location']}  |  Mode: {user_input['work_mode']}")
-
-    # Step 1: read_resume_file
-    step_id = create_step(run_id, "read_resume_file", 1)
-    try:
-        resume_text = logged_tool_call(
-            "read_resume_file", read_resume_file,
-            user_input["resume_file"], run_id, step_id
-        )
-        if not resume_text:
-            raise RuntimeError("read_resume_file returned no text")
-        finish_step(step_id, "success")
-    except Exception as e:
-        fail_step(step_id, e)
-        finish_run(run_id, "failed")
-        print(f"PDF read failed: {e}")
-        return
-
-    print(f"Resume read: {len(resume_text)} characters")
+    print(f"Resume: {len(resume_text)} characters")
 
     # Step 2: parse_resume
     step_id = create_step(run_id, "parse_resume", 2)
@@ -130,15 +158,13 @@ def run_agent(run_id=None, evaluate=False):
 
     print(f"Parsed: {len(parsed['skills'])} skills, {len(parsed['projects'])} projects")
 
-    # Step 3: search_jobs (role + work_mode aware)
+    # Step 3: search_jobs
     step_id = create_step(run_id, "search_jobs", 3)
     try:
         jobs = logged_tool_call(
             "search_jobs",
             lambda _: search_jobs(
-                user_input["target_role"],
-                user_input["location"],
-                user_input.get("work_mode")
+                user_input["target_role"], user_input["location"], user_input.get("work_mode")
             ),
             "query", run_id, step_id
         )
@@ -158,7 +184,6 @@ def run_agent(run_id=None, evaluate=False):
 
     results = []
 
-    # Steps 4..N: evaluate each job
     for index, job in enumerate(jobs, start=4):
         time.sleep(15)
         step_id = create_step(run_id, job["title"], index)
@@ -177,23 +202,19 @@ def run_agent(run_id=None, evaluate=False):
             prompt = build_prompt(resume_text, parsed, job, overlap, requirements)
             result = logged_llm_call(prompt, run_id, step_id)
 
-            # extract and normalize the LLM's decision
             llm_decision = "Unknown"
             for line in result.splitlines():
                 if line.lower().startswith("decision:"):
                     llm_decision = normalize_decision(line.split(":", 1)[1])
                     break
 
-            # deterministic score (location-aware: job + user_input passed in)
             score_result = calculate_match_score(parsed, requirements, resume_text, job, user_input)
 
-            # record both + flag disagreement
             needs_review = record_score(
                 step_id, score_result["score"],
                 score_result["decision"], llm_decision
             )
 
-            # record retrieved context (the evidence behind this verdict)
             record_context(step_id, {
                 "required_skills": requirements["required_skills"],
                 "preferred_skills": requirements["preferred_skills"],
@@ -215,7 +236,6 @@ def run_agent(run_id=None, evaluate=False):
             flag = "  ** REVIEW **" if needs_review else ""
             print(f"{job['title']}: LLM={llm_decision}  Score={score_result['score']}({score_result['decision']}){flag}")
 
-            # Steps 10 & 11: only for viable jobs (Apply / Maybe)
             if llm_decision in ("Apply", "Maybe"):
                 strategy = application_strategy(
                     resume_text, job, requirements,
@@ -228,14 +248,9 @@ def run_agent(run_id=None, evaluate=False):
                 print(f"\n  STRATEGY: {strategy.strip()}")
                 print(f"\n  RESUME EDITS: {edits.strip()}\n")
 
-            # Optional: LLM-as-judge evaluation of this decision.
-            # Guarded so a failed evaluation never fails the step — it is
-            # observability ABOUT the decision, not the decision itself.
             if evaluate:
                 try:
-                    eval_result = evaluate_decision(
-                        resume_text, job, result, run_id, step_id
-                    )
+                    eval_result = evaluate_decision(resume_text, job, result, run_id, step_id)
                     save_evaluation(run_id, step_id, eval_result)
                     print(f"    eval: rel={eval_result['relevance_score']} "
                           f"faith={eval_result['faithfulness_score']} "
@@ -244,7 +259,6 @@ def run_agent(run_id=None, evaluate=False):
                 except Exception as eval_err:
                     print(f"    (evaluation skipped: {eval_err})")
 
-            # only mark the step complete once ALL its work is done
             finish_step(step_id, "success")
 
         except Exception as e:
@@ -254,7 +268,6 @@ def run_agent(run_id=None, evaluate=False):
 
         print("-" * 60)
 
-    # Step N+1: rank jobs — a monitored step
     rank_step_id = create_step(run_id, "rank_jobs", len(jobs) + 4)
     try:
         ranked = rank_jobs(results)
@@ -265,14 +278,13 @@ def run_agent(run_id=None, evaluate=False):
     except Exception as e:
         failures += 1
         fail_step(rank_step_id, e)
-        ranked = results  # fall back to unranked so we still print something
+        ranked = results
         print(f"Ranking failed: {e}")
 
     overall_status = "success" if failures == 0 else "completed_with_errors"
     finish_run(run_id, overall_status)
     print(f"Run {run_id} complete. {failures} failure(s).")
 
-    # display ranked results
     print("\n" + "=" * 60)
     print("RANKED JOBS (best match first):")
     print("=" * 60)
