@@ -132,6 +132,17 @@ def record_score(step_id, match_score, score_decision, llm_decision):
     return needs_review
 
 
+def flag_for_review(step_id, reason="evaluator"):
+    """Mark a step for human review (e.g. evaluator caught a hallucination)."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE steps SET needs_human_review = TRUE WHERE id = %s
+    """, (step_id,))
+    conn.commit()
+    conn.close()
+
+
 def record_context(step_id, context):
     conn = get_connection()
     cur = conn.cursor()

@@ -12,7 +12,7 @@ from evaluator import evaluate_decision
 from llm import (
     create_run, create_step, logged_llm_call, logged_tool_call,
     finish_step, finish_run, fail_step, record_score, record_context,
-    save_evaluation, quota_available, get_connection
+    save_evaluation, flag_for_review, quota_available, get_connection
 )
 from tools import keyword_overlap_tool
 
@@ -79,18 +79,16 @@ Reason: <one sentence explaining why>
 
 
 def run_agent(run_id=None, evaluate=False, resume_id=None, sleep_between=15):
-    # Create the run FIRST, so even a quota-blocked run leaves a trace.
     if run_id is None:
         run_id = create_run("job search run")
 
-    # Quota pre-check — the run already exists, so mark it failed rather than vanish.
     if not quota_available():
         print("⚠ API quota exhausted — skipping run. Try again after reset.")
         finish_run(run_id, "failed")
         return
 
     failures = 0
-    run_finished = False   # guards the finally block from stomping a good status
+    run_finished = False
 
     try:
         # --- Load inputs: from DB (uploaded resume) or user_input.json (CLI) ---
@@ -259,6 +257,14 @@ def run_agent(run_id=None, evaluate=False, resume_id=None, sleep_between=15):
                     try:
                         eval_result = evaluate_decision(resume_text, job, result, run_id, step_id)
                         save_evaluation(run_id, step_id, eval_result)
+
+                        # If the judge caught a hallucination, flag for review even
+                        # when score and LLM agreed — a second, independent trigger.
+                        if eval_result["hallucination_detected"] and not needs_review:
+                            flag_for_review(step_id, reason="hallucination")
+                            needs_review = True
+                            print(f"    ⚠ evaluator flagged hallucination — marked for review")
+
                         print(f"    eval: rel={eval_result['relevance_score']} "
                               f"faith={eval_result['faithfulness_score']} "
                               f"complete={eval_result['completeness_score']} "
@@ -285,7 +291,7 @@ def run_agent(run_id=None, evaluate=False, resume_id=None, sleep_between=15):
 
             print("-" * 60)
 
-        # Step N+1: rank jobs — monitored (the real ranking runs inside the tool call)
+        # Step N+1: rank jobs — monitored (real ranking runs inside the tool call)
         rank_step_id = create_step(run_id, "rank_jobs", len(jobs) + 4)
         try:
             ranked = logged_tool_call(
@@ -314,8 +320,6 @@ def run_agent(run_id=None, evaluate=False, resume_id=None, sleep_between=15):
             print(f"   Score: {r['score']}/100 ({r['decision']})  |  LLM: {r['llm_decision']}{flag}")
 
     finally:
-        # Safety net: if we exited without a normal finish, mark the run failed
-        # so it never sits orphaned as 'running'. The cleanup has its own guard.
         if not run_finished:
             try:
                 finish_run(run_id, "failed")
