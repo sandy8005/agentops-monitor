@@ -78,220 +78,250 @@ Reason: <one sentence explaining why>
     return prompt
 
 
-def run_agent(run_id=None, evaluate=False, resume_id=None):
-    if not quota_available():
-        print("⚠ API quota exhausted — skipping run. Try again after reset.")
-        if run_id is not None:
-            finish_run(run_id, "failed")
-        return
-
+def run_agent(run_id=None, evaluate=False, resume_id=None, sleep_between=15):
+    # Create the run FIRST, so even a quota-blocked run leaves a trace.
     if run_id is None:
         run_id = create_run("job search run")
+
+    # Quota pre-check — the run already exists, so mark it failed rather than vanish.
+    if not quota_available():
+        print("⚠ API quota exhausted — skipping run. Try again after reset.")
+        finish_run(run_id, "failed")
+        return
+
     failures = 0
+    run_finished = False   # guards the finally block from stomping a good status
 
-    # --- Load inputs: from DB (uploaded resume) or user_input.json (CLI) ---
-    if resume_id is not None:
-        step_id = create_step(run_id, "load_resume_from_db", 0)
+    try:
+        # --- Load inputs: from DB (uploaded resume) or user_input.json (CLI) ---
+        if resume_id is not None:
+            step_id = create_step(run_id, "load_resume_from_db", 0)
+            try:
+                db_resume = load_resume_from_db(resume_id)
+                user_input = {
+                    "resume_file": None,
+                    "target_role": db_resume["target_role"],
+                    "location": db_resume["location"],
+                    "work_mode": db_resume["work_mode"],
+                    "employment_type": db_resume["employment_type"]
+                }
+                resume_text = db_resume["resume_text"]
+                if not resume_text:
+                    raise RuntimeError("stored resume has no text")
+                finish_step(step_id, "success")
+            except Exception as e:
+                fail_step(step_id, e)
+                finish_run(run_id, "failed")
+                run_finished = True
+                print(f"Resume load failed: {e}")
+                return
+        else:
+            step_id = create_step(run_id, "receive_user_input", 0)
+            try:
+                user_input = logged_tool_call(
+                    "receive_user_input", receive_user_input,
+                    "user_input.json", run_id, step_id
+                )
+                if user_input is None:
+                    raise RuntimeError("receive_user_input returned no data")
+                finish_step(step_id, "success")
+            except Exception as e:
+                fail_step(step_id, e)
+                finish_run(run_id, "failed")
+                run_finished = True
+                print(f"Input failed: {e}")
+                return
+
+            step_id = create_step(run_id, "read_resume_file", 1)
+            try:
+                resume_text = logged_tool_call(
+                    "read_resume_file", read_resume_file,
+                    user_input["resume_file"], run_id, step_id
+                )
+                if not resume_text:
+                    raise RuntimeError("read_resume_file returned no text")
+                finish_step(step_id, "success")
+            except Exception as e:
+                fail_step(step_id, e)
+                finish_run(run_id, "failed")
+                run_finished = True
+                print(f"PDF read failed: {e}")
+                return
+
+        print(f"Target role: {user_input['target_role']}")
+        print(f"Location: {user_input['location']}  |  Mode: {user_input['work_mode']}")
+        print(f"Resume: {len(resume_text)} characters")
+
+        # Step 2: parse_resume
+        step_id = create_step(run_id, "parse_resume", 2)
         try:
-            db_resume = load_resume_from_db(resume_id)
-            user_input = {
-                "resume_file": None,
-                "target_role": db_resume["target_role"],
-                "location": db_resume["location"],
-                "work_mode": db_resume["work_mode"],
-                "employment_type": db_resume["employment_type"]
+            parsed = parse_resume(resume_text, run_id, step_id)
+            finish_step(step_id, "success")
+        except Exception as e:
+            fail_step(step_id, e)
+            finish_run(run_id, "failed")
+            run_finished = True
+            print(f"Resume parsing failed: {e}")
+            return
+
+        print(f"Parsed: {len(parsed['skills'])} skills, {len(parsed['projects'])} projects")
+
+        # Step 3: search_jobs
+        step_id = create_step(run_id, "search_jobs", 3)
+        try:
+            search_params = {
+                "target_role": user_input["target_role"],
+                "location": user_input["location"],
+                "work_mode": user_input.get("work_mode")
             }
-            resume_text = db_resume["resume_text"]
-            if not resume_text:
-                raise RuntimeError("stored resume has no text")
+            jobs = logged_tool_call(
+                "search_jobs",
+                lambda p: search_jobs(p["target_role"], p["location"], p["work_mode"]),
+                search_params, run_id, step_id
+            )
+            if not jobs:
+                raise RuntimeError("search_jobs returned no jobs")
             finish_step(step_id, "success")
         except Exception as e:
             fail_step(step_id, e)
             finish_run(run_id, "failed")
-            print(f"Resume load failed: {e}")
-            return
-    else:
-        step_id = create_step(run_id, "receive_user_input", 0)
-        try:
-            user_input = logged_tool_call(
-                "receive_user_input", receive_user_input,
-                "user_input.json", run_id, step_id
-            )
-            if user_input is None:
-                raise RuntimeError("receive_user_input returned no data")
-            finish_step(step_id, "success")
-        except Exception as e:
-            fail_step(step_id, e)
-            finish_run(run_id, "failed")
-            print(f"Input failed: {e}")
+            run_finished = True
+            print(f"Job search failed: {e}")
             return
 
-        step_id = create_step(run_id, "read_resume_file", 1)
-        try:
-            resume_text = logged_tool_call(
-                "read_resume_file", read_resume_file,
-                user_input["resume_file"], run_id, step_id
-            )
-            if not resume_text:
-                raise RuntimeError("read_resume_file returned no text")
-            finish_step(step_id, "success")
-        except Exception as e:
-            fail_step(step_id, e)
-            finish_run(run_id, "failed")
-            print(f"PDF read failed: {e}")
-            return
+        print(f"Found {len(jobs)} jobs")
+        if evaluate:
+            print("(evaluation enabled — LLM-as-judge will grade each decision)")
+        print("=" * 60)
 
-    print(f"Target role: {user_input['target_role']}")
-    print(f"Location: {user_input['location']}  |  Mode: {user_input['work_mode']}")
-    print(f"Resume: {len(resume_text)} characters")
+        results = []
 
-    # Step 2: parse_resume
-    step_id = create_step(run_id, "parse_resume", 2)
-    try:
-        parsed = parse_resume(resume_text, run_id, step_id)
-        finish_step(step_id, "success")
-    except Exception as e:
-        fail_step(step_id, e)
-        finish_run(run_id, "failed")
-        print(f"Resume parsing failed: {e}")
-        return
+        # Steps 4..N: evaluate each job
+        for index, job in enumerate(jobs, start=4):
+            if sleep_between:
+                time.sleep(sleep_between)
+            step_id = create_step(run_id, job["title"], index)
 
-    print(f"Parsed: {len(parsed['skills'])} skills, {len(parsed['projects'])} projects")
-
-    # Step 3: search_jobs
-    step_id = create_step(run_id, "search_jobs", 3)
-    try:
-        jobs = logged_tool_call(
-            "search_jobs",
-            lambda _: search_jobs(
-                user_input["target_role"], user_input["location"], user_input.get("work_mode")
-            ),
-            "query", run_id, step_id
-        )
-        if not jobs:
-            raise RuntimeError("search_jobs returned no jobs")
-        finish_step(step_id, "success")
-    except Exception as e:
-        fail_step(step_id, e)
-        finish_run(run_id, "failed")
-        print(f"Job search failed: {e}")
-        return
-
-    print(f"Found {len(jobs)} jobs")
-    if evaluate:
-        print("(evaluation enabled — LLM-as-judge will grade each decision)")
-    print("=" * 60)
-
-    results = []
-
-    for index, job in enumerate(jobs, start=4):
-        time.sleep(15)
-        step_id = create_step(run_id, job["title"], index)
-
-        try:
-            overlap = logged_tool_call(
-                "keyword_overlap_tool", keyword_overlap_tool,
-                {"resume": resume_text, "job_description": job["description"]},
-                run_id, step_id
-            )
-            if overlap is None:
-                raise RuntimeError("keyword_overlap_tool returned no result")
-
-            requirements = extract_requirements(job, run_id, step_id)
-
-            prompt = build_prompt(resume_text, parsed, job, overlap, requirements)
-            result = logged_llm_call(prompt, run_id, step_id)
-
-            llm_decision = "Unknown"
-            for line in result.splitlines():
-                if line.lower().startswith("decision:"):
-                    llm_decision = normalize_decision(line.split(":", 1)[1])
-                    break
-
-            score_result = calculate_match_score(parsed, requirements, resume_text, job, user_input)
-
-            needs_review = record_score(
-                step_id, score_result["score"],
-                score_result["decision"], llm_decision
-            )
-
-            record_context(step_id, {
-                "required_skills": requirements["required_skills"],
-                "preferred_skills": requirements["preferred_skills"],
-                "min_years_experience": requirements["min_years_experience"],
-                "matched_skills": overlap["matched_in_resume"],
-                "missing_skills": overlap["missing_from_resume"],
-                "candidate_years": parsed["years_experience"]
-            })
-
-            results.append({
-                "title": job["title"],
-                "company": job["company"],
-                "score": score_result["score"],
-                "decision": score_result["decision"],
-                "llm_decision": llm_decision,
-                "needs_review": needs_review
-            })
-
-            flag = "  ** REVIEW **" if needs_review else ""
-            print(f"{job['title']}: LLM={llm_decision}  Score={score_result['score']}({score_result['decision']}){flag}")
-
-            if llm_decision in ("Apply", "Maybe"):
-                strategy = application_strategy(
-                    resume_text, job, requirements,
-                    overlap["missing_from_resume"], run_id, step_id
+            try:
+                overlap = logged_tool_call(
+                    "keyword_overlap_tool", keyword_overlap_tool,
+                    {"resume": resume_text, "job_description": job["description"]},
+                    run_id, step_id
                 )
-                edits = resume_edit_advice(
-                    resume_text, job, requirements,
-                    overlap["missing_from_resume"], run_id, step_id
+                if overlap is None:
+                    raise RuntimeError("keyword_overlap_tool returned no result")
+
+                requirements = extract_requirements(job, run_id, step_id)
+
+                prompt = build_prompt(resume_text, parsed, job, overlap, requirements)
+                result = logged_llm_call(prompt, run_id, step_id)
+
+                llm_decision = "Unknown"
+                for line in result.splitlines():
+                    if line.lower().startswith("decision:"):
+                        llm_decision = normalize_decision(line.split(":", 1)[1])
+                        break
+
+                score_result = calculate_match_score(parsed, requirements, resume_text, job, user_input)
+
+                needs_review = record_score(
+                    step_id, score_result["score"],
+                    score_result["decision"], llm_decision
                 )
-                print(f"\n  STRATEGY: {strategy.strip()}")
-                print(f"\n  RESUME EDITS: {edits.strip()}\n")
 
-            if evaluate:
-                try:
-                    eval_result = evaluate_decision(resume_text, job, result, run_id, step_id)
-                    save_evaluation(run_id, step_id, eval_result)
-                    print(f"    eval: rel={eval_result['relevance_score']} "
-                          f"faith={eval_result['faithfulness_score']} "
-                          f"complete={eval_result['completeness_score']} "
-                          f"halluc={eval_result['hallucination_detected']}")
-                except Exception as eval_err:
-                    print(f"    (evaluation skipped: {eval_err})")
+                record_context(step_id, {
+                    "required_skills": requirements["required_skills"],
+                    "preferred_skills": requirements["preferred_skills"],
+                    "min_years_experience": requirements["min_years_experience"],
+                    "matched_skills": overlap["matched_in_resume"],
+                    "missing_skills": overlap["missing_from_resume"],
+                    "candidate_years": parsed["years_experience"]
+                })
 
-            finish_step(step_id, "success")
+                flag = "  ** REVIEW **" if needs_review else ""
+                print(f"{job['title']}: LLM={llm_decision}  Score={score_result['score']}({score_result['decision']}){flag}")
 
+                # Steps 10 & 11: only for viable jobs (Apply / Maybe)
+                if llm_decision in ("Apply", "Maybe"):
+                    strategy = application_strategy(
+                        resume_text, job, requirements,
+                        overlap["missing_from_resume"], run_id, step_id
+                    )
+                    edits = resume_edit_advice(
+                        resume_text, job, requirements,
+                        overlap["missing_from_resume"], run_id, step_id
+                    )
+                    print(f"\n  STRATEGY: {strategy.strip()}")
+                    print(f"\n  RESUME EDITS: {edits.strip()}\n")
+
+                # Optional LLM-as-judge evaluation (guarded — never fails the step)
+                if evaluate:
+                    try:
+                        eval_result = evaluate_decision(resume_text, job, result, run_id, step_id)
+                        save_evaluation(run_id, step_id, eval_result)
+                        print(f"    eval: rel={eval_result['relevance_score']} "
+                              f"faith={eval_result['faithfulness_score']} "
+                              f"complete={eval_result['completeness_score']} "
+                              f"halluc={eval_result['hallucination_detected']}")
+                    except Exception as eval_err:
+                        print(f"    (evaluation skipped: {eval_err})")
+
+                # Append to results only after all this job's work succeeded
+                results.append({
+                    "title": job["title"],
+                    "company": job["company"],
+                    "score": score_result["score"],
+                    "decision": score_result["decision"],
+                    "llm_decision": llm_decision,
+                    "needs_review": needs_review
+                })
+
+                finish_step(step_id, "success")
+
+            except Exception as e:
+                failures += 1
+                fail_step(step_id, e)
+                print(f"{job['title']} ({job['company']}): FAILED — {e}")
+
+            print("-" * 60)
+
+        # Step N+1: rank jobs — monitored (the real ranking runs inside the tool call)
+        rank_step_id = create_step(run_id, "rank_jobs", len(jobs) + 4)
+        try:
+            ranked = logged_tool_call(
+                "rank_jobs", lambda r: rank_jobs(r), results, run_id, rank_step_id
+            )
+            if ranked is None:
+                raise RuntimeError("rank_jobs returned None")
+            finish_step(rank_step_id, "success")
         except Exception as e:
             failures += 1
-            fail_step(step_id, e)
-            print(f"{job['title']} ({job['company']}): FAILED — {e}")
+            fail_step(rank_step_id, e)
+            ranked = results
+            print(f"Ranking failed: {e}")
 
-        print("-" * 60)
+        overall_status = "success" if failures == 0 else "completed_with_errors"
+        finish_run(run_id, overall_status)
+        run_finished = True
+        print(f"Run {run_id} complete. {failures} failure(s).")
 
-    rank_step_id = create_step(run_id, "rank_jobs", len(jobs) + 4)
-    try:
-        ranked = rank_jobs(results)
-        if ranked is None:
-            raise RuntimeError("rank_jobs returned None")
-        logged_tool_call("rank_jobs", lambda _: ranked, "results", run_id, rank_step_id)
-        finish_step(rank_step_id, "success")
-    except Exception as e:
-        failures += 1
-        fail_step(rank_step_id, e)
-        ranked = results
-        print(f"Ranking failed: {e}")
+        print("\n" + "=" * 60)
+        print("RANKED JOBS (best match first):")
+        print("=" * 60)
+        for i, r in enumerate(ranked, 1):
+            flag = "  ** REVIEW **" if r["needs_review"] else ""
+            print(f"{i}. {r['title']} ({r['company']})")
+            print(f"   Score: {r['score']}/100 ({r['decision']})  |  LLM: {r['llm_decision']}{flag}")
 
-    overall_status = "success" if failures == 0 else "completed_with_errors"
-    finish_run(run_id, overall_status)
-    print(f"Run {run_id} complete. {failures} failure(s).")
-
-    print("\n" + "=" * 60)
-    print("RANKED JOBS (best match first):")
-    print("=" * 60)
-    for i, r in enumerate(ranked, 1):
-        flag = "  ** REVIEW **" if r["needs_review"] else ""
-        print(f"{i}. {r['title']} ({r['company']})")
-        print(f"   Score: {r['score']}/100 ({r['decision']})  |  LLM: {r['llm_decision']}{flag}")
+    finally:
+        # Safety net: if we exited without a normal finish, mark the run failed
+        # so it never sits orphaned as 'running'. The cleanup has its own guard.
+        if not run_finished:
+            try:
+                finish_run(run_id, "failed")
+                print(f"Run {run_id} ended unexpectedly — marked failed.")
+            except Exception as cleanup_err:
+                print(f"Could not finalize run {run_id}: {cleanup_err}")
 
 
 if __name__ == "__main__":
