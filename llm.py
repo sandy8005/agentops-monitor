@@ -143,6 +143,25 @@ def flag_for_review(step_id, reason="evaluator"):
     conn.close()
 
 
+def is_cancel_requested(run_id):
+    """Cooperative-cancellation check: has a user asked to stop this run?"""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT cancel_requested FROM runs WHERE id = %s", (run_id,))
+    row = cur.fetchone()
+    conn.close()
+    return bool(row and row[0])
+
+
+def request_cancel(run_id):
+    """Set the cancel flag so the running agent stops at its next checkpoint."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("UPDATE runs SET cancel_requested = TRUE WHERE id = %s", (run_id,))
+    conn.commit()
+    conn.close()
+
+
 def record_context(step_id, context):
     conn = get_connection()
     cur = conn.cursor()

@@ -12,7 +12,8 @@ from evaluator import evaluate_decision
 from llm import (
     create_run, create_step, logged_llm_call, logged_tool_call,
     finish_step, finish_run, fail_step, record_score, record_context,
-    save_evaluation, flag_for_review, quota_available, get_connection
+    save_evaluation, flag_for_review, quota_available, get_connection,
+    is_cancel_requested
 )
 from tools import keyword_overlap_tool
 
@@ -91,7 +92,6 @@ def run_agent(run_id=None, evaluate=False, resume_id=None, sleep_between=15):
     run_finished = False
 
     try:
-        # --- Load inputs: from DB (uploaded resume) or user_input.json (CLI) ---
         if resume_id is not None:
             step_id = create_step(run_id, "load_resume_from_db", 0)
             try:
@@ -154,7 +154,6 @@ def run_agent(run_id=None, evaluate=False, resume_id=None, sleep_between=15):
         print(f"Location: {user_input['location']}  |  Mode: {user_input['work_mode']}")
         print(f"Resume: {len(resume_text)} characters")
 
-        # Step 2: parse_resume
         step_id = create_step(run_id, "parse_resume", 2)
         try:
             parsed = parse_resume(resume_text, run_id, step_id)
@@ -168,7 +167,6 @@ def run_agent(run_id=None, evaluate=False, resume_id=None, sleep_between=15):
 
         print(f"Parsed: {len(parsed['skills'])} skills, {len(parsed['projects'])} projects")
 
-        # Step 3: search_jobs
         step_id = create_step(run_id, "search_jobs", 3)
         try:
             search_params = {
@@ -198,8 +196,14 @@ def run_agent(run_id=None, evaluate=False, resume_id=None, sleep_between=15):
 
         results = []
 
-        # Steps 4..N: evaluate each job
         for index, job in enumerate(jobs, start=4):
+            # Cooperative cancellation: stop cleanly between jobs if requested.
+            if is_cancel_requested(run_id):
+                print(f"Run {run_id} cancelled by user — stopping.")
+                finish_run(run_id, "cancelled")
+                run_finished = True
+                return
+
             if sleep_between:
                 time.sleep(sleep_between)
             step_id = create_step(run_id, job["title"], index)
@@ -243,7 +247,6 @@ def run_agent(run_id=None, evaluate=False, resume_id=None, sleep_between=15):
                 flag = "  ** REVIEW **" if needs_review else ""
                 print(f"{job['title']}: LLM={llm_decision}  Score={score_result['score']}({score_result['decision']}){flag}")
 
-                # Steps 10 & 11: only for viable jobs (Apply / Maybe)
                 if llm_decision in ("Apply", "Maybe"):
                     strategy = application_strategy(
                         resume_text, job, requirements,
@@ -256,19 +259,14 @@ def run_agent(run_id=None, evaluate=False, resume_id=None, sleep_between=15):
                     print(f"\n  STRATEGY: {strategy.strip()}")
                     print(f"\n  RESUME EDITS: {edits.strip()}\n")
 
-                # Optional LLM-as-judge evaluation (guarded — never fails the step)
                 if evaluate:
                     try:
                         eval_result = evaluate_decision(resume_text, job, result, run_id, step_id)
                         save_evaluation(run_id, step_id, eval_result)
-
-                        # If the judge caught a hallucination, flag for review even
-                        # when score and LLM agreed — a second, independent trigger.
                         if eval_result["hallucination_detected"] and not needs_review:
                             flag_for_review(step_id, reason="hallucination")
                             needs_review = True
                             print(f"    ⚠ evaluator flagged hallucination — marked for review")
-
                         print(f"    eval: rel={eval_result['relevance_score']} "
                               f"faith={eval_result['faithfulness_score']} "
                               f"complete={eval_result['completeness_score']} "
@@ -276,7 +274,6 @@ def run_agent(run_id=None, evaluate=False, resume_id=None, sleep_between=15):
                     except Exception as eval_err:
                         print(f"    (evaluation skipped: {eval_err})")
 
-                # Append to results only after all this job's work succeeded
                 results.append({
                     "title": job["title"],
                     "company": job["company"],
@@ -295,7 +292,6 @@ def run_agent(run_id=None, evaluate=False, resume_id=None, sleep_between=15):
 
             print("-" * 60)
 
-        # Step N+1: rank jobs — monitored (real ranking runs inside the tool call)
         rank_step_id = create_step(run_id, "rank_jobs", len(jobs) + 4)
         try:
             ranked = logged_tool_call(

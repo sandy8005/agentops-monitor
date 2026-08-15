@@ -4,7 +4,7 @@ from datetime import datetime
 import psycopg2, os, tempfile
 from dotenv import load_dotenv
 from agent import run_agent
-from llm import create_run
+from llm import create_run, request_cancel
 from pdf_reader import read_resume_file
 
 load_dotenv()
@@ -47,6 +47,7 @@ def dashboard():
     .errors { background: #3a2814; color: #fbbf24; }
     .failed { background: #3a1518; color: #f87171; }
     .running { background: #1e2a4a; color: #60a5fa; }
+    .cancelled { background: #2a2e3a; color: #b0b4c0; }
     .detail { margin-top: 24px; }
     .step { background: #171a22; border: 1px solid #2a2e3a; border-radius: 6px; padding: 12px 16px; margin-bottom: 8px; }
     .review { border-color: #fbbf24; }
@@ -209,6 +210,14 @@ def dashboard():
       } catch (err) { alert('Error: ' + err.message); }
     }
 
+    async function cancelRun(id) {
+      if (!confirm('Cancel run #' + id + '?')) return;
+      try {
+        const res = await fetch('/runs/' + id + '/cancel', { method: 'POST' });
+        if (!res.ok) { const e = await res.json(); throw new Error(e.detail || 'cancel failed'); }
+      } catch (err) { alert('Error: ' + err.message); }
+    }
+
     async function deleteResume(id) {
       if (!confirm('Delete resume #' + id + '?')) return;
       try {
@@ -262,6 +271,7 @@ def dashboard():
           if (r.status === 'success') cls = 'success';
           else if (r.status === 'failed') cls = 'failed';
           else if (r.status === 'running') cls = 'running';
+          else if (r.status === 'cancelled') cls = 'cancelled';
           const tr = document.createElement('tr');
           tr.innerHTML = '<td>#' + escapeHtml(r.id) + '</td>' +
             '<td><span class="status ' + cls + '">' + escapeHtml(r.status) + '</span></td>' +
@@ -297,6 +307,7 @@ def dashboard():
           html += '<div class="step progress">' +
             '<strong style="color:#60a5fa;">&#9679; RUNNING</strong> &nbsp; ' +
             done + '/' + total + ' steps done &nbsp; | &nbsp; current: ' + escapeHtml(current) +
+            ' &nbsp; <button class="btn-sm btn-reject" onclick="cancelRun(' + run.id + ')">Cancel</button>' +
             '</div>';
         }
 
@@ -475,6 +486,23 @@ def start_run(background_tasks: BackgroundTasks, resume_id: int = None):
     background_tasks.add_task(run_agent, run_id, False, resume_id)
     return {"run_id": run_id, "resume_id": resume_id,
             "message": f"Run {run_id} started in background."}
+
+
+@app.post("/runs/{run_id}/cancel")
+def cancel_run(run_id: int):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT status FROM runs WHERE id = %s", (run_id,))
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
+    if row[0] != "running":
+        conn.close()
+        raise HTTPException(status_code=400, detail=f"Run {run_id} is not running (status: {row[0]})")
+    conn.close()
+    request_cancel(run_id)
+    return {"run_id": run_id, "cancel_requested": True}
 
 
 @app.get("/runs/{run_id}")
