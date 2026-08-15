@@ -70,14 +70,14 @@ def real_llm(prompt, max_retries=3):
             time.sleep(wait)
 
 
-def create_run(input_summary):
+def create_run(input_summary, resume_id=None):
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
-        INSERT INTO runs (started_at, status, input_summary)
-        VALUES (%s, %s, %s)
+        INSERT INTO runs (started_at, status, input_summary, resume_id)
+        VALUES (%s, %s, %s, %s)
         RETURNING id
-    """, (datetime.now(), "running", input_summary))
+    """, (datetime.now(), "running", input_summary, resume_id))
     run_id = cur.fetchone()[0]
     conn.commit()
     conn.close()

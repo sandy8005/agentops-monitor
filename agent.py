@@ -80,7 +80,7 @@ Reason: <one sentence explaining why>
 
 def run_agent(run_id=None, evaluate=False, resume_id=None, sleep_between=15):
     if run_id is None:
-        run_id = create_run("job search run")
+        run_id = create_run("job search run", resume_id=resume_id)
 
     if not quota_available():
         print("⚠ API quota exhausted — skipping run. Try again after reset.")
@@ -95,7 +95,11 @@ def run_agent(run_id=None, evaluate=False, resume_id=None, sleep_between=15):
         if resume_id is not None:
             step_id = create_step(run_id, "load_resume_from_db", 0)
             try:
-                db_resume = load_resume_from_db(resume_id)
+                db_resume = logged_tool_call(
+                    "load_resume_from_db", load_resume_from_db, resume_id, run_id, step_id
+                )
+                if db_resume is None:
+                    raise RuntimeError("load_resume_from_db returned nothing")
                 user_input = {
                     "resume_file": None,
                     "target_role": db_resume["target_role"],
