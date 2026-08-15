@@ -302,7 +302,7 @@ def list_runs(limit: int = 20):
 
 @app.post("/runs")
 def start_run(background_tasks: BackgroundTasks, resume_id: int = None):
-    run_id = create_run("job search run (dashboard)")
+    run_id = create_run("job search run (dashboard)", resume_id=resume_id)
     background_tasks.add_task(run_agent, run_id, False, resume_id)
     return {"run_id": run_id, "message": f"Run {run_id} started in background."}
 
