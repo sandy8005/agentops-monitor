@@ -67,6 +67,7 @@ def dashboard():
     .upload-form .row > div { flex: 1; }
     .err { color: #f87171; font-size: 12px; margin-top: 8px; }
     .progress { border-color: #60a5fa !important; }
+    .rev-input { background: #0d0f15; border: 1px solid #2a2e3a; border-radius: 4px; padding: 5px; color: #e4e6eb; font-size: 12px; margin-right: 6px; }
   </style>
 </head>
 <body>
@@ -241,6 +242,10 @@ def dashboard():
           el.innerHTML = '<strong>' + escapeHtml(it.step_name) + '</strong> (run #' + escapeHtml(it.run_id) + ') - ' +
             'Score: ' + escapeHtml(it.match_score) + ' (' + escapeHtml(it.score_decision) + ') | LLM: ' + escapeHtml(it.llm_decision) +
             '<div style="margin-top:8px;">' +
+              '<input id="reviewer_' + it.step_id + '" class="rev-input" placeholder="your name" style="width:140px;">' +
+              '<input id="comment_' + it.step_id + '" class="rev-input" placeholder="comment (optional)" style="width:260px;">' +
+            '</div>' +
+            '<div style="margin-top:8px;">' +
               '<button class="btn-sm btn-approve" onclick="review(' + it.step_id + ', \\'approved\\')">Approve</button>' +
               '<button class="btn-sm btn-reject" onclick="review(' + it.step_id + ', \\'rejected\\')">Reject</button>' +
             '</div>';
@@ -252,8 +257,15 @@ def dashboard():
     }
 
     async function review(stepId, decision) {
+      const reviewerEl = document.getElementById('reviewer_' + stepId);
+      const commentEl = document.getElementById('comment_' + stepId);
+      const reviewer = reviewerEl ? reviewerEl.value.trim() : '';
+      const comment = commentEl ? commentEl.value.trim() : '';
+      const qs = '?decision=' + decision +
+                 '&reviewer=' + encodeURIComponent(reviewer || 'anonymous') +
+                 '&comment=' + encodeURIComponent(comment);
       try {
-        const res = await fetch('/steps/' + stepId + '/review?decision=' + decision, { method: 'POST' });
+        const res = await fetch('/steps/' + stepId + '/review' + qs, { method: 'POST' });
         if (res.ok) { loadPending(); }
         else { const err = await res.json(); alert('Error: ' + (err.detail || 'failed')); }
       } catch (err) { alert('Network error: ' + err.message); }
@@ -318,7 +330,10 @@ def dashboard():
           if (s.match_score !== null) {
             html += ' - Score: ' + escapeHtml(s.match_score) + ' (' + escapeHtml(s.score_decision) + ') | LLM: ' + escapeHtml(s.llm_decision);
             if (review && s.review_status) {
-              html += ' <span class="reviewed">&#9679; ' + escapeHtml(s.review_status.toUpperCase()) + '</span>';
+              html += ' <span class="reviewed">&#9679; ' + escapeHtml(s.review_status.toUpperCase());
+              if (s.reviewer) html += ' by ' + escapeHtml(s.reviewer);
+              html += '</span>';
+              if (s.review_comment) html += '<div class="call">note: ' + escapeHtml(s.review_comment) + '</div>';
             } else if (review) {
               html += ' <span class="flag">&#9888; NEEDS REVIEW</span>';
             } else {
@@ -521,7 +536,8 @@ def get_run(run_id: int):
 
     cur.execute("""
         SELECT id, step_name, status, match_score, score_decision,
-               llm_decision, needs_human_review, review_status, error_message, retrieved_context
+               llm_decision, needs_human_review, review_status, error_message,
+               retrieved_context, reviewer, review_comment
         FROM steps WHERE run_id = %s ORDER BY step_order
     """, (run_id,))
     step_rows = cur.fetchall()
@@ -568,6 +584,7 @@ def get_run(run_id: int):
             "score_decision": s[4], "llm_decision": s[5],
             "needs_human_review": s[6], "review_status": s[7],
             "error_message": s[8], "retrieved_context": s[9],
+            "reviewer": s[10], "review_comment": s[11],
             "tool_calls": tool_calls, "llm_calls": llm_calls,
             "evaluation": evaluation
         })
@@ -607,7 +624,7 @@ def pending_reviews():
 
 
 @app.post("/steps/{step_id}/review")
-def submit_review(step_id: int, decision: str):
+def submit_review(step_id: int, decision: str, reviewer: str = "anonymous", comment: str = ""):
     if decision not in ("approved", "rejected"):
         raise HTTPException(status_code=400, detail="decision must be 'approved' or 'rejected'")
 
@@ -626,8 +643,10 @@ def submit_review(step_id: int, decision: str):
         raise HTTPException(status_code=409, detail=f"This step was already reviewed ({row[1]})")
 
     cur.execute("""
-        UPDATE steps SET review_status = %s, reviewed_at = %s WHERE id = %s
-    """, (decision, datetime.now(), step_id))
+        UPDATE steps
+        SET review_status = %s, reviewed_at = %s, reviewer = %s, review_comment = %s
+        WHERE id = %s
+    """, (decision, datetime.now(), reviewer or "anonymous", comment, step_id))
     conn.commit()
     conn.close()
-    return {"step_id": step_id, "review_status": decision}
+    return {"step_id": step_id, "review_status": decision, "reviewer": reviewer or "anonymous"}
