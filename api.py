@@ -65,6 +65,7 @@ def dashboard():
     .upload-form .row { display: flex; gap: 12px; }
     .upload-form .row > div { flex: 1; }
     .err { color: #f87171; font-size: 12px; margin-top: 8px; }
+    .progress { border-color: #60a5fa !important; }
   </style>
 </head>
 <body>
@@ -125,6 +126,7 @@ def dashboard():
 
   <script>
     var NL = String.fromCharCode(10);
+    var pollTimer = null;
 
     function escapeHtml(s) {
       return String(s == null ? '' : s)
@@ -165,7 +167,8 @@ def dashboard():
         if (!run.ok) { const e = await run.json(); throw new Error(e.detail || 'run failed to start'); }
         const runData = await run.json();
         msg.textContent = 'Resume #' + upData.resume_id + ' -> Run #' + runData.run_id + ' started.';
-        setTimeout(function() { loadRuns(); loadResumes(); loadDetail(runData.run_id); }, 2000);
+        loadResumes();
+        setTimeout(function() { loadRuns(); loadDetail(runData.run_id); }, 1500);
       } catch (err) {
         msg.textContent = 'Error: ' + err.message;
       } finally {
@@ -202,8 +205,7 @@ def dashboard():
         const run = await fetch('/runs?resume_id=' + id, { method: 'POST' });
         if (!run.ok) { const e = await run.json(); throw new Error(e.detail || 'run failed'); }
         const runData = await run.json();
-        alert('Run #' + runData.run_id + ' started for resume #' + id);
-        setTimeout(function() { loadRuns(); loadDetail(runData.run_id); }, 2000);
+        setTimeout(function() { loadRuns(); loadDetail(runData.run_id); }, 1500);
       } catch (err) { alert('Error: ' + err.message); }
     }
 
@@ -280,7 +282,24 @@ def dashboard():
         const res = await fetch('/runs/' + id);
         if (!res.ok) throw new Error('failed to load run ' + id);
         const run = await res.json();
+
+        const total = run.steps.length;
+        const done = run.steps.filter(function(s) {
+          return s.status === 'success' || s.status === 'failed';
+        }).length;
+        const running = run.status === 'running';
+
         let html = '<h2>Run #' + escapeHtml(run.id) + ' - ' + escapeHtml(run.status) + '</h2>';
+
+        if (running) {
+          const active = run.steps.filter(function(s){ return s.status === 'running'; });
+          const current = active.length ? active[active.length - 1].step_name : 'starting...';
+          html += '<div class="step progress">' +
+            '<strong style="color:#60a5fa;">&#9679; RUNNING</strong> &nbsp; ' +
+            done + '/' + total + ' steps done &nbsp; | &nbsp; current: ' + escapeHtml(current) +
+            '</div>';
+        }
+
         for (const s of run.steps) {
           const review = s.needs_human_review;
           html += '<div class="step ' + (review ? 'review' : '') + '">' +
@@ -319,7 +338,13 @@ def dashboard():
           html += '</div>';
         }
         d.innerHTML = html;
-        d.scrollIntoView({ behavior: 'smooth' });
+
+        if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+        if (running) {
+          pollTimer = setTimeout(function() { loadDetail(id); }, 3000);
+        } else {
+          loadRuns();
+        }
       } catch (err) {
         d.innerHTML = '<div style="color:#f87171;">Could not load run detail: ' + escapeHtml(err.message) + '</div>';
       }
