@@ -109,6 +109,9 @@ def dashboard():
       <div id="uploadMsg" class="err"></div>
     </div>
 
+    <div class="section-title">Saved Resumes</div>
+    <div id="resumeLibrary"></div>
+
     <div class="section-title">Pending Human Review</div>
     <div id="pending"></div>
 
@@ -121,6 +124,8 @@ def dashboard():
   </div>
 
   <script>
+    var NL = String.fromCharCode(10);
+
     function escapeHtml(s) {
       return String(s == null ? '' : s)
         .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
@@ -154,18 +159,61 @@ def dashboard():
         const up = await fetch('/upload', { method: 'POST', body: fd });
         if (!up.ok) { const e = await up.json(); throw new Error(e.detail || 'upload failed'); }
         const upData = await up.json();
-        msg.textContent = `Stored resume #${upData.resume_id} (${upData.chars} chars). Starting run...`;
+        msg.textContent = 'Stored resume #' + upData.resume_id + ' (' + upData.chars + ' chars). Starting run...';
 
         const run = await fetch('/runs?resume_id=' + upData.resume_id, { method: 'POST' });
         if (!run.ok) { const e = await run.json(); throw new Error(e.detail || 'run failed to start'); }
         const runData = await run.json();
-        msg.textContent = `Resume #${upData.resume_id} → Run #${runData.run_id} started.`;
-        setTimeout(() => { loadRuns(); loadDetail(runData.run_id); }, 2000);
+        msg.textContent = 'Resume #' + upData.resume_id + ' -> Run #' + runData.run_id + ' started.';
+        setTimeout(function() { loadRuns(); loadResumes(); loadDetail(runData.run_id); }, 2000);
       } catch (err) {
         msg.textContent = 'Error: ' + err.message;
       } finally {
         btn.disabled = false; btn.innerHTML = '&#9654; Upload &amp; Start Run';
       }
+    }
+
+    async function loadResumes() {
+      const div = document.getElementById('resumeLibrary');
+      try {
+        const res = await fetch('/resumes');
+        if (!res.ok) throw new Error('failed to load resumes');
+        const resumes = await res.json();
+        if (resumes.length === 0) { div.innerHTML = '<div class="step">No saved resumes yet.</div>'; return; }
+        div.innerHTML = '';
+        for (const r of resumes) {
+          const el = document.createElement('div');
+          el.className = 'step';
+          el.innerHTML = '<strong>' + escapeHtml(r.name) + '</strong> - ' + escapeHtml(r.target_role || 'no role') +
+            ' <span style="color:#8b8f9c;">(' + escapeHtml(r.chars) + ' chars, ' + escapeHtml(r.work_mode || 'any') + ')</span>' +
+            '<div style="margin-top:8px;">' +
+              '<button class="btn-sm btn-approve" onclick="runResume(' + r.id + ')">Run</button>' +
+              '<button class="btn-sm btn-reject" onclick="deleteResume(' + r.id + ')">Delete</button>' +
+            '</div>';
+          div.appendChild(el);
+        }
+      } catch (err) {
+        div.innerHTML = '<div class="step" style="color:#f87171;">Could not load resumes: ' + escapeHtml(err.message) + '</div>';
+      }
+    }
+
+    async function runResume(id) {
+      try {
+        const run = await fetch('/runs?resume_id=' + id, { method: 'POST' });
+        if (!run.ok) { const e = await run.json(); throw new Error(e.detail || 'run failed'); }
+        const runData = await run.json();
+        alert('Run #' + runData.run_id + ' started for resume #' + id);
+        setTimeout(function() { loadRuns(); loadDetail(runData.run_id); }, 2000);
+      } catch (err) { alert('Error: ' + err.message); }
+    }
+
+    async function deleteResume(id) {
+      if (!confirm('Delete resume #' + id + '?')) return;
+      try {
+        const res = await fetch('/resumes/' + id, { method: 'DELETE' });
+        if (!res.ok) { const e = await res.json(); throw new Error(e.detail || 'delete failed'); }
+        loadResumes();
+      } catch (err) { alert('Error: ' + err.message); }
     }
 
     async function loadPending() {
@@ -179,12 +227,12 @@ def dashboard():
         for (const it of items) {
           const el = document.createElement('div');
           el.className = 'step review';
-          el.innerHTML = `<strong>${escapeHtml(it.step_name)}</strong> (run #${escapeHtml(it.run_id)}) —
-            Score: ${escapeHtml(it.match_score)} (${escapeHtml(it.score_decision)}) | LLM: ${escapeHtml(it.llm_decision)}
-            <div style="margin-top:8px;">
-              <button class="btn-sm btn-approve" onclick="review(${it.step_id}, 'approved')">Approve</button>
-              <button class="btn-sm btn-reject" onclick="review(${it.step_id}, 'rejected')">Reject</button>
-            </div>`;
+          el.innerHTML = '<strong>' + escapeHtml(it.step_name) + '</strong> (run #' + escapeHtml(it.run_id) + ') - ' +
+            'Score: ' + escapeHtml(it.match_score) + ' (' + escapeHtml(it.score_decision) + ') | LLM: ' + escapeHtml(it.llm_decision) +
+            '<div style="margin-top:8px;">' +
+              '<button class="btn-sm btn-approve" onclick="review(' + it.step_id + ', \\'approved\\')">Approve</button>' +
+              '<button class="btn-sm btn-reject" onclick="review(' + it.step_id + ', \\'rejected\\')">Reject</button>' +
+            '</div>';
           div.appendChild(el);
         }
       } catch (err) {
@@ -213,12 +261,12 @@ def dashboard():
           else if (r.status === 'failed') cls = 'failed';
           else if (r.status === 'running') cls = 'running';
           const tr = document.createElement('tr');
-          tr.innerHTML = `<td>#${escapeHtml(r.id)}</td>
-            <td><span class="status ${cls}">${escapeHtml(r.status)}</span></td>
-            <td>${escapeHtml((r.started_at || '').replace('T', ' ').slice(0, 16))}</td>
-            <td>${escapeHtml(r.total_tokens || 0)}</td>
-            <td>$${escapeHtml((r.total_cost || 0).toFixed(6))}</td>`;
-          tr.onclick = () => loadDetail(r.id);
+          tr.innerHTML = '<td>#' + escapeHtml(r.id) + '</td>' +
+            '<td><span class="status ' + cls + '">' + escapeHtml(r.status) + '</span></td>' +
+            '<td>' + escapeHtml((r.started_at || '').replace('T', ' ').slice(0, 16)) + '</td>' +
+            '<td>' + escapeHtml(r.total_tokens || 0) + '</td>' +
+            '<td>$' + escapeHtml((r.total_cost || 0).toFixed(6)) + '</td>';
+          tr.onclick = function() { loadDetail(r.id); };
           tbody.appendChild(tr);
         }
       } catch (err) {
@@ -232,39 +280,43 @@ def dashboard():
         const res = await fetch('/runs/' + id);
         if (!res.ok) throw new Error('failed to load run ' + id);
         const run = await res.json();
-        let html = `<h2>Run #${escapeHtml(run.id)} — ${escapeHtml(run.status)}</h2>`;
+        let html = '<h2>Run #' + escapeHtml(run.id) + ' - ' + escapeHtml(run.status) + '</h2>';
         for (const s of run.steps) {
           const review = s.needs_human_review;
-          html += `<div class="step ${review ? 'review' : ''}">
-            <strong>${escapeHtml(s.step_name)}</strong> [${escapeHtml(s.status)}]`;
+          html += '<div class="step ' + (review ? 'review' : '') + '">' +
+            '<strong>' + escapeHtml(s.step_name) + '</strong> [' + escapeHtml(s.status) + ']';
           if (s.match_score !== null) {
-            html += ` — Score: ${escapeHtml(s.match_score)} (${escapeHtml(s.score_decision)}) | LLM: ${escapeHtml(s.llm_decision)}`;
+            html += ' - Score: ' + escapeHtml(s.match_score) + ' (' + escapeHtml(s.score_decision) + ') | LLM: ' + escapeHtml(s.llm_decision);
             if (review && s.review_status) {
-              html += ` <span class="reviewed">&#9679; ${escapeHtml(s.review_status.toUpperCase())}</span>`;
+              html += ' <span class="reviewed">&#9679; ' + escapeHtml(s.review_status.toUpperCase()) + '</span>';
             } else if (review) {
-              html += ` <span class="flag">&#9888; NEEDS REVIEW</span>`;
+              html += ' <span class="flag">&#9888; NEEDS REVIEW</span>';
             } else {
-              html += ` <span class="agree">&#10003;</span>`;
+              html += ' <span class="agree">&#10003;</span>';
             }
           }
           if (s.error_message) {
-            html += `<div class="call call-failed">error: ${escapeHtml(s.error_message)}</div>`;
+            html += '<div class="call call-failed">error: ' + escapeHtml(s.error_message) + '</div>';
           }
           for (const t of (s.tool_calls || [])) {
             const fc = t.status === 'failed' ? 'call-failed' : '';
-            html += `<div class="call ${fc}">tool: ${escapeHtml(t.tool_name)} [${escapeHtml(t.status)}] ${escapeHtml(t.latency_ms)}ms
-              <details><summary>view i/o</summary>
-                <pre class="io">IN: ${escapeHtml(t.input_json || '')}\n\nOUT: ${escapeHtml(t.output_json || '')}${t.error_message ? '\n\nERROR: ' + escapeHtml(t.error_message) : ''}</pre>
-              </details></div>`;
+            let io = 'IN: ' + escapeHtml(t.input_json || '') + NL + NL + 'OUT: ' + escapeHtml(t.output_json || '');
+            if (t.error_message) io += NL + NL + 'ERROR: ' + escapeHtml(t.error_message);
+            html += '<div class="call ' + fc + '">tool: ' + escapeHtml(t.tool_name) + ' [' + escapeHtml(t.status) + '] ' + escapeHtml(t.latency_ms) + 'ms' +
+              '<details><summary>view i/o</summary><pre class="io">' + io + '</pre></details></div>';
           }
           for (const l of (s.llm_calls || [])) {
             const fc = l.status === 'failed' ? 'call-failed' : '';
-            html += `<div class="call ${fc}">llm: ${escapeHtml(l.prompt_tokens)}+${escapeHtml(l.completion_tokens)} tok, ${escapeHtml(l.latency_ms)}ms, $${escapeHtml(l.cost_usd)} [${escapeHtml(l.status)}]
-              <details><summary>view prompt/response</summary>
-                <pre class="io">PROMPT:\n${escapeHtml(l.prompt || '')}\n\nRESPONSE:\n${escapeHtml(l.response || '')}${l.error_message ? '\n\nERROR: ' + escapeHtml(l.error_message) : ''}</pre>
-              </details></div>`;
+            let io = 'PROMPT:' + NL + escapeHtml(l.prompt || '') + NL + NL + 'RESPONSE:' + NL + escapeHtml(l.response || '');
+            if (l.error_message) io += NL + NL + 'ERROR: ' + escapeHtml(l.error_message);
+            html += '<div class="call ' + fc + '">llm: ' + escapeHtml(l.prompt_tokens) + '+' + escapeHtml(l.completion_tokens) + ' tok, ' + escapeHtml(l.latency_ms) + 'ms, $' + escapeHtml(l.cost_usd) + ' [' + escapeHtml(l.status) + ']' +
+              '<details><summary>view prompt/response</summary><pre class="io">' + io + '</pre></details></div>';
           }
-          html += `</div>`;
+          if (s.evaluation) {
+            const ev = s.evaluation;
+            html += '<div class="call">eval: rel=' + escapeHtml(ev.relevance_score) + ' faith=' + escapeHtml(ev.faithfulness_score) + ' complete=' + escapeHtml(ev.completeness_score) + ' halluc=' + escapeHtml(ev.hallucination_detected) + '</div>';
+          }
+          html += '</div>';
         }
         d.innerHTML = html;
         d.scrollIntoView({ behavior: 'smooth' });
@@ -273,6 +325,7 @@ def dashboard():
       }
     }
 
+    loadResumes();
     loadPending();
     loadRuns();
   </script>
@@ -294,11 +347,8 @@ async def upload_resume(
         raise HTTPException(status_code=400, detail="Please upload a PDF file")
 
     contents = await file.read()
-
-    # size cap
     if len(contents) > MAX_UPLOAD_BYTES:
         raise HTTPException(status_code=400, detail="File too large (max 5 MB)")
-    # content check: real PDFs start with %PDF, not just a .pdf name
     if not contents[:5].startswith(b"%PDF"):
         raise HTTPException(status_code=400, detail="File does not appear to be a valid PDF")
 
@@ -333,6 +383,38 @@ async def upload_resume(
             "chars": len(resume_text), "message": f"Resume stored as #{resume_id}"}
 
 
+@app.get("/resumes")
+def list_resumes():
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT id, name, target_role, location, work_mode, length(resume_text), created_at
+        FROM resumes ORDER BY id DESC
+    """)
+    rows = cur.fetchall()
+    conn.close()
+    return [
+        {"id": r[0], "name": r[1], "target_role": r[2], "location": r[3],
+         "work_mode": r[4], "chars": r[5],
+         "created_at": r[6].isoformat() if r[6] else None}
+        for r in rows
+    ]
+
+
+@app.delete("/resumes/{resume_id}")
+def delete_resume(resume_id: int):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT 1 FROM resumes WHERE id = %s", (resume_id,))
+    if not cur.fetchone():
+        conn.close()
+        raise HTTPException(status_code=404, detail=f"Resume {resume_id} not found")
+    cur.execute("DELETE FROM resumes WHERE id = %s", (resume_id,))
+    conn.commit()
+    conn.close()
+    return {"resume_id": resume_id, "deleted": True}
+
+
 @app.get("/runs")
 def list_runs(limit: int = Query(20, ge=1, le=100)):
     conn = get_connection()
@@ -353,11 +435,9 @@ def list_runs(limit: int = Query(20, ge=1, le=100)):
 
 @app.post("/runs")
 def start_run(background_tasks: BackgroundTasks, resume_id: int = None):
-    # resume_id is required from the dashboard path — no silent fallback to user_input.json
     if resume_id is None:
-        raise HTTPException(status_code=400, detail="resume_id is required; upload a resume first")
+        raise HTTPException(status_code=400, detail="resume_id is required; upload or pick a resume first")
 
-    # confirm the resume exists before starting a costly run
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("SELECT 1 FROM resumes WHERE id = %s", (resume_id,))
@@ -415,7 +495,6 @@ def get_run(run_id: int):
              "prompt": l[5], "response": l[6], "error_message": l[7]}
             for l in cur.fetchall()
         ]
-        # evaluation for this step, if any
         cur.execute("""
             SELECT relevance_score, faithfulness_score, completeness_score,
                    hallucination_detected, hallucinated_claims, notes
