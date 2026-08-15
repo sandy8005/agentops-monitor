@@ -21,7 +21,8 @@ CREATE TABLE IF NOT EXISTS runs (
     status TEXT,
     input_summary TEXT,
     total_tokens INTEGER DEFAULT 0,
-    total_cost NUMERIC(12,6) DEFAULT 0
+    total_cost NUMERIC(12,6) DEFAULT 0,
+    resume_id INTEGER
 )
 """)
 
@@ -83,6 +84,49 @@ CREATE TABLE IF NOT EXISTS tool_calls (
 )
 """)
 
+cur.execute("""
+CREATE TABLE IF NOT EXISTS job_postings (
+    id SERIAL PRIMARY KEY,
+    title TEXT NOT NULL,
+    company TEXT,
+    description TEXT NOT NULL,
+    location TEXT,
+    work_mode TEXT,
+    source TEXT DEFAULT 'seed',
+    created_at TIMESTAMP DEFAULT NOW()
+)
+""")
+
+cur.execute("""
+CREATE TABLE IF NOT EXISTS resumes (
+    id SERIAL PRIMARY KEY,
+    name TEXT,
+    resume_text TEXT NOT NULL,
+    target_role TEXT,
+    location TEXT,
+    work_mode TEXT,
+    employment_type TEXT,
+    created_at TIMESTAMP DEFAULT NOW()
+)
+""")
+
+cur.execute("""
+CREATE TABLE IF NOT EXISTS evaluations (
+    id SERIAL PRIMARY KEY,
+    run_id INTEGER,
+    step_id INTEGER,
+    relevance_score INTEGER,
+    faithfulness_score INTEGER,
+    completeness_score INTEGER,
+    hallucination_detected BOOLEAN,
+    hallucinated_claims JSONB,
+    notes TEXT,
+    created_at TIMESTAMP,
+    FOREIGN KEY (run_id) REFERENCES runs(id),
+    FOREIGN KEY (step_id) REFERENCES steps(id)
+)
+""")
+
 conn.commit()
 conn.close()
-print("Postgres tables ready (complete schema)")
+print("Postgres tables ready (complete schema: 7 tables)")
