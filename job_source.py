@@ -47,21 +47,24 @@ def search_jobs(target_role=None, location=None, work_mode=None, min_results=3):
         def mode_ok(job):
             jm = (job.get("work_mode") or "").lower()
             jl = (job.get("location") or "").lower()
-            # no mode data and not obviously remote → don't exclude (missing data is not a mismatch)
             if not jm and "remote" not in jl:
                 return True
-            # remote jobs fit any preference
             if "remote" in jm or "remote" in jl:
                 return True
-            # otherwise require the requested mode to appear
             return wm in jm
 
         filtered = [j for j in filtered if mode_ok(j)]
 
-    # --- safety net: never return an empty/too-small set, but say so ---
-    if len(filtered) < min_results:
-        print(f"  ({len(filtered)} matched after filtering — returning all {len(all_jobs)} jobs)")
-        return all_jobs
+    # --- results handling ---
+    # Return the genuine matches, even if few. Do NOT dilute with irrelevant jobs
+    # — that wastes LLM tokens/quota evaluating things the user didn't ask for.
+    if len(filtered) == 0:
+        # Nothing matched at all. Rather than evaluate the entire DB, return a
+        # small sample so the run isn't empty, and make the situation explicit.
+        sample = all_jobs[:min_results]
+        print(f"  (no jobs matched '{target_role}' — showing {len(sample)} sample job(s); "
+              f"try a broader role or different filters)")
+        return sample
 
-    print(f"  ({len(filtered)} of {len(all_jobs)} jobs matched filters)")
+    print(f"  ({len(filtered)} of {len(all_jobs)} job(s) matched your criteria)")
     return filtered

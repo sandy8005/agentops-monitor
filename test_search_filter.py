@@ -1,12 +1,11 @@
 # test_search_filter.py
 from job_source import search_jobs
 
-print("--- role only ---")
-jobs = search_jobs("AI/ML Engineer", "Michigan")
-print(f"  {len(jobs)} jobs")
+# A role that should match few or none — verify we DON'T get the whole DB
+jobs = search_jobs(target_role="quantum blockchain astrologer")
+print(f"Returned {len(jobs)} jobs for a nonsense role")
+# Should be a small sample (<= 3), NOT the full pool
 
-print("--- role + work_mode=remote ---")
-jobs = search_jobs("AI/ML Engineer", "Michigan", "remote")
-print(f"  {len(jobs)} jobs")
-for j in jobs[:5]:
-    print(f"    {j['title']}  [{j.get('work_mode') or j.get('location') or 'no-mode'}]")
+# A real role — verify we get the genuine matches
+jobs2 = search_jobs(target_role="engineer")
+print(f"Returned {len(jobs2)} jobs for 'engineer'")
