@@ -22,7 +22,8 @@ CREATE TABLE IF NOT EXISTS runs (
     input_summary TEXT,
     total_tokens INTEGER DEFAULT 0,
     total_cost NUMERIC(12,6) DEFAULT 0,
-    resume_id INTEGER
+    resume_id INTEGER,
+    cancel_requested BOOLEAN DEFAULT FALSE
 )
 """)
 
@@ -43,6 +44,8 @@ CREATE TABLE IF NOT EXISTS steps (
     retrieved_context JSONB,
     review_status TEXT,
     reviewed_at TIMESTAMP,
+    reviewer TEXT,
+    review_comment TEXT,
     FOREIGN KEY (run_id) REFERENCES runs(id)
 )
 """)
