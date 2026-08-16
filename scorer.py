@@ -14,24 +14,6 @@ def _skill_present(skill, resume_text_lower, resume_tokens):
     return s in resume_tokens
 
 
-def _location_score(job_location, job_work_mode, user_location, user_work_mode):
-    """Award 0-5 points for location fit. Generous when data is missing."""
-    jl = (job_location or "").lower()
-    jm = (job_work_mode or "").lower()
-    ul = (user_location or "").lower()
-    um = (user_work_mode or "").lower()
-
-    if "remote" in jl or "remote" in jm or "anywhere" in jl:
-        return 5.0
-    if not jl:
-        return 3.0
-    if ul and ul in jl:
-        return 5.0
-    if um in ("remote", "hybrid") and not jl:
-        return 4.0
-    return 1.0
-
-
 def calculate_match_score(parsed_resume, requirements, resume_text, job=None, user_input=None):
     resume_text_lower = resume_text.lower()
     resume_tokens = set(re.findall(r"[a-z0-9\+\#\.]+", resume_text_lower))
@@ -78,29 +60,20 @@ def calculate_match_score(parsed_resume, requirements, resume_text, job=None, us
     for group in any_of_groups:
         all_required_flat.extend(group)
     if all_required_flat:
-        relevant = [s for s in set(all_required_flat) if s in project_tech_set]
-        # normalise against distinct required items so it stays 0-15
-        denom = len(set(all_required_flat))
-        breakdown["projects"] = round(15 * len(relevant) / denom, 1)
+        distinct = set(all_required_flat)
+        relevant = [s for s in distinct if s in project_tech_set]
+        breakdown["projects"] = round(15 * len(relevant) / len(distinct), 1)
     else:
         breakdown["projects"] = 0.0
 
-    # Experience — 10 pts.
+    # Experience — 15 pts (absorbs the points formerly given to location,
+    # which was removed: location is informational only, not a scoring factor).
     if candidate_years >= min_years:
-        breakdown["experience"] = 10.0
+        breakdown["experience"] = 15.0
     elif min_years > 0:
-        breakdown["experience"] = round(10 * candidate_years / min_years, 1)
+        breakdown["experience"] = round(15 * candidate_years / min_years, 1)
     else:
-        breakdown["experience"] = 10.0
-
-    # Location — 5 pts.
-    if job is not None and user_input is not None:
-        breakdown["location"] = _location_score(
-            job.get("location"), job.get("work_mode"),
-            user_input.get("location"), user_input.get("work_mode")
-        )
-    else:
-        breakdown["location"] = 3.0
+        breakdown["experience"] = 15.0
 
     total = round(sum(breakdown.values()), 1)
 

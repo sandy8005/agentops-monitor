@@ -39,6 +39,8 @@ def search_jobs(target_role=None, location=None, work_mode=None, min_results=3):
     filtered = [j for j in all_jobs if role_matches(j)]
 
     # --- work_mode filter (only excludes jobs that HAVE a mode and clearly conflict) ---
+    # Location is intentionally NOT used to filter: the user sees jobs from all
+    # locations. Location is collected and displayed but does not filter or score.
     if work_mode:
         wm = work_mode.lower()
 
