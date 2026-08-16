@@ -72,7 +72,7 @@ The "decision" field MUST be exactly one of: "Apply", "Maybe", or "Skip".
 
 
 def parse_decision(raw):
-    """Parse the LLM's JSON decision. Returns 'Apply'/'Maybe'/'Skip', or 'Unknown' on failure."""
+    """Parse the LLM's JSON decision. Returns 'Apply'/'Maybe'/'Skip', or raises on failure."""
     cleaned = raw.strip().replace("```json", "").replace("```", "").strip()
     parsed = JobDecision(**json.loads(cleaned))
     return parsed.decision.value
@@ -221,8 +221,8 @@ def run_agent(run_id=None, evaluate=False, resume_id=None, sleep_between=15):
                 result = logged_llm_call(prompt, run_id, step_id)
 
                 # Parse the LLM decision from structured JSON (Pydantic-validated).
-                # A malformed response degrades to 'Unknown', which will disagree
-                # with the score and correctly trigger human review.
+                # A malformed response degrades to 'Unknown', which disagrees with
+                # the score and correctly triggers human review.
                 try:
                     llm_decision = parse_decision(result)
                 except Exception as parse_err:
@@ -270,13 +270,30 @@ def run_agent(run_id=None, evaluate=False, resume_id=None, sleep_between=15):
                     try:
                         eval_result = evaluate_decision(resume_text, job, result, run_id, step_id)
                         save_evaluation(run_id, step_id, eval_result)
-                        if eval_result["hallucination_detected"] and not needs_review:
-                            flag_for_review(step_id, reason="hallucination")
+
+                        # Escalate to human review if the judge flags a problem:
+                        # a hallucination, any single very-low dimension, or a low
+                        # overall quality. Thresholds are conservative to avoid
+                        # flooding the review queue with borderline cases.
+                        rel = eval_result["relevance_score"]
+                        faith = eval_result["faithfulness_score"]
+                        comp = eval_result["completeness_score"]
+                        avg = (rel + faith + comp) / 3.0
+
+                        low_quality = (
+                            eval_result["hallucination_detected"]
+                            or rel <= 2 or faith <= 2 or comp <= 2   # any dimension alarming
+                            or avg < 4.0                              # broadly weak
+                        )
+
+                        if low_quality and not needs_review:
+                            reason = ("hallucination" if eval_result["hallucination_detected"]
+                                      else "low_evaluation_scores")
+                            flag_for_review(step_id, reason=reason)
                             needs_review = True
-                            print(f"    ⚠ evaluator flagged hallucination — marked for review")
-                        print(f"    eval: rel={eval_result['relevance_score']} "
-                              f"faith={eval_result['faithfulness_score']} "
-                              f"complete={eval_result['completeness_score']} "
+                            print(f"    ⚠ evaluator flagged ({reason}) — marked for review")
+
+                        print(f"    eval: rel={rel} faith={faith} complete={comp} "
                               f"halluc={eval_result['hallucination_detected']}")
                     except Exception as eval_err:
                         print(f"    (evaluation skipped: {eval_err})")
