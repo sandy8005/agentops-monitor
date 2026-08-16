@@ -70,6 +70,7 @@ def dashboard():
     .err { color: #f87171; font-size: 12px; margin-top: 8px; }
     .progress { border-color: #60a5fa !important; }
     .rev-input { background: #0d0f15; border: 1px solid #2a2e3a; border-radius: 4px; padding: 5px; color: #e4e6eb; font-size: 12px; margin-right: 6px; }
+    .note { text-transform: none; color: #8b8f9c; font-weight: normal; font-size: 12px; }
   </style>
 </head>
 <body>
@@ -126,9 +127,9 @@ def dashboard():
     <div class="section-title">Pending Human Review</div>
     <div id="pending"></div>
 
-    <div class="section-title">Runs</div>
+    <div class="section-title">Runs <span class="note">— cost is an estimate from published token rates, not the actual provider bill</span></div>
     <table id="runs">
-      <thead><tr><th>Run</th><th>Status</th><th>Started</th><th>Tokens</th><th>Cost</th></tr></thead>
+      <thead><tr><th>Run</th><th>Status</th><th>Started</th><th>Tokens</th><th>Est. Cost</th></tr></thead>
       <tbody></tbody>
     </table>
     <div class="detail" id="detail"></div>
@@ -303,7 +304,7 @@ def dashboard():
             '<td><span class="status ' + cls + '">' + escapeHtml(r.status) + '</span></td>' +
             '<td>' + escapeHtml((r.started_at || '').replace('T', ' ').slice(0, 16)) + '</td>' +
             '<td>' + escapeHtml(r.total_tokens || 0) + '</td>' +
-            '<td>$' + escapeHtml((r.total_cost || 0).toFixed(6)) + '</td>';
+            '<td>~$' + escapeHtml((r.total_cost || 0).toFixed(6)) + '</td>';
           tr.onclick = function() { loadDetail(r.id); };
           tbody.appendChild(tr);
         }
@@ -370,7 +371,7 @@ def dashboard():
             const fc = l.status === 'failed' ? 'call-failed' : '';
             let io = 'PROMPT:' + NL + escapeHtml(l.prompt || '') + NL + NL + 'RESPONSE:' + NL + escapeHtml(l.response || '');
             if (l.error_message) io += NL + NL + 'ERROR: ' + escapeHtml(l.error_message);
-            html += '<div class="call ' + fc + '"><span class="op">' + escapeHtml(l.operation || 'llm') + '</span> &middot; llm: ' + escapeHtml(l.prompt_tokens) + '+' + escapeHtml(l.completion_tokens) + ' tok, ' + escapeHtml(l.latency_ms) + 'ms, $' + escapeHtml(l.cost_usd) + ' [' + escapeHtml(l.status) + ']' +
+            html += '<div class="call ' + fc + '"><span class="op">' + escapeHtml(l.operation || 'llm') + '</span> &middot; llm: ' + escapeHtml(l.prompt_tokens) + '+' + escapeHtml(l.completion_tokens) + ' tok, ' + escapeHtml(l.latency_ms) + 'ms, ~$' + escapeHtml(l.cost_usd) + ' [' + escapeHtml(l.status) + ']' +
               '<details><summary>view prompt/response</summary><pre class="io">' + io + '</pre></details></div>';
           }
           if (s.evaluation) {

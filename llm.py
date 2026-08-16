@@ -11,6 +11,13 @@ load_dotenv()
 
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
+# Estimated pricing (USD per token), based on published Gemini Flash rates.
+# These are ESTIMATES for observability, not the actual provider invoice — real
+# billing may differ due to tiering, rounding, promotions, or model changes.
+# Input and output are priced separately (output tokens cost more than input).
+INPUT_TOKEN_RATE = 0.075 / 1_000_000     # ~$0.075 per 1M input tokens
+OUTPUT_TOKEN_RATE = 0.30 / 1_000_000     # ~$0.30 per 1M output tokens
+
 
 def get_connection():
     return psycopg2.connect(
@@ -209,7 +216,13 @@ def logged_llm_call(prompt, run_id, step_id, operation="llm_call"):
         latency_ms = int((end - start) * 1000)
         prompt_tokens = result["prompt_tokens"]
         completion_tokens = result["completion_tokens"]
-        cost_usd = (prompt_tokens + completion_tokens) * 0.000001
+
+        # Estimated cost: input and output tokens priced at their separate rates.
+        # This is an ESTIMATE for observability, not the actual provider bill.
+        estimated_cost = (
+            prompt_tokens * INPUT_TOKEN_RATE +
+            completion_tokens * OUTPUT_TOKEN_RATE
+        )
 
         conn = get_connection()
         cur = conn.cursor()
@@ -220,7 +233,7 @@ def logged_llm_call(prompt, run_id, step_id, operation="llm_call"):
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'success', %s)
         """, (
             run_id, step_id, "gemini-flash-latest", prompt, result["text"],
-            prompt_tokens, completion_tokens, latency_ms, cost_usd, datetime.now(), operation
+            prompt_tokens, completion_tokens, latency_ms, estimated_cost, datetime.now(), operation
         ))
         conn.commit()
         conn.close()
