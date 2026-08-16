@@ -197,7 +197,6 @@ def run_agent(run_id=None, evaluate=False, resume_id=None, sleep_between=15):
         results = []
 
         for index, job in enumerate(jobs, start=4):
-            # Cooperative cancellation: stop cleanly between jobs if requested.
             if is_cancel_requested(run_id):
                 print(f"Run {run_id} cancelled by user — stopping.")
                 finish_run(run_id, "cancelled")
@@ -234,6 +233,13 @@ def run_agent(run_id=None, evaluate=False, resume_id=None, sleep_between=15):
                     step_id, score_result["score"],
                     score_result["decision"], llm_decision
                 )
+
+                # If requirements couldn't be extracted, the score is untrustworthy
+                # — flag for human review regardless of score/LLM agreement.
+                if score_result.get("insufficient_requirements") and not needs_review:
+                    flag_for_review(step_id, reason="insufficient_requirements")
+                    needs_review = True
+                    print(f"    ⚠ insufficient job requirements — flagged for review")
 
                 record_context(step_id, {
                     "required_skills": requirements["required_skills"],
