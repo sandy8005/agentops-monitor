@@ -1,5 +1,6 @@
 import time
 import sys
+import json
 from input_handler import receive_user_input
 from pdf_reader import read_resume_file
 from parser import parse_resume
@@ -9,6 +10,7 @@ from ranker import rank_jobs
 from job_source import search_jobs
 from advisor import application_strategy, resume_edit_advice
 from evaluator import evaluate_decision
+from schemas import JobDecision
 from llm import (
     create_run, create_step, logged_llm_call, logged_tool_call,
     finish_step, finish_run, fail_step, record_score, record_context,
@@ -16,20 +18,6 @@ from llm import (
     is_cancel_requested
 )
 from tools import keyword_overlap_tool
-
-
-def normalize_decision(raw):
-    """Map an LLM decision to Apply / Maybe / Skip / Unknown, guarding against negation."""
-    text = raw.lower().strip()
-    negated = any(neg in text for neg in ["not ", "n't", "do not", "don't", "avoid", "shouldn't"])
-    words = text.replace(".", " ").replace(",", " ").split()
-    if "skip" in words:
-        return "Skip"
-    if "maybe" in words:
-        return "Maybe"
-    if "apply" in words:
-        return "Skip" if negated else "Apply"
-    return "Unknown"
 
 
 def load_resume_from_db(resume_id):
@@ -65,18 +53,29 @@ PROJECTS: {[{'name': p['name'], 'tech': p['tech']} for p in parsed['projects']]}
 JOB TITLE: {job['title']}
 COMPANY: {job['company']}
 REQUIRED SKILLS: {requirements['required_skills']}
+REQUIRED (ANY OF EACH GROUP): {requirements['required_any_of']}
 PREFERRED SKILLS: {requirements['preferred_skills']}
 MINIMUM YEARS EXPERIENCE: {requirements['min_years_experience']}
 
 A keyword check found these required skills missing from the resume: {overlap['missing_from_resume']}
 And these present: {overlap['matched_in_resume']}
 
-Based on the match between the candidate and this job, respond in this exact format:
-
-Decision: <Apply / Maybe / Skip>
-Reason: <one sentence explaining why>
+Based on the match between the candidate and this job, respond with ONLY valid JSON
+(no markdown fences, no extra text) in exactly this shape:
+{{
+  "decision": "Apply",
+  "reason": "one sentence explaining why"
+}}
+The "decision" field MUST be exactly one of: "Apply", "Maybe", or "Skip".
 """
     return prompt
+
+
+def parse_decision(raw):
+    """Parse the LLM's JSON decision. Returns 'Apply'/'Maybe'/'Skip', or 'Unknown' on failure."""
+    cleaned = raw.strip().replace("```json", "").replace("```", "").strip()
+    parsed = JobDecision(**json.loads(cleaned))
+    return parsed.decision.value
 
 
 def run_agent(run_id=None, evaluate=False, resume_id=None, sleep_between=15):
@@ -221,11 +220,14 @@ def run_agent(run_id=None, evaluate=False, resume_id=None, sleep_between=15):
                 prompt = build_prompt(resume_text, parsed, job, overlap, requirements)
                 result = logged_llm_call(prompt, run_id, step_id)
 
-                llm_decision = "Unknown"
-                for line in result.splitlines():
-                    if line.lower().startswith("decision:"):
-                        llm_decision = normalize_decision(line.split(":", 1)[1])
-                        break
+                # Parse the LLM decision from structured JSON (Pydantic-validated).
+                # A malformed response degrades to 'Unknown', which will disagree
+                # with the score and correctly trigger human review.
+                try:
+                    llm_decision = parse_decision(result)
+                except Exception as parse_err:
+                    llm_decision = "Unknown"
+                    print(f"    (could not parse decision JSON: {parse_err})")
 
                 score_result = calculate_match_score(parsed, requirements, resume_text, job, user_input)
 
@@ -234,8 +236,6 @@ def run_agent(run_id=None, evaluate=False, resume_id=None, sleep_between=15):
                     score_result["decision"], llm_decision
                 )
 
-                # If requirements couldn't be extracted, the score is untrustworthy
-                # — flag for human review regardless of score/LLM agreement.
                 if score_result.get("insufficient_requirements") and not needs_review:
                     flag_for_review(step_id, reason="insufficient_requirements")
                     needs_review = True
@@ -243,6 +243,7 @@ def run_agent(run_id=None, evaluate=False, resume_id=None, sleep_between=15):
 
                 record_context(step_id, {
                     "required_skills": requirements["required_skills"],
+                    "required_any_of": requirements["required_any_of"],
                     "preferred_skills": requirements["preferred_skills"],
                     "min_years_experience": requirements["min_years_experience"],
                     "matched_skills": overlap["matched_in_resume"],

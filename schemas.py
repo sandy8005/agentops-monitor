@@ -1,5 +1,6 @@
 from pydantic import BaseModel
 from typing import List
+from enum import Enum
 
 
 class Education(BaseModel):
@@ -33,6 +34,17 @@ class JobRequirements(BaseModel):
     preferred_skills: List[str]
     min_years_experience: float
     responsibilities: List[str]
+
+
+class DecisionEnum(str, Enum):
+    apply = "Apply"
+    maybe = "Maybe"
+    skip = "Skip"
+
+
+class JobDecision(BaseModel):
+    decision: DecisionEnum
+    reason: str
 
 
 class Evaluation(BaseModel):
