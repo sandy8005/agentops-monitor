@@ -119,26 +119,61 @@ def fail_step(step_id, error_message):
 
 
 def record_score(step_id, match_score, score_decision, llm_decision):
+    """
+    Record the match score + decisions. If the deterministic score and the LLM
+    decision disagree, flag for human review with reason 'score_disagreement'.
+    """
     needs_review = score_decision != llm_decision
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute("""
-        UPDATE steps
-        SET match_score = %s, score_decision = %s, llm_decision = %s, needs_human_review = %s
-        WHERE id = %s
-    """, (match_score, score_decision, llm_decision, needs_review, step_id))
+    if needs_review:
+        cur.execute("""
+            UPDATE steps
+            SET match_score = %s, score_decision = %s, llm_decision = %s,
+                needs_human_review = TRUE, review_reason = 'score_disagreement'
+            WHERE id = %s
+        """, (match_score, score_decision, llm_decision, step_id))
+    else:
+        cur.execute("""
+            UPDATE steps
+            SET match_score = %s, score_decision = %s, llm_decision = %s,
+                needs_human_review = FALSE
+            WHERE id = %s
+        """, (match_score, score_decision, llm_decision, step_id))
     conn.commit()
     conn.close()
     return needs_review
 
 
-def flag_for_review(step_id, reason="evaluator"):
-    """Mark a step for human review (e.g. evaluator caught a hallucination)."""
+def flag_for_review(step_id, reason="unspecified"):
+    """
+    Mark a step for human review and record WHY. Reasons accumulate: if a step is
+    flagged for multiple reasons, they're combined (e.g.
+    'score_disagreement; hallucination') so no signal is lost.
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT review_reason FROM steps WHERE id = %s", (step_id,))
+    row = cur.fetchone()
+    existing = row[0] if row and row[0] else ""
+    if existing:
+        reasons = [r.strip() for r in existing.split(";")]
+        new_reason = existing if reason in reasons else existing + "; " + reason
+    else:
+        new_reason = reason
+    cur.execute("""
+        UPDATE steps SET needs_human_review = TRUE, review_reason = %s WHERE id = %s
+    """, (new_reason, step_id))
+    conn.commit()
+    conn.close()
+
+
+def record_context(step_id, context):
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
-        UPDATE steps SET needs_human_review = TRUE WHERE id = %s
-    """, (step_id,))
+        UPDATE steps SET retrieved_context = %s WHERE id = %s
+    """, (json.dumps(context), step_id))
     conn.commit()
     conn.close()
 
@@ -158,16 +193,6 @@ def request_cancel(run_id):
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("UPDATE runs SET cancel_requested = TRUE WHERE id = %s", (run_id,))
-    conn.commit()
-    conn.close()
-
-
-def record_context(step_id, context):
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("""
-        UPDATE steps SET retrieved_context = %s WHERE id = %s
-    """, (json.dumps(context), step_id))
     conn.commit()
     conn.close()
 

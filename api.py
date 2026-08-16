@@ -10,7 +10,7 @@ from pdf_reader import read_resume_file
 load_dotenv()
 app = FastAPI(title="AgentOps Monitor")
 
-MAX_UPLOAD_BYTES = 5 * 1024 * 1024   # 5 MB cap on resume uploads
+MAX_UPLOAD_BYTES = 5 * 1024 * 1024
 
 
 def get_connection():
@@ -54,6 +54,7 @@ def dashboard():
     .flag { color: #fbbf24; font-size: 12px; font-weight: 600; }
     .agree { color: #4ade80; }
     .reviewed { color: #60a5fa; font-size: 12px; font-weight: 600; }
+    .reason { color: #fbbf24; font-size: 12px; }
     .call { color: #8b8f9c; font-size: 12px; margin-left: 16px; margin-top: 4px; }
     .call-failed { color: #f87171; }
     .io { background: #0d0f15; border: 1px solid #2a2e3a; border-radius: 4px; padding: 8px; font-size: 11px; white-space: pre-wrap; word-break: break-word; max-height: 300px; overflow-y: auto; color: #b0b4c0; margin-top: 4px; }
@@ -252,6 +253,7 @@ def dashboard():
           el.className = 'step review';
           el.innerHTML = '<strong>' + escapeHtml(it.step_name) + '</strong> (run #' + escapeHtml(it.run_id) + ') - ' +
             'Score: ' + escapeHtml(it.match_score) + ' (' + escapeHtml(it.score_decision) + ') | LLM: ' + escapeHtml(it.llm_decision) +
+            (it.review_reason ? ' <span class="reason">[' + escapeHtml(it.review_reason) + ']</span>' : '') +
             '<div style="margin-top:8px;">' +
               '<input id="reviewer_' + it.step_id + '" class="rev-input" placeholder="your name" style="width:140px;">' +
               '<input id="comment_' + it.step_id + '" class="rev-input" placeholder="comment (optional)" style="width:260px;">' +
@@ -344,9 +346,11 @@ def dashboard():
               html += ' <span class="reviewed">&#9679; ' + escapeHtml(s.review_status.toUpperCase());
               if (s.reviewer) html += ' by ' + escapeHtml(s.reviewer);
               html += '</span>';
+              if (s.review_reason) html += ' <span class="reason">[' + escapeHtml(s.review_reason) + ']</span>';
               if (s.review_comment) html += '<div class="call">note: ' + escapeHtml(s.review_comment) + '</div>';
             } else if (review) {
               html += ' <span class="flag">&#9888; NEEDS REVIEW</span>';
+              if (s.review_reason) html += ' <span class="reason">[' + escapeHtml(s.review_reason) + ']</span>';
             } else {
               html += ' <span class="agree">&#10003;</span>';
             }
@@ -548,7 +552,7 @@ def get_run(run_id: int):
     cur.execute("""
         SELECT id, step_name, status, match_score, score_decision,
                llm_decision, needs_human_review, review_status, error_message,
-               retrieved_context, reviewer, review_comment
+               retrieved_context, reviewer, review_comment, review_reason
         FROM steps WHERE run_id = %s ORDER BY step_order
     """, (run_id,))
     step_rows = cur.fetchall()
@@ -595,7 +599,7 @@ def get_run(run_id: int):
             "score_decision": s[4], "llm_decision": s[5],
             "needs_human_review": s[6], "review_status": s[7],
             "error_message": s[8], "retrieved_context": s[9],
-            "reviewer": s[10], "review_comment": s[11],
+            "reviewer": s[10], "review_comment": s[11], "review_reason": s[12],
             "tool_calls": tool_calls, "llm_calls": llm_calls,
             "evaluation": evaluation
         })
@@ -619,7 +623,7 @@ def pending_reviews():
     cur = conn.cursor()
     cur.execute("""
         SELECT s.id, s.run_id, s.step_name, s.match_score,
-               s.score_decision, s.llm_decision
+               s.score_decision, s.llm_decision, s.review_reason
         FROM steps s
         WHERE s.needs_human_review = TRUE AND s.review_status IS NULL
         ORDER BY s.id DESC
@@ -629,7 +633,7 @@ def pending_reviews():
     return [
         {"step_id": r[0], "run_id": r[1], "step_name": r[2],
          "match_score": float(r[3]) if r[3] is not None else None,
-         "score_decision": r[4], "llm_decision": r[5]}
+         "score_decision": r[4], "llm_decision": r[5], "review_reason": r[6]}
         for r in rows
     ]
 
