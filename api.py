@@ -57,6 +57,7 @@ def dashboard():
     .reason { color: #fbbf24; font-size: 12px; }
     .call { color: #8b8f9c; font-size: 12px; margin-left: 16px; margin-top: 4px; }
     .call-failed { color: #f87171; }
+    .op { color: #a78bfa; font-weight: 600; }
     .io { background: #0d0f15; border: 1px solid #2a2e3a; border-radius: 4px; padding: 8px; font-size: 11px; white-space: pre-wrap; word-break: break-word; max-height: 300px; overflow-y: auto; color: #b0b4c0; margin-top: 4px; }
     details summary { color: #60a5fa; font-size: 11px; cursor: pointer; margin-top: 4px; }
     h2 { font-size: 16px; margin: 8px 0 16px; }
@@ -362,14 +363,14 @@ def dashboard():
             const fc = t.status === 'failed' ? 'call-failed' : '';
             let io = 'IN: ' + escapeHtml(t.input_json || '') + NL + NL + 'OUT: ' + escapeHtml(t.output_json || '');
             if (t.error_message) io += NL + NL + 'ERROR: ' + escapeHtml(t.error_message);
-            html += '<div class="call ' + fc + '">tool: ' + escapeHtml(t.tool_name) + ' [' + escapeHtml(t.status) + '] ' + escapeHtml(t.latency_ms) + 'ms' +
+            html += '<div class="call ' + fc + '"><span class="op">' + escapeHtml(t.operation || t.tool_name) + '</span> &middot; tool: ' + escapeHtml(t.tool_name) + ' [' + escapeHtml(t.status) + '] ' + escapeHtml(t.latency_ms) + 'ms' +
               '<details><summary>view i/o</summary><pre class="io">' + io + '</pre></details></div>';
           }
           for (const l of (s.llm_calls || [])) {
             const fc = l.status === 'failed' ? 'call-failed' : '';
             let io = 'PROMPT:' + NL + escapeHtml(l.prompt || '') + NL + NL + 'RESPONSE:' + NL + escapeHtml(l.response || '');
             if (l.error_message) io += NL + NL + 'ERROR: ' + escapeHtml(l.error_message);
-            html += '<div class="call ' + fc + '">llm: ' + escapeHtml(l.prompt_tokens) + '+' + escapeHtml(l.completion_tokens) + ' tok, ' + escapeHtml(l.latency_ms) + 'ms, $' + escapeHtml(l.cost_usd) + ' [' + escapeHtml(l.status) + ']' +
+            html += '<div class="call ' + fc + '"><span class="op">' + escapeHtml(l.operation || 'llm') + '</span> &middot; llm: ' + escapeHtml(l.prompt_tokens) + '+' + escapeHtml(l.completion_tokens) + ' tok, ' + escapeHtml(l.latency_ms) + 'ms, $' + escapeHtml(l.cost_usd) + ' [' + escapeHtml(l.status) + ']' +
               '<details><summary>view prompt/response</summary><pre class="io">' + io + '</pre></details></div>';
           }
           if (s.evaluation) {
@@ -561,22 +562,22 @@ def get_run(run_id: int):
     for s in step_rows:
         step_id = s[0]
         cur.execute("""
-            SELECT tool_name, status, latency_ms, input_json, output_json, error_message
+            SELECT tool_name, status, latency_ms, input_json, output_json, error_message, operation_name
             FROM tool_calls WHERE step_id = %s ORDER BY id
         """, (step_id,))
         tool_calls = [
             {"tool_name": t[0], "status": t[1], "latency_ms": t[2],
-             "input_json": t[3], "output_json": t[4], "error_message": t[5]}
+             "input_json": t[3], "output_json": t[4], "error_message": t[5], "operation": t[6]}
             for t in cur.fetchall()
         ]
         cur.execute("""
-            SELECT prompt_tokens, completion_tokens, latency_ms, cost_usd, status, prompt, response, error_message
+            SELECT prompt_tokens, completion_tokens, latency_ms, cost_usd, status, prompt, response, error_message, operation_name
             FROM llm_calls WHERE step_id = %s ORDER BY id
         """, (step_id,))
         llm_calls = [
             {"prompt_tokens": l[0], "completion_tokens": l[1], "latency_ms": l[2],
              "cost_usd": float(l[3]) if l[3] is not None else 0, "status": l[4],
-             "prompt": l[5], "response": l[6], "error_message": l[7]}
+             "prompt": l[5], "response": l[6], "error_message": l[7], "operation": l[8]}
             for l in cur.fetchall()
         ]
         cur.execute("""

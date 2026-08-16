@@ -21,7 +21,6 @@ from tools import keyword_overlap_tool
 
 
 def load_resume_from_db(resume_id):
-    """Load a stored resume + its search config from the resumes table."""
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
@@ -33,11 +32,8 @@ def load_resume_from_db(resume_id):
     if not row:
         raise RuntimeError(f"Resume {resume_id} not found")
     return {
-        "resume_text": row[0],
-        "target_role": row[1],
-        "location": row[2] or "",
-        "work_mode": row[3] or "",
-        "employment_type": row[4] or ""
+        "resume_text": row[0], "target_role": row[1], "location": row[2] or "",
+        "work_mode": row[3] or "", "employment_type": row[4] or ""
     }
 
 
@@ -72,7 +68,6 @@ The "decision" field MUST be exactly one of: "Apply", "Maybe", or "Skip".
 
 
 def parse_decision(raw):
-    """Parse the LLM's JSON decision. Returns 'Apply'/'Maybe'/'Skip', or raises on failure."""
     cleaned = raw.strip().replace("```json", "").replace("```", "").strip()
     parsed = JobDecision(**json.loads(cleaned))
     return parsed.decision.value
@@ -95,7 +90,8 @@ def run_agent(run_id=None, evaluate=False, resume_id=None, sleep_between=15):
             step_id = create_step(run_id, "load_resume_from_db", 0)
             try:
                 db_resume = logged_tool_call(
-                    "load_resume_from_db", load_resume_from_db, resume_id, run_id, step_id
+                    "load_resume_from_db", load_resume_from_db, resume_id,
+                    run_id, step_id, operation="load_resume"
                 )
                 if db_resume is None:
                     raise RuntimeError("load_resume_from_db returned nothing")
@@ -120,8 +116,8 @@ def run_agent(run_id=None, evaluate=False, resume_id=None, sleep_between=15):
             step_id = create_step(run_id, "receive_user_input", 0)
             try:
                 user_input = logged_tool_call(
-                    "receive_user_input", receive_user_input,
-                    "user_input.json", run_id, step_id
+                    "receive_user_input", receive_user_input, "user_input.json",
+                    run_id, step_id, operation="receive_input"
                 )
                 if user_input is None:
                     raise RuntimeError("receive_user_input returned no data")
@@ -136,8 +132,8 @@ def run_agent(run_id=None, evaluate=False, resume_id=None, sleep_between=15):
             step_id = create_step(run_id, "read_resume_file", 1)
             try:
                 resume_text = logged_tool_call(
-                    "read_resume_file", read_resume_file,
-                    user_input["resume_file"], run_id, step_id
+                    "read_resume_file", read_resume_file, user_input["resume_file"],
+                    run_id, step_id, operation="read_resume_file"
                 )
                 if not resume_text:
                     raise RuntimeError("read_resume_file returned no text")
@@ -176,7 +172,7 @@ def run_agent(run_id=None, evaluate=False, resume_id=None, sleep_between=15):
             jobs = logged_tool_call(
                 "search_jobs",
                 lambda p: search_jobs(p["target_role"], p["location"], p["work_mode"]),
-                search_params, run_id, step_id
+                search_params, run_id, step_id, operation="search_jobs"
             )
             if not jobs:
                 raise RuntimeError("search_jobs returned no jobs")
@@ -210,7 +206,7 @@ def run_agent(run_id=None, evaluate=False, resume_id=None, sleep_between=15):
                 overlap = logged_tool_call(
                     "keyword_overlap_tool", keyword_overlap_tool,
                     {"resume": resume_text, "job_description": job["description"]},
-                    run_id, step_id
+                    run_id, step_id, operation="keyword_overlap"
                 )
                 if overlap is None:
                     raise RuntimeError("keyword_overlap_tool returned no result")
@@ -218,11 +214,8 @@ def run_agent(run_id=None, evaluate=False, resume_id=None, sleep_between=15):
                 requirements = extract_requirements(job, run_id, step_id)
 
                 prompt = build_prompt(resume_text, parsed, job, overlap, requirements)
-                result = logged_llm_call(prompt, run_id, step_id)
+                result = logged_llm_call(prompt, run_id, step_id, operation="job_judge")
 
-                # Parse the LLM decision from structured JSON (Pydantic-validated).
-                # A malformed response degrades to 'Unknown', which disagrees with
-                # the score and correctly triggers human review.
                 try:
                     llm_decision = parse_decision(result)
                 except Exception as parse_err:
@@ -271,10 +264,6 @@ def run_agent(run_id=None, evaluate=False, resume_id=None, sleep_between=15):
                         eval_result = evaluate_decision(resume_text, job, result, run_id, step_id)
                         save_evaluation(run_id, step_id, eval_result)
 
-                        # Escalate to human review if the judge flags a problem:
-                        # a hallucination, any single very-low dimension, or a low
-                        # overall quality. Thresholds are conservative to avoid
-                        # flooding the review queue with borderline cases.
                         rel = eval_result["relevance_score"]
                         faith = eval_result["faithfulness_score"]
                         comp = eval_result["completeness_score"]
@@ -282,8 +271,8 @@ def run_agent(run_id=None, evaluate=False, resume_id=None, sleep_between=15):
 
                         low_quality = (
                             eval_result["hallucination_detected"]
-                            or rel <= 2 or faith <= 2 or comp <= 2   # any dimension alarming
-                            or avg < 4.0                              # broadly weak
+                            or rel <= 2 or faith <= 2 or comp <= 2
+                            or avg < 4.0
                         )
 
                         if low_quality and not needs_review:
@@ -299,12 +288,9 @@ def run_agent(run_id=None, evaluate=False, resume_id=None, sleep_between=15):
                         print(f"    (evaluation skipped: {eval_err})")
 
                 results.append({
-                    "title": job["title"],
-                    "company": job["company"],
-                    "score": score_result["score"],
-                    "decision": score_result["decision"],
-                    "llm_decision": llm_decision,
-                    "needs_review": needs_review
+                    "title": job["title"], "company": job["company"],
+                    "score": score_result["score"], "decision": score_result["decision"],
+                    "llm_decision": llm_decision, "needs_review": needs_review
                 })
 
                 finish_step(step_id, "success")
@@ -319,7 +305,8 @@ def run_agent(run_id=None, evaluate=False, resume_id=None, sleep_between=15):
         rank_step_id = create_step(run_id, "rank_jobs", len(jobs) + 4)
         try:
             ranked = logged_tool_call(
-                "rank_jobs", lambda r: rank_jobs(r), results, run_id, rank_step_id
+                "rank_jobs", lambda r: rank_jobs(r), results,
+                run_id, rank_step_id, operation="rank_jobs"
             )
             if ranked is None:
                 raise RuntimeError("rank_jobs returned None")

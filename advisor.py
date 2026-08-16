@@ -21,7 +21,7 @@ Give a short, practical application strategy in 3-4 sentences:
 
 Write plain prose, no headers, no bullet points.
 """
-    return logged_llm_call(prompt, run_id, step_id)
+    return logged_llm_call(prompt, run_id, step_id, operation="application_strategy")
 
 
 def resume_edit_advice(resume_text, job, requirements, missing_skills, run_id, step_id):
@@ -43,4 +43,4 @@ Give 3-4 specific, actionable resume edits for THIS job:
 
 Number each suggestion. Keep each to one sentence.
 """
-    return logged_llm_call(prompt, run_id, step_id)
+    return logged_llm_call(prompt, run_id, step_id, operation="resume_edit")

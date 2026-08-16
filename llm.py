@@ -25,10 +25,7 @@ def get_connection():
 def quota_available():
     """Cheap probe: returns True if the API responds, False if rate-limited."""
     try:
-        client.models.generate_content(
-            model="gemini-flash-latest",
-            contents="hi"
-        )
+        client.models.generate_content(model="gemini-flash-latest", contents="hi")
         return True
     except Exception as e:
         if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
@@ -37,22 +34,16 @@ def quota_available():
 
 
 def fake_llm(prompt):
-    """Mock LLM — used for testing the logging pipeline without real API calls."""
     time.sleep(0.5)
-    return {
-        "text": "Apply",
-        "prompt_tokens": len(prompt.split()),
-        "completion_tokens": random.randint(5, 20)
-    }
+    return {"text": "Apply", "prompt_tokens": len(prompt.split()),
+            "completion_tokens": random.randint(5, 20)}
 
 
 def real_llm(prompt, max_retries=3):
-    """Real LLM call via Gemini, with retry on transient failures."""
     for attempt in range(max_retries):
         try:
             response = client.models.generate_content(
-                model="gemini-flash-latest",
-                contents=prompt
+                model="gemini-flash-latest", contents=prompt
             )
             usage = response.usage_metadata
             return {
@@ -75,8 +66,7 @@ def create_run(input_summary, resume_id=None):
     cur = conn.cursor()
     cur.execute("""
         INSERT INTO runs (started_at, status, input_summary, resume_id)
-        VALUES (%s, %s, %s, %s)
-        RETURNING id
+        VALUES (%s, %s, %s, %s) RETURNING id
     """, (datetime.now(), "running", input_summary, resume_id))
     run_id = cur.fetchone()[0]
     conn.commit()
@@ -89,8 +79,7 @@ def create_step(run_id, step_name, step_order):
     cur = conn.cursor()
     cur.execute("""
         INSERT INTO steps (run_id, step_name, step_order, started_at, status)
-        VALUES (%s, %s, %s, %s, %s)
-        RETURNING id
+        VALUES (%s, %s, %s, %s, %s) RETURNING id
     """, (run_id, step_name, step_order, datetime.now(), "running"))
     step_id = cur.fetchone()[0]
     conn.commit()
@@ -101,9 +90,8 @@ def create_step(run_id, step_name, step_order):
 def finish_step(step_id, status="success"):
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute("""
-        UPDATE steps SET ended_at = %s, status = %s WHERE id = %s
-    """, (datetime.now(), status, step_id))
+    cur.execute("UPDATE steps SET ended_at = %s, status = %s WHERE id = %s",
+                (datetime.now(), status, step_id))
     conn.commit()
     conn.close()
 
@@ -111,34 +99,25 @@ def finish_step(step_id, status="success"):
 def fail_step(step_id, error_message):
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute("""
-        UPDATE steps SET ended_at = %s, status = %s, error_message = %s WHERE id = %s
-    """, (datetime.now(), "failed", str(error_message), step_id))
+    cur.execute("UPDATE steps SET ended_at = %s, status = %s, error_message = %s WHERE id = %s",
+                (datetime.now(), "failed", str(error_message), step_id))
     conn.commit()
     conn.close()
 
 
 def record_score(step_id, match_score, score_decision, llm_decision):
-    """
-    Record the match score + decisions. If the deterministic score and the LLM
-    decision disagree, flag for human review with reason 'score_disagreement'.
-    """
     needs_review = score_decision != llm_decision
     conn = get_connection()
     cur = conn.cursor()
     if needs_review:
         cur.execute("""
-            UPDATE steps
-            SET match_score = %s, score_decision = %s, llm_decision = %s,
-                needs_human_review = TRUE, review_reason = 'score_disagreement'
-            WHERE id = %s
+            UPDATE steps SET match_score = %s, score_decision = %s, llm_decision = %s,
+                needs_human_review = TRUE, review_reason = 'score_disagreement' WHERE id = %s
         """, (match_score, score_decision, llm_decision, step_id))
     else:
         cur.execute("""
-            UPDATE steps
-            SET match_score = %s, score_decision = %s, llm_decision = %s,
-                needs_human_review = FALSE
-            WHERE id = %s
+            UPDATE steps SET match_score = %s, score_decision = %s, llm_decision = %s,
+                needs_human_review = FALSE WHERE id = %s
         """, (match_score, score_decision, llm_decision, step_id))
     conn.commit()
     conn.close()
@@ -146,11 +125,6 @@ def record_score(step_id, match_score, score_decision, llm_decision):
 
 
 def flag_for_review(step_id, reason="unspecified"):
-    """
-    Mark a step for human review and record WHY. Reasons accumulate: if a step is
-    flagged for multiple reasons, they're combined (e.g.
-    'score_disagreement; hallucination') so no signal is lost.
-    """
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("SELECT review_reason FROM steps WHERE id = %s", (step_id,))
@@ -161,9 +135,8 @@ def flag_for_review(step_id, reason="unspecified"):
         new_reason = existing if reason in reasons else existing + "; " + reason
     else:
         new_reason = reason
-    cur.execute("""
-        UPDATE steps SET needs_human_review = TRUE, review_reason = %s WHERE id = %s
-    """, (new_reason, step_id))
+    cur.execute("UPDATE steps SET needs_human_review = TRUE, review_reason = %s WHERE id = %s",
+                (new_reason, step_id))
     conn.commit()
     conn.close()
 
@@ -171,15 +144,13 @@ def flag_for_review(step_id, reason="unspecified"):
 def record_context(step_id, context):
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute("""
-        UPDATE steps SET retrieved_context = %s WHERE id = %s
-    """, (json.dumps(context), step_id))
+    cur.execute("UPDATE steps SET retrieved_context = %s WHERE id = %s",
+                (json.dumps(context), step_id))
     conn.commit()
     conn.close()
 
 
 def is_cancel_requested(run_id):
-    """Cooperative-cancellation check: has a user asked to stop this run?"""
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("SELECT cancel_requested FROM runs WHERE id = %s", (run_id,))
@@ -189,7 +160,6 @@ def is_cancel_requested(run_id):
 
 
 def request_cancel(run_id):
-    """Set the cancel flag so the running agent stops at its next checkpoint."""
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("UPDATE runs SET cancel_requested = TRUE WHERE id = %s", (run_id,))
@@ -207,13 +177,9 @@ def save_evaluation(run_id, step_id, evaluation):
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
     """, (
         run_id, step_id,
-        evaluation["relevance_score"],
-        evaluation["faithfulness_score"],
-        evaluation["completeness_score"],
-        evaluation["hallucination_detected"],
-        json.dumps(evaluation["hallucinated_claims"]),
-        evaluation["notes"],
-        datetime.now()
+        evaluation["relevance_score"], evaluation["faithfulness_score"],
+        evaluation["completeness_score"], evaluation["hallucination_detected"],
+        json.dumps(evaluation["hallucinated_claims"]), evaluation["notes"], datetime.now()
     ))
     conn.commit()
     conn.close()
@@ -223,30 +189,24 @@ def finish_run(run_id, status="success"):
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
-        UPDATE runs
-        SET ended_at = %s,
-            status = %s,
-            total_tokens = (
-                SELECT COALESCE(SUM(prompt_tokens + completion_tokens), 0)
-                FROM llm_calls WHERE run_id = %s
-            ),
-            total_cost = (
-                SELECT COALESCE(SUM(cost_usd), 0)
-                FROM llm_calls WHERE run_id = %s
-            )
+        UPDATE runs SET ended_at = %s, status = %s,
+            total_tokens = (SELECT COALESCE(SUM(prompt_tokens + completion_tokens), 0)
+                            FROM llm_calls WHERE run_id = %s),
+            total_cost = (SELECT COALESCE(SUM(cost_usd), 0)
+                          FROM llm_calls WHERE run_id = %s)
         WHERE id = %s
     """, (datetime.now(), status, run_id, run_id, run_id))
     conn.commit()
     conn.close()
 
 
-def logged_llm_call(prompt, run_id, step_id):
+def logged_llm_call(prompt, run_id, step_id, operation="llm_call"):
+    """Run an LLM call and log it, tagged with the conceptual operation (stage) name."""
     start = time.time()
     try:
         result = real_llm(prompt)
         end = time.time()
         latency_ms = int((end - start) * 1000)
-
         prompt_tokens = result["prompt_tokens"]
         completion_tokens = result["completion_tokens"]
         cost_usd = (prompt_tokens + completion_tokens) * 0.000001
@@ -256,37 +216,36 @@ def logged_llm_call(prompt, run_id, step_id):
         cur.execute("""
             INSERT INTO llm_calls
             (run_id, step_id, model, prompt, response,
-             prompt_tokens, completion_tokens, latency_ms, cost_usd, created_at, status)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'success')
+             prompt_tokens, completion_tokens, latency_ms, cost_usd, created_at, status, operation_name)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'success', %s)
         """, (
             run_id, step_id, "gemini-flash-latest", prompt, result["text"],
-            prompt_tokens, completion_tokens, latency_ms, cost_usd, datetime.now()
+            prompt_tokens, completion_tokens, latency_ms, cost_usd, datetime.now(), operation
         ))
         conn.commit()
         conn.close()
         return result["text"]
-
     except Exception as e:
         end = time.time()
         latency_ms = int((end - start) * 1000)
-
         conn = get_connection()
         cur = conn.cursor()
         cur.execute("""
             INSERT INTO llm_calls
             (run_id, step_id, model, prompt, response,
-             prompt_tokens, completion_tokens, latency_ms, cost_usd, created_at, status, error_message)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'failed', %s)
+             prompt_tokens, completion_tokens, latency_ms, cost_usd, created_at, status, error_message, operation_name)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'failed', %s, %s)
         """, (
             run_id, step_id, "gemini-flash-latest", prompt, None,
-            0, 0, latency_ms, 0, datetime.now(), str(e)
+            0, 0, latency_ms, 0, datetime.now(), str(e), operation
         ))
         conn.commit()
         conn.close()
         raise
 
 
-def logged_tool_call(tool_name, tool_func, tool_input, run_id, step_id):
+def logged_tool_call(tool_name, tool_func, tool_input, run_id, step_id, operation=None):
+    """Run a tool and log it, tagged with the conceptual operation (stage) name."""
     start = time.time()
     try:
         result = tool_func(tool_input)
@@ -300,12 +259,12 @@ def logged_tool_call(tool_name, tool_func, tool_input, run_id, step_id):
     cur = conn.cursor()
     cur.execute("""
         INSERT INTO tool_calls
-        (run_id, step_id, tool_name, input_json, output_json, latency_ms, status, error_message, created_at)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+        (run_id, step_id, tool_name, input_json, output_json, latency_ms, status, error_message, created_at, operation_name)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     """, (
         run_id, step_id, tool_name, json.dumps(tool_input),
         json.dumps(result) if result is not None else None,
-        latency_ms, status, error_message, datetime.now()
+        latency_ms, status, error_message, datetime.now(), operation or tool_name
     ))
     conn.commit()
     conn.close()
@@ -315,5 +274,5 @@ def logged_tool_call(tool_name, tool_func, tool_input, run_id, step_id):
 if __name__ == "__main__":
     run_id = create_run("test resume vs test job")
     step_id = create_step(run_id, "score_job", 1)
-    answer = logged_llm_call("Does this resume match this job?", run_id, step_id)
+    answer = logged_llm_call("Does this resume match this job?", run_id, step_id, operation="test")
     print("Agent got back:", answer)
