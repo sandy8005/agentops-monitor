@@ -106,6 +106,12 @@ def dashboard():
           </select>
         </div>
       </div>
+      <div style="margin-top:10px;">
+        <label style="display:inline; color:#e4e6eb; font-size:13px;">
+          <input type="checkbox" id="runEvaluator" style="width:auto; margin-right:6px;">
+          Run LLM evaluator (grades each decision — uses extra API calls)
+        </label>
+      </div>
       <div style="margin-top:14px;">
         <button id="uploadBtn" onclick="uploadAndRun()">&#9654; Upload &amp; Start Run</button>
       </div>
@@ -134,6 +140,11 @@ def dashboard():
       return String(s == null ? '' : s)
         .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
         .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
+    }
+
+    function evalFlag() {
+      var el = document.getElementById('runEvaluator');
+      return el && el.checked ? 'true' : 'false';
     }
 
     async function uploadAndRun() {
@@ -165,7 +176,7 @@ def dashboard():
         const upData = await up.json();
         msg.textContent = 'Stored resume #' + upData.resume_id + ' (' + upData.chars + ' chars). Starting run...';
 
-        const run = await fetch('/runs?resume_id=' + upData.resume_id, { method: 'POST' });
+        const run = await fetch('/runs?resume_id=' + upData.resume_id + '&evaluate=' + evalFlag(), { method: 'POST' });
         if (!run.ok) { const e = await run.json(); throw new Error(e.detail || 'run failed to start'); }
         const runData = await run.json();
         msg.textContent = 'Resume #' + upData.resume_id + ' -> Run #' + runData.run_id + ' started.';
@@ -204,7 +215,7 @@ def dashboard():
 
     async function runResume(id) {
       try {
-        const run = await fetch('/runs?resume_id=' + id, { method: 'POST' });
+        const run = await fetch('/runs?resume_id=' + id + '&evaluate=' + evalFlag(), { method: 'POST' });
         if (!run.ok) { const e = await run.json(); throw new Error(e.detail || 'run failed'); }
         const runData = await run.json();
         setTimeout(function() { loadRuns(); loadDetail(runData.run_id); }, 1500);
@@ -485,7 +496,7 @@ def list_runs(limit: int = Query(20, ge=1, le=100)):
 
 
 @app.post("/runs")
-def start_run(background_tasks: BackgroundTasks, resume_id: int = None):
+def start_run(background_tasks: BackgroundTasks, resume_id: int = None, evaluate: bool = False):
     if resume_id is None:
         raise HTTPException(status_code=400, detail="resume_id is required; upload or pick a resume first")
 
@@ -498,8 +509,8 @@ def start_run(background_tasks: BackgroundTasks, resume_id: int = None):
         raise HTTPException(status_code=404, detail=f"Resume {resume_id} not found")
 
     run_id = create_run("job search run (dashboard)", resume_id=resume_id)
-    background_tasks.add_task(run_agent, run_id, False, resume_id)
-    return {"run_id": run_id, "resume_id": resume_id,
+    background_tasks.add_task(run_agent, run_id, evaluate, resume_id)
+    return {"run_id": run_id, "resume_id": resume_id, "evaluate": evaluate,
             "message": f"Run {run_id} started in background."}
 
 
