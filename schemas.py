@@ -5,19 +5,18 @@ from typing import List
 class Education(BaseModel):
     degree: str
     institution: str
-    year: int
+    year: str
 
 
 class Project(BaseModel):
     name: str
     tech: List[str]
-    description: str
 
 
 class Experience(BaseModel):
-    role: str
+    title: str
     company: str
-    months: int
+    years: float
 
 
 class ParsedResume(BaseModel):
@@ -30,6 +29,7 @@ class ParsedResume(BaseModel):
 
 class JobRequirements(BaseModel):
     required_skills: List[str]
+    required_any_of: List[List[str]] = []   # groups; candidate needs ANY one per group
     preferred_skills: List[str]
     min_years_experience: float
     responsibilities: List[str]
