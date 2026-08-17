@@ -12,9 +12,7 @@ load_dotenv()
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
 # Estimated pricing (USD per token), based on published Gemini Flash rates.
-# These are ESTIMATES for observability, not the actual provider invoice — real
-# billing may differ due to tiering, rounding, promotions, or model changes.
-# Input and output are priced separately (output tokens cost more than input).
+# ESTIMATES for observability, not the actual provider invoice.
 INPUT_TOKEN_RATE = 0.075 / 1_000_000     # ~$0.075 per 1M input tokens
 OUTPUT_TOKEN_RATE = 0.30 / 1_000_000     # ~$0.30 per 1M output tokens
 
@@ -46,26 +44,23 @@ def fake_llm(prompt):
             "completion_tokens": random.randint(5, 20)}
 
 
-def real_llm(prompt, max_retries=3):
-    for attempt in range(max_retries):
-        try:
-            response = client.models.generate_content(
-                model="gemini-flash-latest", contents=prompt
-            )
-            usage = response.usage_metadata
-            return {
-                "text": response.text,
-                "prompt_tokens": usage.prompt_token_count,
-                "completion_tokens": usage.candidates_token_count
-            }
-        except Exception as e:
-            is_last = attempt == max_retries - 1
-            transient = "503" in str(e) or "UNAVAILABLE" in str(e) or "429" in str(e)
-            if is_last or not transient:
-                raise
-            wait = 2 ** attempt
-            print(f"  retry {attempt + 1}/{max_retries - 1} after {wait}s...")
-            time.sleep(wait)
+def real_llm_once(prompt):
+    """Single LLM attempt — no retry. Raises on failure. Retry lives in logged_llm_call."""
+    response = client.models.generate_content(
+        model="gemini-flash-latest", contents=prompt
+    )
+    usage = response.usage_metadata
+    request_id = None
+    try:
+        request_id = getattr(response, "response_id", None) or getattr(response, "_request_id", None)
+    except Exception:
+        request_id = None
+    return {
+        "text": response.text,
+        "prompt_tokens": usage.prompt_token_count,
+        "completion_tokens": usage.candidates_token_count,
+        "provider_request_id": request_id
+    }
 
 
 def create_run(input_summary, resume_id=None):
@@ -207,54 +202,66 @@ def finish_run(run_id, status="success"):
     conn.close()
 
 
-def logged_llm_call(prompt, run_id, step_id, operation="llm_call"):
-    """Run an LLM call and log it, tagged with the conceptual operation (stage) name."""
-    start = time.time()
-    try:
-        result = real_llm(prompt)
-        end = time.time()
-        latency_ms = int((end - start) * 1000)
-        prompt_tokens = result["prompt_tokens"]
-        completion_tokens = result["completion_tokens"]
+def _log_llm_attempt(run_id, step_id, operation, prompt, response_text,
+                     prompt_tokens, completion_tokens, latency_ms, cost,
+                     status, error_message, attempt_number, retry_count, provider_request_id):
+    """Log a single HTTP attempt of an LLM call as its own llm_calls row."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO llm_calls
+        (run_id, step_id, model, prompt, response,
+         prompt_tokens, completion_tokens, latency_ms, cost_usd, created_at,
+         status, error_message, operation_name, attempt_number, retry_count, provider_request_id)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+    """, (
+        run_id, step_id, "gemini-flash-latest", prompt, response_text,
+        prompt_tokens, completion_tokens, latency_ms, cost, datetime.now(),
+        status, error_message, operation, attempt_number, retry_count, provider_request_id
+    ))
+    conn.commit()
+    conn.close()
 
-        # Estimated cost: input and output tokens priced at their separate rates.
-        # This is an ESTIMATE for observability, not the actual provider bill.
-        estimated_cost = (
-            prompt_tokens * INPUT_TOKEN_RATE +
-            completion_tokens * OUTPUT_TOKEN_RATE
-        )
 
-        conn = get_connection()
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO llm_calls
-            (run_id, step_id, model, prompt, response,
-             prompt_tokens, completion_tokens, latency_ms, cost_usd, created_at, status, operation_name)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'success', %s)
-        """, (
-            run_id, step_id, "gemini-flash-latest", prompt, result["text"],
-            prompt_tokens, completion_tokens, latency_ms, estimated_cost, datetime.now(), operation
-        ))
-        conn.commit()
-        conn.close()
-        return result["text"]
-    except Exception as e:
-        end = time.time()
-        latency_ms = int((end - start) * 1000)
-        conn = get_connection()
-        cur = conn.cursor()
-        cur.execute("""
-            INSERT INTO llm_calls
-            (run_id, step_id, model, prompt, response,
-             prompt_tokens, completion_tokens, latency_ms, cost_usd, created_at, status, error_message, operation_name)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, 'failed', %s, %s)
-        """, (
-            run_id, step_id, "gemini-flash-latest", prompt, None,
-            0, 0, latency_ms, 0, datetime.now(), str(e), operation
-        ))
-        conn.commit()
-        conn.close()
-        raise
+def logged_llm_call(prompt, run_id, step_id, operation="llm_call", max_retries=3):
+    """
+    Run an LLM call with retry, logging EACH HTTP attempt as its own row.
+    Failed attempts are logged with status='failed' and their attempt_number;
+    the succeeding attempt records retry_count = number of prior failures.
+    So two 503s then a success produce three rows (attempts 1, 2, 3).
+    """
+    last_error = None
+    for attempt in range(1, max_retries + 1):
+        start = time.time()
+        try:
+            result = real_llm_once(prompt)
+            latency_ms = int((time.time() - start) * 1000)
+            prompt_tokens = result["prompt_tokens"]
+            completion_tokens = result["completion_tokens"]
+            cost = (prompt_tokens * INPUT_TOKEN_RATE +
+                    completion_tokens * OUTPUT_TOKEN_RATE)
+            _log_llm_attempt(
+                run_id, step_id, operation, prompt, result["text"],
+                prompt_tokens, completion_tokens, latency_ms, cost,
+                "success", None, attempt, attempt - 1, result.get("provider_request_id")
+            )
+            return result["text"]
+        except Exception as e:
+            latency_ms = int((time.time() - start) * 1000)
+            last_error = e
+            transient = "503" in str(e) or "UNAVAILABLE" in str(e) or "429" in str(e)
+            _log_llm_attempt(
+                run_id, step_id, operation, prompt, None,
+                0, 0, latency_ms, 0,
+                "failed", str(e), attempt, attempt - 1, None
+            )
+            if attempt == max_retries or not transient:
+                raise
+            wait = 2 ** (attempt - 1)
+            print(f"  retry {attempt}/{max_retries - 1} after {wait}s...")
+            time.sleep(wait)
+    if last_error:
+        raise last_error
 
 
 def logged_tool_call(tool_name, tool_func, tool_input, run_id, step_id, operation=None):

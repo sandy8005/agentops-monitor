@@ -71,6 +71,7 @@ def dashboard():
     .progress { border-color: #60a5fa !important; }
     .rev-input { background: #0d0f15; border: 1px solid #2a2e3a; border-radius: 4px; padding: 5px; color: #e4e6eb; font-size: 12px; margin-right: 6px; }
     .note { text-transform: none; color: #8b8f9c; font-weight: normal; font-size: 12px; }
+    .retry { color: #fbbf24; font-size: 11px; }
   </style>
 </head>
 <body>
@@ -369,9 +370,11 @@ def dashboard():
           }
           for (const l of (s.llm_calls || [])) {
             const fc = l.status === 'failed' ? 'call-failed' : '';
+            const attemptLabel = (l.attempt_number && l.attempt_number > 1) ? ' <span class="retry">(attempt ' + escapeHtml(l.attempt_number) + ')</span>' : '';
             let io = 'PROMPT:' + NL + escapeHtml(l.prompt || '') + NL + NL + 'RESPONSE:' + NL + escapeHtml(l.response || '');
             if (l.error_message) io += NL + NL + 'ERROR: ' + escapeHtml(l.error_message);
-            html += '<div class="call ' + fc + '"><span class="op">' + escapeHtml(l.operation || 'llm') + '</span> &middot; llm: ' + escapeHtml(l.prompt_tokens) + '+' + escapeHtml(l.completion_tokens) + ' tok, ' + escapeHtml(l.latency_ms) + 'ms, ~$' + escapeHtml(l.cost_usd) + ' [' + escapeHtml(l.status) + ']' +
+            if (l.provider_request_id) io += NL + NL + 'REQUEST_ID: ' + escapeHtml(l.provider_request_id);
+            html += '<div class="call ' + fc + '"><span class="op">' + escapeHtml(l.operation || 'llm') + '</span> &middot; llm' + attemptLabel + ': ' + escapeHtml(l.prompt_tokens) + '+' + escapeHtml(l.completion_tokens) + ' tok, ' + escapeHtml(l.latency_ms) + 'ms, ~$' + escapeHtml(l.cost_usd) + ' [' + escapeHtml(l.status) + ']' +
               '<details><summary>view prompt/response</summary><pre class="io">' + io + '</pre></details></div>';
           }
           if (s.evaluation) {
@@ -572,13 +575,15 @@ def get_run(run_id: int):
             for t in cur.fetchall()
         ]
         cur.execute("""
-            SELECT prompt_tokens, completion_tokens, latency_ms, cost_usd, status, prompt, response, error_message, operation_name
+            SELECT prompt_tokens, completion_tokens, latency_ms, cost_usd, status, prompt, response,
+                   error_message, operation_name, attempt_number, retry_count, provider_request_id
             FROM llm_calls WHERE step_id = %s ORDER BY id
         """, (step_id,))
         llm_calls = [
             {"prompt_tokens": l[0], "completion_tokens": l[1], "latency_ms": l[2],
              "cost_usd": float(l[3]) if l[3] is not None else 0, "status": l[4],
-             "prompt": l[5], "response": l[6], "error_message": l[7], "operation": l[8]}
+             "prompt": l[5], "response": l[6], "error_message": l[7], "operation": l[8],
+             "attempt_number": l[9], "retry_count": l[10], "provider_request_id": l[11]}
             for l in cur.fetchall()
         ]
         cur.execute("""
