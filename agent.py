@@ -77,15 +77,19 @@ def run_agent(run_id=None, evaluate=False, resume_id=None, sleep_between=15):
     if run_id is None:
         run_id = create_run("job search run", resume_id=resume_id)
 
-    if not quota_available():
-        print("⚠ API quota exhausted — skipping run. Try again after reset.")
-        finish_run(run_id, "failed")
-        return
-
     failures = 0
     run_finished = False
 
     try:
+        # Quota probe INSIDE the protected lifecycle: if it raises (503, network,
+        # auth, or any unexpected provider error), the finally still closes the run
+        # so it can never be left stuck as 'running'.
+        if not quota_available():
+            print("⚠ API quota exhausted — skipping run. Try again after reset.")
+            finish_run(run_id, "failed")
+            run_finished = True
+            return
+
         if resume_id is not None:
             step_id = create_step(run_id, "load_resume_from_db", 0)
             try:
