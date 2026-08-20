@@ -65,8 +65,11 @@ def dashboard():
     .upload-form { background: #171a22; border: 1px solid #2a2e3a; border-radius: 8px; padding: 16px 20px; margin-bottom: 20px; max-width: 640px; }
     .upload-form label { display: block; font-size: 12px; color: #8b8f9c; margin: 8px 0 4px; }
     .upload-form input, .upload-form select { width: 100%; box-sizing: border-box; background: #0d0f15; border: 1px solid #2a2e3a; border-radius: 4px; padding: 8px; color: #e4e6eb; font-size: 13px; }
-    .upload-form .row { display: flex; gap: 12px; }
-    .upload-form .row > div { flex: 1; }
+    .search-form { margin-top: 10px; padding: 10px; background: #0d0f15; border: 1px solid #2a2e3a; border-radius: 6px; }
+    .search-form input, .search-form select { background: #171a22; border: 1px solid #2a2e3a; border-radius: 4px; padding: 6px; color: #e4e6eb; font-size: 12px; margin: 2px 4px 2px 0; }
+    .search-form label { font-size: 11px; color: #8b8f9c; }
+    .row { display: flex; gap: 12px; }
+    .row > div { flex: 1; }
     .err { color: #f87171; font-size: 12px; margin-top: 8px; }
     .progress { border-color: #60a5fa !important; }
     .rev-input { background: #0d0f15; border: 1px solid #2a2e3a; border-radius: 4px; padding: 5px; color: #e4e6eb; font-size: 12px; margin-right: 6px; }
@@ -81,48 +84,19 @@ def dashboard():
   </header>
   <div class="container">
 
-    <div class="section-title">New Run — Upload Resume</div>
+    <div class="section-title">Upload a Resume <span class="note">— the document only; you set search options when you run it</span></div>
     <div class="upload-form">
       <label>Resume PDF</label>
       <input type="file" id="resumeFile" accept="application/pdf">
       <label>Resume label (optional)</label>
       <input type="text" id="resumeName" placeholder="e.g. Backend-focused resume">
-      <div class="row">
-        <div><label>Target role</label><input type="text" id="targetRole" placeholder="AI/ML Engineer"></div>
-        <div><label>Location</label><input type="text" id="location" placeholder="Michigan"></div>
-      </div>
-      <div class="row">
-        <div><label>Work mode</label>
-          <select id="workMode">
-            <option value="">(any)</option>
-            <option value="remote">remote</option>
-            <option value="hybrid">hybrid</option>
-            <option value="onsite">onsite</option>
-          </select>
-        </div>
-        <div><label>Employment type</label>
-          <select id="employmentType">
-            <option value="">(any)</option>
-            <option value="full-time">full-time</option>
-            <option value="part-time">part-time</option>
-            <option value="contract">contract</option>
-            <option value="internship">internship</option>
-          </select>
-        </div>
-      </div>
-      <div style="margin-top:10px;">
-        <label style="display:inline; color:#e4e6eb; font-size:13px;">
-          <input type="checkbox" id="runEvaluator" style="width:auto; margin-right:6px;">
-          Run LLM evaluator (grades each decision — uses extra API calls)
-        </label>
-      </div>
       <div style="margin-top:14px;">
-        <button id="uploadBtn" onclick="uploadAndRun()">&#9654; Upload &amp; Start Run</button>
+        <button id="uploadBtn" onclick="uploadResume()">&#9654; Upload Resume</button>
       </div>
       <div id="uploadMsg" class="err"></div>
     </div>
 
-    <div class="section-title">Saved Resumes</div>
+    <div class="section-title">Saved Resumes <span class="note">— pick one, set this search's options, and run. One resume, many searches.</span></div>
     <div id="resumeLibrary"></div>
 
     <div class="section-title">Pending Human Review</div>
@@ -130,7 +104,7 @@ def dashboard():
 
     <div class="section-title">Runs <span class="note">— cost is an estimate from published token rates, not the actual provider bill</span></div>
     <table id="runs">
-      <thead><tr><th>Run</th><th>Status</th><th>Started</th><th>Tokens</th><th>Est. Cost</th></tr></thead>
+      <thead><tr><th>Run</th><th>Status</th><th>Search</th><th>Started</th><th>Tokens</th><th>Est. Cost</th></tr></thead>
       <tbody></tbody>
     </table>
     <div class="detail" id="detail"></div>
@@ -146,19 +120,12 @@ def dashboard():
         .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
     }
 
-    function evalFlag() {
-      var el = document.getElementById('runEvaluator');
-      return el && el.checked ? 'true' : 'false';
-    }
-
-    async function uploadAndRun() {
+    async function uploadResume() {
       const fileInput = document.getElementById('resumeFile');
-      const role = document.getElementById('targetRole').value.trim();
       const msg = document.getElementById('uploadMsg');
       msg.textContent = '';
 
       if (!fileInput.files.length) { msg.textContent = 'Please choose a PDF file.'; return; }
-      if (!role) { msg.textContent = 'Please enter a target role.'; return; }
       const file = fileInput.files[0];
       if (file.size > 5 * 1024 * 1024) { msg.textContent = 'File too large (max 5 MB).'; return; }
 
@@ -169,27 +136,17 @@ def dashboard():
       const fd = new FormData();
       fd.append('file', file);
       fd.append('name', document.getElementById('resumeName').value.trim());
-      fd.append('target_role', role);
-      fd.append('location', document.getElementById('location').value.trim());
-      fd.append('work_mode', document.getElementById('workMode').value);
-      fd.append('employment_type', document.getElementById('employmentType').value);
 
       try {
         const up = await fetch('/upload', { method: 'POST', body: fd });
         if (!up.ok) { const e = await up.json(); throw new Error(e.detail || 'upload failed'); }
         const upData = await up.json();
-        msg.textContent = 'Stored resume #' + upData.resume_id + ' (' + upData.chars + ' chars). Starting run...';
-
-        const run = await fetch('/runs?resume_id=' + upData.resume_id + '&evaluate=' + evalFlag(), { method: 'POST' });
-        if (!run.ok) { const e = await run.json(); throw new Error(e.detail || 'run failed to start'); }
-        const runData = await run.json();
-        msg.textContent = 'Resume #' + upData.resume_id + ' -> Run #' + runData.run_id + ' started.';
+        msg.textContent = 'Stored resume #' + upData.resume_id + ' (' + upData.chars + ' chars). Set search options below and run it.';
         loadResumes();
-        setTimeout(function() { loadRuns(); loadDetail(runData.run_id); }, 1500);
       } catch (err) {
         msg.textContent = 'Error: ' + err.message;
       } finally {
-        btn.disabled = false; btn.innerHTML = '&#9654; Upload &amp; Start Run';
+        btn.disabled = false; btn.innerHTML = '&#9654; Upload Resume';
       }
     }
 
@@ -199,16 +156,32 @@ def dashboard():
         const res = await fetch('/resumes');
         if (!res.ok) throw new Error('failed to load resumes');
         const resumes = await res.json();
-        if (resumes.length === 0) { div.innerHTML = '<div class="step">No saved resumes yet.</div>'; return; }
+        if (resumes.length === 0) { div.innerHTML = '<div class="step">No saved resumes yet. Upload one above.</div>'; return; }
         div.innerHTML = '';
         for (const r of resumes) {
           const el = document.createElement('div');
           el.className = 'step';
-          el.innerHTML = '<strong>' + escapeHtml(r.name) + '</strong> - ' + escapeHtml(r.target_role || 'no role') +
-            ' <span style="color:#8b8f9c;">(' + escapeHtml(r.chars) + ' chars, ' + escapeHtml(r.work_mode || 'any') + ')</span>' +
-            '<div style="margin-top:8px;">' +
-              '<button class="btn-sm btn-approve" onclick="runResume(' + r.id + ')">Run</button>' +
-              '<button class="btn-sm btn-reject" onclick="deleteResume(' + r.id + ')">Delete</button>' +
+          el.innerHTML = '<strong>' + escapeHtml(r.name) + '</strong> <span style="color:#8b8f9c;">(' + escapeHtml(r.chars) + ' chars)</span>' +
+            '<div class="search-form">' +
+              '<div class="row">' +
+                '<div><label>Target role</label><br><input type="text" id="role_' + r.id + '" placeholder="AI/ML Engineer" style="width:95%;"></div>' +
+                '<div><label>Location</label><br><input type="text" id="loc_' + r.id + '" placeholder="Michigan" style="width:95%;"></div>' +
+              '</div>' +
+              '<div class="row" style="margin-top:6px;">' +
+                '<div><label>Work mode</label><br><select id="mode_' + r.id + '" style="width:100%;">' +
+                  '<option value="">(any)</option><option value="remote">remote</option><option value="hybrid">hybrid</option><option value="onsite">onsite</option>' +
+                '</select></div>' +
+                '<div><label>Employment type</label><br><select id="emp_' + r.id + '" style="width:100%;">' +
+                  '<option value="">(any)</option><option value="full-time">full-time</option><option value="part-time">part-time</option><option value="contract">contract</option><option value="internship">internship</option>' +
+                '</select></div>' +
+              '</div>' +
+              '<div style="margin-top:8px;">' +
+                '<label style="color:#e4e6eb;"><input type="checkbox" id="eval_' + r.id + '" style="width:auto;margin-right:6px;">Run LLM evaluator (extra API calls)</label>' +
+              '</div>' +
+              '<div style="margin-top:8px;">' +
+                '<button class="btn-sm btn-approve" onclick="runResume(' + r.id + ')">Run Search</button>' +
+                '<button class="btn-sm btn-reject" onclick="deleteResume(' + r.id + ')">Delete</button>' +
+              '</div>' +
             '</div>';
           div.appendChild(el);
         }
@@ -218,8 +191,20 @@ def dashboard():
     }
 
     async function runResume(id) {
+      const role = (document.getElementById('role_' + id).value || '').trim();
+      if (!role) { alert('Please enter a target role for this search.'); return; }
+      const loc = (document.getElementById('loc_' + id).value || '').trim();
+      const mode = document.getElementById('mode_' + id).value;
+      const emp = document.getElementById('emp_' + id).value;
+      const doEval = document.getElementById('eval_' + id).checked ? 'true' : 'false';
+      const qs = '?resume_id=' + id +
+                 '&target_role=' + encodeURIComponent(role) +
+                 '&location=' + encodeURIComponent(loc) +
+                 '&work_mode=' + encodeURIComponent(mode) +
+                 '&employment_type=' + encodeURIComponent(emp) +
+                 '&evaluate=' + doEval;
       try {
-        const run = await fetch('/runs?resume_id=' + id + '&evaluate=' + evalFlag(), { method: 'POST' });
+        const run = await fetch('/runs' + qs, { method: 'POST' });
         if (!run.ok) { const e = await run.json(); throw new Error(e.detail || 'run failed'); }
         const runData = await run.json();
         setTimeout(function() { loadRuns(); loadDetail(runData.run_id); }, 1500);
@@ -300,9 +285,11 @@ def dashboard():
           else if (r.status === 'failed') cls = 'failed';
           else if (r.status === 'running') cls = 'running';
           else if (r.status === 'cancelled') cls = 'cancelled';
+          const searchDesc = (r.target_role || '-') + (r.location ? ' / ' + r.location : '') + (r.work_mode ? ' / ' + r.work_mode : '');
           const tr = document.createElement('tr');
           tr.innerHTML = '<td>#' + escapeHtml(r.id) + '</td>' +
             '<td><span class="status ' + cls + '">' + escapeHtml(r.status) + '</span></td>' +
+            '<td style="font-size:12px;color:#b0b4c0;">' + escapeHtml(searchDesc) + '</td>' +
             '<td>' + escapeHtml((r.started_at || '').replace('T', ' ').slice(0, 16)) + '</td>' +
             '<td>' + escapeHtml(r.total_tokens || 0) + '</td>' +
             '<td>~$' + escapeHtml((r.total_cost || 0).toFixed(6)) + '</td>';
@@ -310,7 +297,7 @@ def dashboard():
           tbody.appendChild(tr);
         }
       } catch (err) {
-        tbody.innerHTML = '<tr><td colspan="5" style="color:#f87171;">Could not load runs: ' + escapeHtml(err.message) + '</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="6" style="color:#f87171;">Could not load runs: ' + escapeHtml(err.message) + '</td></tr>';
       }
     }
 
@@ -327,7 +314,9 @@ def dashboard():
         }).length;
         const running = run.status === 'running';
 
-        let html = '<h2>Run #' + escapeHtml(run.id) + ' - ' + escapeHtml(run.status) + '</h2>';
+        let html = '<h2>Run #' + escapeHtml(run.id) + ' - ' + escapeHtml(run.status);
+        if (run.target_role) html += ' <span class="note">(' + escapeHtml(run.target_role) + (run.location ? ' / ' + escapeHtml(run.location) : '') + ')</span>';
+        html += '</h2>';
 
         if (running) {
           const active = run.steps.filter(function(s){ return s.status === 'running'; });
@@ -406,14 +395,8 @@ def dashboard():
 
 
 @app.post("/upload")
-async def upload_resume(
-    file: UploadFile = File(...),
-    name: str = Form(""),
-    target_role: str = Form(...),
-    location: str = Form(""),
-    work_mode: str = Form(""),
-    employment_type: str = Form("")
-):
+async def upload_resume(file: UploadFile = File(...), name: str = Form("")):
+    """Store ONLY the resume document. Search config is provided per-run, not here."""
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Please upload a PDF file")
 
@@ -438,14 +421,9 @@ async def upload_resume(
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
-        INSERT INTO resumes (name, resume_text, target_role, location, work_mode, employment_type, created_at)
-        VALUES (%s, %s, %s, %s, %s, %s, %s)
-        RETURNING id
-    """, (
-        name or file.filename,
-        resume_text, target_role, location, work_mode, employment_type,
-        datetime.now()
-    ))
+        INSERT INTO resumes (name, resume_text, created_at)
+        VALUES (%s, %s, %s) RETURNING id
+    """, (name or file.filename, resume_text, datetime.now()))
     resume_id = cur.fetchone()[0]
     conn.commit()
     conn.close()
@@ -459,15 +437,14 @@ def list_resumes():
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
-        SELECT id, name, target_role, location, work_mode, length(resume_text), created_at
+        SELECT id, name, length(resume_text), created_at
         FROM resumes ORDER BY id DESC
     """)
     rows = cur.fetchall()
     conn.close()
     return [
-        {"id": r[0], "name": r[1], "target_role": r[2], "location": r[3],
-         "work_mode": r[4], "chars": r[5],
-         "created_at": r[6].isoformat() if r[6] else None}
+        {"id": r[0], "name": r[1], "chars": r[2],
+         "created_at": r[3].isoformat() if r[3] else None}
         for r in rows
     ]
 
@@ -491,7 +468,8 @@ def list_runs(limit: int = Query(20, ge=1, le=100)):
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
-        SELECT id, status, started_at, total_tokens, total_cost
+        SELECT id, status, started_at, total_tokens, total_cost,
+               target_role, location, work_mode
         FROM runs ORDER BY id DESC LIMIT %s
     """, (limit,))
     rows = cur.fetchall()
@@ -499,15 +477,20 @@ def list_runs(limit: int = Query(20, ge=1, le=100)):
     return [
         {"id": r[0], "status": r[1],
          "started_at": r[2].isoformat() if r[2] else None,
-         "total_tokens": r[3], "total_cost": float(r[4]) if r[4] else 0}
+         "total_tokens": r[3], "total_cost": float(r[4]) if r[4] else 0,
+         "target_role": r[5], "location": r[6], "work_mode": r[7]}
         for r in rows
     ]
 
 
 @app.post("/runs")
-def start_run(background_tasks: BackgroundTasks, resume_id: int = None, evaluate: bool = False):
+def start_run(background_tasks: BackgroundTasks, resume_id: int = None,
+              target_role: str = "", location: str = "", work_mode: str = "",
+              employment_type: str = "", evaluate: bool = False):
     if resume_id is None:
         raise HTTPException(status_code=400, detail="resume_id is required; upload or pick a resume first")
+    if not target_role.strip():
+        raise HTTPException(status_code=400, detail="target_role is required for a search")
 
     conn = get_connection()
     cur = conn.cursor()
@@ -517,9 +500,12 @@ def start_run(background_tasks: BackgroundTasks, resume_id: int = None, evaluate
     if not exists:
         raise HTTPException(status_code=404, detail=f"Resume {resume_id} not found")
 
-    run_id = create_run("job search run (dashboard)", resume_id=resume_id)
-    background_tasks.add_task(run_agent, run_id, evaluate, resume_id)
-    return {"run_id": run_id, "resume_id": resume_id, "evaluate": evaluate,
+    run_id = create_run("job search run (dashboard)", resume_id=resume_id,
+                        target_role=target_role, location=location,
+                        work_mode=work_mode, employment_type=employment_type)
+    background_tasks.add_task(run_agent, run_id, evaluate, resume_id,
+                             target_role, location, work_mode, employment_type)
+    return {"run_id": run_id, "resume_id": resume_id, "target_role": target_role,
             "message": f"Run {run_id} started in background."}
 
 
@@ -546,7 +532,8 @@ def get_run(run_id: int):
     cur = conn.cursor()
 
     cur.execute("""
-        SELECT id, status, started_at, ended_at, input_summary, total_tokens, total_cost, resume_id
+        SELECT id, status, started_at, ended_at, input_summary, total_tokens, total_cost,
+               resume_id, target_role, location, work_mode, employment_type
         FROM runs WHERE id = %s
     """, (run_id,))
     run = cur.fetchone()
@@ -619,7 +606,8 @@ def get_run(run_id: int):
         "ended_at": run[3].isoformat() if run[3] else None,
         "input_summary": run[4],
         "total_tokens": run[5], "total_cost": float(run[6]) if run[6] else 0,
-        "resume_id": run[7],
+        "resume_id": run[7], "target_role": run[8], "location": run[9],
+        "work_mode": run[10], "employment_type": run[11],
         "steps": steps
     }
 

@@ -21,20 +21,15 @@ from tools import keyword_overlap_tool
 
 
 def load_resume_from_db(resume_id):
+    """Load ONLY the resume document. Search config now lives on the run, not here."""
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute("""
-        SELECT resume_text, target_role, location, work_mode, employment_type
-        FROM resumes WHERE id = %s
-    """, (resume_id,))
+    cur.execute("SELECT resume_text FROM resumes WHERE id = %s", (resume_id,))
     row = cur.fetchone()
     conn.close()
     if not row:
         raise RuntimeError(f"Resume {resume_id} not found")
-    return {
-        "resume_text": row[0], "target_role": row[1], "location": row[2] or "",
-        "work_mode": row[3] or "", "employment_type": row[4] or ""
-    }
+    return {"resume_text": row[0]}
 
 
 def build_prompt(resume_text, parsed, job, overlap, requirements):
@@ -73,17 +68,23 @@ def parse_decision(raw):
     return parsed.decision.value
 
 
-def run_agent(run_id=None, evaluate=False, resume_id=None, sleep_between=15):
+def run_agent(run_id=None, evaluate=False, resume_id=None,
+              target_role=None, location=None, work_mode=None,
+              employment_type=None, sleep_between=15):
+    """
+    Run the agent. Search config (target_role/location/work_mode/employment_type)
+    is passed in per-run. Dashboard runs pass these explicitly; the CLI path falls
+    back to user_input.json when they aren't provided.
+    """
     if run_id is None:
-        run_id = create_run("job search run", resume_id=resume_id)
+        run_id = create_run("job search run", resume_id=resume_id,
+                            target_role=target_role, location=location,
+                            work_mode=work_mode, employment_type=employment_type)
 
     failures = 0
     run_finished = False
 
     try:
-        # Quota probe INSIDE the protected lifecycle: if it raises (503, network,
-        # auth, or any unexpected provider error), the finally still closes the run
-        # so it can never be left stuck as 'running'.
         if not quota_available():
             print("⚠ API quota exhausted — skipping run. Try again after reset.")
             finish_run(run_id, "failed")
@@ -99,16 +100,16 @@ def run_agent(run_id=None, evaluate=False, resume_id=None, sleep_between=15):
                 )
                 if db_resume is None:
                     raise RuntimeError("load_resume_from_db returned nothing")
-                user_input = {
-                    "resume_file": None,
-                    "target_role": db_resume["target_role"],
-                    "location": db_resume["location"],
-                    "work_mode": db_resume["work_mode"],
-                    "employment_type": db_resume["employment_type"]
-                }
                 resume_text = db_resume["resume_text"]
                 if not resume_text:
                     raise RuntimeError("stored resume has no text")
+                user_input = {
+                    "resume_file": None,
+                    "target_role": target_role or "",
+                    "location": location or "",
+                    "work_mode": work_mode or "",
+                    "employment_type": employment_type or ""
+                }
                 finish_step(step_id, "success")
             except Exception as e:
                 fail_step(step_id, e)

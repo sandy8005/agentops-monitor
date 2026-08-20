@@ -63,13 +63,21 @@ def real_llm_once(prompt):
     }
 
 
-def create_run(input_summary, resume_id=None):
+def create_run(input_summary, resume_id=None, target_role=None,
+               location=None, work_mode=None, employment_type=None):
+    """
+    Create a run. Search configuration (role/location/work_mode/employment_type)
+    now lives on the RUN, not the resume — so one resume can be searched many
+    ways across different runs.
+    """
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
-        INSERT INTO runs (started_at, status, input_summary, resume_id)
-        VALUES (%s, %s, %s, %s) RETURNING id
-    """, (datetime.now(), "running", input_summary, resume_id))
+        INSERT INTO runs (started_at, status, input_summary, resume_id,
+                          target_role, location, work_mode, employment_type)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id
+    """, (datetime.now(), "running", input_summary, resume_id,
+          target_role, location, work_mode, employment_type))
     run_id = cur.fetchone()[0]
     conn.commit()
     conn.close()
@@ -228,7 +236,6 @@ def logged_llm_call(prompt, run_id, step_id, operation="llm_call", max_retries=3
     Run an LLM call with retry, logging EACH HTTP attempt as its own row.
     Failed attempts are logged with status='failed' and their attempt_number;
     the succeeding attempt records retry_count = number of prior failures.
-    So two 503s then a success produce three rows (attempts 1, 2, 3).
     """
     last_error = None
     for attempt in range(1, max_retries + 1):
