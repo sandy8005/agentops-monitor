@@ -19,7 +19,6 @@ def import_jobs_from_csv(csv_path):
     conn = get_connection()
     cur = conn.cursor()
 
-    # idempotent: clear previous CSV imports so re-running doesn't duplicate
     cur.execute("DELETE FROM job_postings WHERE source = 'csv'")
 
     imported = 0
@@ -34,12 +33,14 @@ def import_jobs_from_csv(csv_path):
             if not row["title"] or not row["description"]:
                 print(f"  skipping row with empty title/description")
                 continue
+            # employment_type is optional in the CSV; default to full-time.
+            emp_type = row.get("employment_type", "") or "full-time"
             cur.execute("""
-                INSERT INTO job_postings (title, company, description, location, work_mode, source)
-                VALUES (%s, %s, %s, %s, %s, 'csv')
+                INSERT INTO job_postings (title, company, description, location, work_mode, employment_type, source)
+                VALUES (%s, %s, %s, %s, %s, %s, 'csv')
             """, (
                 row["title"], row.get("company", ""), row["description"],
-                row.get("location", ""), row.get("work_mode", "")
+                row.get("location", ""), row.get("work_mode", ""), emp_type
             ))
             imported += 1
 

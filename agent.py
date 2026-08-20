@@ -151,7 +151,7 @@ def run_agent(run_id=None, evaluate=False, resume_id=None,
                 return
 
         print(f"Target role: {user_input['target_role']}")
-        print(f"Location: {user_input['location']}  |  Mode: {user_input['work_mode']}")
+        print(f"Location: {user_input['location']}  |  Mode: {user_input['work_mode']}  |  Type: {user_input['employment_type']}")
         print(f"Resume: {len(resume_text)} characters")
 
         step_id = create_step(run_id, "parse_resume", 2)
@@ -172,11 +172,13 @@ def run_agent(run_id=None, evaluate=False, resume_id=None,
             search_params = {
                 "target_role": user_input["target_role"],
                 "location": user_input["location"],
-                "work_mode": user_input.get("work_mode")
+                "work_mode": user_input.get("work_mode"),
+                "employment_type": user_input.get("employment_type")
             }
             jobs = logged_tool_call(
                 "search_jobs",
-                lambda p: search_jobs(p["target_role"], p["location"], p["work_mode"]),
+                lambda p: search_jobs(p["target_role"], p["location"],
+                                      p["work_mode"], p["employment_type"]),
                 search_params, run_id, step_id, operation="search_jobs"
             )
             if not jobs:

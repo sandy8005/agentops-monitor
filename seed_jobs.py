@@ -13,10 +13,12 @@ cur = conn.cursor()
 cur.execute("DELETE FROM job_postings WHERE source = 'seed'")
 
 for job in JOBS:
+    # employment_type is optional in the JOBS data; default to full-time.
+    emp_type = job.get("employment_type", "full-time")
     cur.execute("""
-        INSERT INTO job_postings (title, company, description, source)
-        VALUES (%s, %s, %s, 'seed')
-    """, (job["title"], job["company"], job["description"]))
+        INSERT INTO job_postings (title, company, description, employment_type, source)
+        VALUES (%s, %s, %s, %s, 'seed')
+    """, (job["title"], job["company"], job["description"], emp_type))
 
 conn.commit()
 cur.execute("SELECT COUNT(*) FROM job_postings")

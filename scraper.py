@@ -12,10 +12,24 @@ def get_connection():
     )
 
 
+def infer_employment_type(title, description):
+    """
+    Best-effort inference of employment type from text, since the scraped site
+    doesn't provide it structurally. Defaults to full-time when nothing matches.
+    """
+    text = f"{title} {description}".lower()
+    if "intern" in text:
+        return "internship"
+    if "part-time" in text or "part time" in text:
+        return "part-time"
+    if "contract" in text or "contractor" in text or "freelance" in text:
+        return "contract"
+    return "full-time"
+
+
 def scrape_job_postings(url="https://realpython.github.io/fake-jobs/", limit=5):
     """
-    Scrape job postings from a static, scraping-permitted job board.
-    Uses a practice site built for scraping (no ToS/anti-bot issues).
+    Scrape job postings from a static, scraping-permitted practice site.
     """
     headers = {"User-Agent": "AgentOpsMonitor/1.0 (educational project)"}
     resp = requests.get(url, headers=headers, timeout=15)
@@ -31,12 +45,16 @@ def scrape_job_postings(url="https://realpython.github.io/fake-jobs/", limit=5):
         location = card.select_one("p.location")
         if not title:
             continue
+        t = title.get_text(strip=True)
+        c = company.get_text(strip=True) if company else ""
+        desc = f"{t} at {c if c else 'unknown'}. Scraped listing."
         jobs.append({
-            "title": title.get_text(strip=True),
-            "company": company.get_text(strip=True) if company else "",
+            "title": t,
+            "company": c,
             "location": location.get_text(strip=True) if location else "",
             "url": url,
-            "description": f"{title.get_text(strip=True)} at {company.get_text(strip=True) if company else 'unknown'}. Scraped listing."
+            "description": desc,
+            "employment_type": infer_employment_type(t, desc)
         })
     return jobs
 
@@ -49,14 +67,14 @@ def import_scraped_jobs(url="https://realpython.github.io/fake-jobs/", limit=5):
 
     conn = get_connection()
     cur = conn.cursor()
-    # idempotent: clear previous scraped rows
     cur.execute("DELETE FROM job_postings WHERE source = 'scraped'")
 
     for job in jobs:
         cur.execute("""
-            INSERT INTO job_postings (title, company, description, location, work_mode, source)
-            VALUES (%s, %s, %s, %s, %s, 'scraped')
-        """, (job["title"], job["company"], job["description"], job["location"], ""))
+            INSERT INTO job_postings (title, company, description, location, work_mode, employment_type, source)
+            VALUES (%s, %s, %s, %s, %s, %s, 'scraped')
+        """, (job["title"], job["company"], job["description"], job["location"], "",
+              job["employment_type"]))
 
     conn.commit()
     cur.execute("SELECT COUNT(*) FROM job_postings")
