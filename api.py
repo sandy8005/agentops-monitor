@@ -84,7 +84,7 @@ def dashboard():
   </header>
   <div class="container">
 
-    <div class="section-title">Upload a Resume <span class="note">— the document only; you set search options when you run it</span></div>
+    <div class="section-title">Saved Resumes <span class="note">— pick one, set this search's options, and run. One resume, many searches. Location is informational only; it doesn't filter or score.</span></div>
     <div class="upload-form">
       <label>Resume PDF</label>
       <input type="file" id="resumeFile" accept="application/pdf">
@@ -165,7 +165,7 @@ def dashboard():
             '<div class="search-form">' +
               '<div class="row">' +
                 '<div><label>Target role</label><br><input type="text" id="role_' + r.id + '" placeholder="AI/ML Engineer" style="width:95%;"></div>' +
-                '<div><label>Location</label><br><input type="text" id="loc_' + r.id + '" placeholder="Michigan" style="width:95%;"></div>' +
+                '<div><label>Location <span style="color:#8b8f9c;">(informational — does not filter)</span></label><br><input type="text" id="loc_' + r.id + '" placeholder="Michigan" style="width:95%;"></div>' +
               '</div>' +
               '<div class="row" style="margin-top:6px;">' +
                 '<div><label>Work mode</label><br><select id="mode_' + r.id + '" style="width:100%;">' +
