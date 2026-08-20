@@ -13,6 +13,9 @@ conn = psycopg2.connect(
 )
 cur = conn.cursor()
 
+# runs: one row per agent run. Search config (target_role/location/work_mode/
+# employment_type) lives HERE, not on the resume, so one resume can be searched
+# many different ways across runs.
 cur.execute("""
 CREATE TABLE IF NOT EXISTS runs (
     id SERIAL PRIMARY KEY,
@@ -23,10 +26,15 @@ CREATE TABLE IF NOT EXISTS runs (
     total_tokens INTEGER DEFAULT 0,
     total_cost NUMERIC(12,6) DEFAULT 0,
     resume_id INTEGER,
-    cancel_requested BOOLEAN DEFAULT FALSE
+    cancel_requested BOOLEAN DEFAULT FALSE,
+    target_role TEXT,
+    location TEXT,
+    work_mode TEXT,
+    employment_type TEXT
 )
 """)
 
+# steps: one row per conceptual stage of a run (load, parse, search, per-job, rank).
 cur.execute("""
 CREATE TABLE IF NOT EXISTS steps (
     id SERIAL PRIMARY KEY,
@@ -46,10 +54,12 @@ CREATE TABLE IF NOT EXISTS steps (
     reviewed_at TIMESTAMP,
     reviewer TEXT,
     review_comment TEXT,
+    review_reason TEXT,
     FOREIGN KEY (run_id) REFERENCES runs(id)
 )
 """)
 
+# llm_calls: one row per HTTP attempt (retries logged separately via attempt_number).
 cur.execute("""
 CREATE TABLE IF NOT EXISTS llm_calls (
     id SERIAL PRIMARY KEY,
@@ -65,11 +75,16 @@ CREATE TABLE IF NOT EXISTS llm_calls (
     created_at TIMESTAMP,
     status TEXT DEFAULT 'success',
     error_message TEXT,
+    operation_name TEXT,
+    attempt_number INTEGER DEFAULT 1,
+    retry_count INTEGER DEFAULT 0,
+    provider_request_id TEXT,
     FOREIGN KEY (run_id) REFERENCES runs(id),
     FOREIGN KEY (step_id) REFERENCES steps(id)
 )
 """)
 
+# tool_calls: one row per tool invocation, tagged with the conceptual operation.
 cur.execute("""
 CREATE TABLE IF NOT EXISTS tool_calls (
     id SERIAL PRIMARY KEY,
@@ -82,11 +97,13 @@ CREATE TABLE IF NOT EXISTS tool_calls (
     status TEXT,
     error_message TEXT,
     created_at TIMESTAMP,
+    operation_name TEXT,
     FOREIGN KEY (run_id) REFERENCES runs(id),
     FOREIGN KEY (step_id) REFERENCES steps(id)
 )
 """)
 
+# job_postings: the searchable job pool (populated by the four importers).
 cur.execute("""
 CREATE TABLE IF NOT EXISTS job_postings (
     id SERIAL PRIMARY KEY,
@@ -100,6 +117,9 @@ CREATE TABLE IF NOT EXISTS job_postings (
 )
 """)
 
+# resumes: the stored resume DOCUMENT. Search config now lives on runs, not here.
+# The legacy target_role/location/work_mode/employment_type columns are kept
+# (nullable, unused) so pre-normalization databases don't break; new code ignores them.
 cur.execute("""
 CREATE TABLE IF NOT EXISTS resumes (
     id SERIAL PRIMARY KEY,
@@ -113,6 +133,7 @@ CREATE TABLE IF NOT EXISTS resumes (
 )
 """)
 
+# evaluations: LLM-as-judge grades for a step's decision.
 cur.execute("""
 CREATE TABLE IF NOT EXISTS evaluations (
     id SERIAL PRIMARY KEY,
@@ -132,4 +153,4 @@ CREATE TABLE IF NOT EXISTS evaluations (
 
 conn.commit()
 conn.close()
-print("Postgres tables ready (complete schema: 7 tables)")
+print("Postgres tables ready (complete schema: 7 tables, all columns)")
