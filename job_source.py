@@ -40,8 +40,7 @@ def search_jobs(target_role=None, location=None, work_mode=None,
     filtered = [j for j in all_jobs if role_matches(j)]
 
     # --- work_mode filter (only excludes jobs that HAVE a mode and clearly conflict) ---
-    # Location is intentionally NOT used to filter: the user sees jobs from all
-    # locations. Location is collected and displayed but does not filter or score.
+    # Location is intentionally NOT used to filter (informational only).
     if work_mode:
         wm = work_mode.lower()
 
@@ -56,27 +55,25 @@ def search_jobs(target_role=None, location=None, work_mode=None,
 
         filtered = [j for j in filtered if mode_ok(j)]
 
-    # --- employment_type filter (SOFT: exclude only jobs that HAVE a type that
-    # clearly conflicts; keep jobs with no type data so the pool isn't wiped out) ---
+    # --- employment_type filter (SOFT: keep unknown-type jobs, exclude known mismatches) ---
     if employment_type:
         et = employment_type.lower().strip()
 
         def type_ok(job):
             jt = (job.get("employment_type") or "").lower().strip()
             if not jt:
-                return True          # no type data → don't exclude (missing != mismatch)
-            return jt == et          # keep only jobs whose type matches the request
+                return True
+            return jt == et
 
         filtered = [j for j in filtered if type_ok(j)]
 
     # --- results handling ---
-    # Return the genuine matches, even if few. Do NOT dilute with irrelevant jobs
-    # — that wastes LLM tokens/quota evaluating things the user didn't ask for.
+    # Return the genuine matches only. If NOTHING matched, return an empty list —
+    # do NOT manufacture arbitrary jobs just to give the run something to process.
+    # An honest "no jobs matched" is better than fake results the user didn't ask for.
     if len(filtered) == 0:
-        sample = all_jobs[:min_results]
-        print(f"  (no jobs matched '{target_role}' — showing {len(sample)} sample job(s); "
-              f"try a broader role or different filters)")
-        return sample
+        print(f"  (no jobs matched '{target_role}' with the given filters)")
+        return []
 
     print(f"  ({len(filtered)} of {len(all_jobs)} job(s) matched your criteria)")
     return filtered

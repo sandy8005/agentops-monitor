@@ -181,14 +181,21 @@ def run_agent(run_id=None, evaluate=False, resume_id=None,
                                       p["work_mode"], p["employment_type"]),
                 search_params, run_id, step_id, operation="search_jobs"
             )
-            if not jobs:
-                raise RuntimeError("search_jobs returned no jobs")
             finish_step(step_id, "success")
         except Exception as e:
             fail_step(step_id, e)
             finish_run(run_id, "failed")
             run_finished = True
             print(f"Job search failed: {e}")
+            return
+
+        # No jobs matched — a VALID outcome, not an error. Finish cleanly so the
+        # user sees an honest "no matches" rather than a failure or manufactured
+        # (arbitrary) jobs. We do not fabricate results just to fill the run.
+        if not jobs:
+            print(f"No jobs matched '{user_input['target_role']}' with the given filters.")
+            finish_run(run_id, "no_matches")
+            run_finished = True
             return
 
         print(f"Found {len(jobs)} jobs")
