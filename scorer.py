@@ -2,10 +2,7 @@ import re
 
 
 def _skill_present(skill, resume_text_lower, resume_tokens):
-    """
-    Whole-word skill match. Avoids 'go' matching inside 'django'.
-    Multi-word skills (e.g. 'machine learning') fall back to phrase search.
-    """
+    """Whole-word skill match. Avoids 'go' matching inside 'django'."""
     s = skill.lower().strip()
     if not s:
         return False
@@ -28,12 +25,11 @@ def calculate_match_score(parsed_resume, requirements, resume_text, job=None, us
     preferred = [s.lower() for s in requirements["preferred_skills"]]
     min_years = requirements["min_years_experience"]
 
-    # "No requirements at all" => can't score meaningfully.
     insufficient = (len(required) == 0 and len(any_of_groups) == 0 and len(preferred) == 0)
 
     breakdown = {}
 
-    # Required section — 50 pts. Covers flat required skills + any-of groups.
+    # Required section — 50 pts. Flat required skills + any-of groups.
     # A group counts as one item, satisfied if ANY of its alternatives is present.
     total_required_items = len(required) + len(any_of_groups)
     if total_required_items > 0:
@@ -55,19 +51,31 @@ def calculate_match_score(parsed_resume, requirements, resume_text, job=None, us
     else:
         breakdown["preferred"] = 0.0
 
-    # Project relevance — 15 pts: required skills (flat + any-of members) in projects.
-    all_required_flat = list(required)
-    for group in any_of_groups:
-        all_required_flat.extend(group)
-    if all_required_flat:
-        distinct = set(all_required_flat)
-        relevant = [s for s in distinct if s in project_tech_set]
-        breakdown["projects"] = round(15 * len(relevant) / len(distinct), 1)
+    # Project relevance — 15 pts. Uses the SAME group semantics as the required
+    # section: each flat required skill is one unit, and each any-of GROUP is one
+    # unit satisfied if ANY member appears in the projects. This keeps the project
+    # score consistent with the required score — a Django-only candidate gets full
+    # credit for a "Flask OR Django" group in BOTH sections, not half in projects.
+    def _in_projects(skill):
+        s = skill.lower().strip()
+        if " " in s:
+            return any(s in t for t in project_tech_set)
+        return s in project_tech_set
+
+    total_project_units = len(required) + len(any_of_groups)
+    if total_project_units > 0:
+        units_met = 0
+        for s in required:
+            if _in_projects(s):
+                units_met += 1
+        for group in any_of_groups:
+            if any(_in_projects(s) for s in group):
+                units_met += 1
+        breakdown["projects"] = round(15 * units_met / total_project_units, 1)
     else:
         breakdown["projects"] = 0.0
 
-    # Experience — 15 pts (absorbs the points formerly given to location,
-    # which was removed: location is informational only, not a scoring factor).
+    # Experience — 15 pts.
     if candidate_years >= min_years:
         breakdown["experience"] = 15.0
     elif min_years > 0:
