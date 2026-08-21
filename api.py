@@ -447,7 +447,7 @@ def list_resumes():
     cur = conn.cursor()
     cur.execute("""
         SELECT id, name, length(resume_text), created_at
-        FROM resumes ORDER BY id DESC
+        FROM resumes WHERE is_deleted = FALSE ORDER BY id DESC
     """)
     rows = cur.fetchall()
     conn.close()
@@ -466,7 +466,10 @@ def delete_resume(resume_id: int):
     if not cur.fetchone():
         conn.close()
         raise HTTPException(status_code=404, detail=f"Resume {resume_id} not found")
-    cur.execute("DELETE FROM resumes WHERE id = %s", (resume_id,))
+    # Soft delete: hide from the library but keep the row, so historical runs
+    # that reference this resume keep an intact link. A hard DELETE would orphan
+    # those runs (runs.resume_id would point at a missing row).
+    cur.execute("UPDATE resumes SET is_deleted = TRUE WHERE id = %s", (resume_id,))
     conn.commit()
     conn.close()
     return {"resume_id": resume_id, "deleted": True}
@@ -503,11 +506,13 @@ def start_run(background_tasks: BackgroundTasks, resume_id: int = None,
 
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute("SELECT 1 FROM resumes WHERE id = %s", (resume_id,))
-    exists = cur.fetchone()
+    cur.execute("SELECT is_deleted FROM resumes WHERE id = %s", (resume_id,))
+    row = cur.fetchone()
     conn.close()
-    if not exists:
+    if not row:
         raise HTTPException(status_code=404, detail=f"Resume {resume_id} not found")
+    if row[0]:
+        raise HTTPException(status_code=400, detail="That resume was deleted; upload it again to run new searches")
 
     run_id = create_run("job search run (dashboard)", resume_id=resume_id,
                         target_role=target_role, location=location,
