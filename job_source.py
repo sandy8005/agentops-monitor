@@ -2,9 +2,7 @@ import psycopg2, os
 from dotenv import load_dotenv
 load_dotenv()
 
-# Generic role words that are too common to distinguish a role on their own.
-# A search for "AI/ML Engineer" should require a SPECIALIZING term (ai, ml, ...),
-# not merely "engineer" — otherwise Civil/QA/Network Engineer all match.
+# Generic role words too common to distinguish a role on their own.
 GENERIC_ROLE_WORDS = {
     "engineer", "developer", "analyst", "manager", "specialist", "consultant",
     "administrator", "architect", "designer", "coordinator", "lead", "senior",
@@ -22,10 +20,9 @@ def get_connection():
 
 def _role_matcher(target_role):
     """
-    Build a matcher that requires at least one SPECIALIZING term from the query
-    (e.g. 'ai', 'ml', 'backend'), so a generic word like 'engineer' alone does
-    NOT pull in unrelated roles (Civil Engineer, QA Engineer, ...).
-    If the query has only generic words, fall back to matching those.
+    Require at least one SPECIALIZING term from the query (e.g. 'ai', 'ml',
+    'backend'), so a generic word like 'engineer' alone does NOT pull in
+    unrelated roles. If the query is only generic words, match on those.
     """
     words = [w.lower() for w in target_role.replace("/", " ").split() if w.strip()]
     specializing = [w for w in words if w not in GENERIC_ROLE_WORDS]
@@ -34,9 +31,7 @@ def _role_matcher(target_role):
     def matches(job):
         haystack = f"{job['title']} {job['description']}".lower()
         if specializing:
-            # Require at least one specializing term to be present.
             return any(term in haystack for term in specializing)
-        # Query was only generic words — match on those instead.
         return any(term in haystack for term in generic)
 
     return matches
@@ -46,8 +41,11 @@ def search_jobs(target_role=None, location=None, work_mode=None,
                 employment_type=None, min_results=3):
     conn = get_connection()
     cur = conn.cursor()
+    # Select provenance (source) too — for an observability tool, knowing WHERE
+    # each job came from (seed/csv/api/scraped) is valuable trace context that
+    # should survive downstream, not be dropped at the search boundary.
     cur.execute("""
-        SELECT id, title, company, description, location, work_mode, employment_type
+        SELECT id, title, company, description, location, work_mode, employment_type, source
         FROM job_postings ORDER BY id
     """)
     rows = cur.fetchall()
@@ -55,7 +53,7 @@ def search_jobs(target_role=None, location=None, work_mode=None,
 
     all_jobs = [
         {"id": r[0], "title": r[1], "company": r[2], "description": r[3],
-         "location": r[4], "work_mode": r[5], "employment_type": r[6]}
+         "location": r[4], "work_mode": r[5], "employment_type": r[6], "source": r[7]}
         for r in rows
     ]
 

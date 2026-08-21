@@ -248,7 +248,8 @@ def run_agent(run_id=None, evaluate=False, resume_id=None,
 
                 needs_review = record_score(
                     step_id, score_result["score"],
-                    score_result["decision"], llm_decision
+                    score_result["decision"], llm_decision,
+                    breakdown=score_result["breakdown"]
                 )
 
                 if score_result.get("insufficient_requirements") and not needs_review:
@@ -257,6 +258,8 @@ def run_agent(run_id=None, evaluate=False, resume_id=None,
                     print(f"    ⚠ insufficient job requirements — flagged for review")
 
                 record_context(step_id, {
+                    "job_id": job.get("id"),
+                    "job_source": job.get("source"),
                     "required_skills": requirements["required_skills"],
                     "required_any_of": requirements["required_any_of"],
                     "preferred_skills": requirements["preferred_skills"],
