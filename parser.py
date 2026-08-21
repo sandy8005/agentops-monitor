@@ -1,21 +1,19 @@
 import json
+import re
 from llm import logged_llm_call
-from schemas import ParsedResume
+from schemas import ParsedResume, _strict_float
 
 
-def _to_float(v, default=0.0):
-    """Coerce anything numeric-ish to float; fall back to default."""
+def _to_float_or_default(v, default=0.0):
+    """
+    For fields where a MISSING value has a sensible default (like a per-entry
+    duration the LLM omitted): coerce recoverable values, fall back to default
+    only for None/absent — but still FAIL on genuine garbage like 'about two',
+    so bad LLM output surfaces instead of silently becoming 0.
+    """
     if v is None:
         return default
-    if isinstance(v, (int, float)):
-        return float(v)
-    try:
-        # pull the first number out of strings like "2 years", "24 months", "1.5"
-        import re
-        m = re.search(r"\d+(\.\d+)?", str(v))
-        return float(m.group()) if m else default
-    except (ValueError, TypeError):
-        return default
+    return _strict_float(v, field_name="years")
 
 
 def _normalize_education(edu_list):
@@ -54,6 +52,7 @@ def _normalize_experience(exp_list):
     """
     Coerce each experience entry to {title, company, years}.
     Handles alternative keys (role/position, months, duration) universally.
+    Garbage durations fail loudly (via _strict_float) rather than becoming 0.
     """
     out = []
     for x in (exp_list or []):
@@ -62,13 +61,12 @@ def _normalize_experience(exp_list):
         title = x.get("title") or x.get("role") or x.get("position") or x.get("job_title") or ""
         company = x.get("company") or x.get("employer") or x.get("organization") or ""
 
-        # years: prefer an explicit years field; else convert months; else parse duration
         if x.get("years") is not None:
-            years = _to_float(x.get("years"))
+            years = _to_float_or_default(x.get("years"))
         elif x.get("months") is not None:
-            years = round(_to_float(x.get("months")) / 12.0, 2)
+            years = round(_to_float_or_default(x.get("months")) / 12.0, 2)
         elif x.get("duration") is not None:
-            years = _to_float(x.get("duration"))
+            years = _to_float_or_default(x.get("duration"))
         else:
             years = 0.0
 
@@ -78,6 +76,38 @@ def _normalize_experience(exp_list):
             "years": years
         })
     return out
+
+
+def _reconcile_experience(parsed_dict):
+    """
+    Cross-check the LLM's stated years_experience against the sum of individual
+    experience durations. The two are independent sources for the same fact; if
+    they diverge meaningfully, prefer the GROUNDED sum (itemized per-role
+    durations resist hallucination better than a free-floating total), and record
+    the discrepancy so it's VISIBLE rather than silently resolved.
+    """
+    stated = parsed_dict.get("years_experience", 0.0) or 0.0
+    summed = round(sum(e.get("years", 0.0) or 0.0 for e in parsed_dict.get("experience", [])), 2)
+
+    parsed_dict["years_experience_stated"] = stated
+    parsed_dict["years_experience_summed"] = summed
+
+    TOLERANCE_YEARS = 1.0
+    if summed > 0 and abs(stated - summed) > TOLERANCE_YEARS:
+        # Meaningful divergence: trust the grounded sum, flag the discrepancy.
+        parsed_dict["years_experience"] = summed
+        parsed_dict["experience_discrepancy"] = {
+            "stated": stated,
+            "summed": summed,
+            "used": summed,
+            "note": ("LLM-stated total diverged from the sum of itemized role "
+                     "durations by more than 1 year; using the grounded sum.")
+        }
+    else:
+        # They agree, or there's no itemized data to check against — keep stated.
+        parsed_dict["experience_discrepancy"] = None
+
+    return parsed_dict
 
 
 def parse_resume(resume_text, run_id, step_id):
@@ -113,19 +143,19 @@ RULES:
     raw = logged_llm_call(prompt, run_id, step_id)
     cleaned = raw.strip().replace("```json", "").replace("```", "").strip()
 
-    # Parse JSON defensively — if the model wrapped or malformed it, fail with a clear message.
     try:
         data = json.loads(cleaned)
     except json.JSONDecodeError as e:
         raise RuntimeError(f"resume parse: model did not return valid JSON ({e})")
 
-    # Normalize EVERYTHING before validation, so schema differences never crash the run.
     normalized = {
         "skills": [str(s) for s in (data.get("skills") or [])],
-        "years_experience": _to_float(data.get("years_experience")),
+        "years_experience": _to_float_or_default(data.get("years_experience")),
         "education": _normalize_education(data.get("education")),
         "projects": _normalize_projects(data.get("projects")),
         "experience": _normalize_experience(data.get("experience")),
     }
 
-    return ParsedResume(**normalized).model_dump()
+    parsed = ParsedResume(**normalized).model_dump()
+    parsed = _reconcile_experience(parsed)
+    return parsed
