@@ -11,10 +11,8 @@ load_dotenv()
 
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
-# Estimated pricing (USD per token), based on published Gemini Flash rates.
-# ESTIMATES for observability, not the actual provider invoice.
-INPUT_TOKEN_RATE = 0.075 / 1_000_000     # ~$0.075 per 1M input tokens
-OUTPUT_TOKEN_RATE = 0.30 / 1_000_000     # ~$0.30 per 1M output tokens
+INPUT_TOKEN_RATE = 0.075 / 1_000_000
+OUTPUT_TOKEN_RATE = 0.30 / 1_000_000
 
 
 def get_connection():
@@ -28,7 +26,6 @@ def get_connection():
 
 
 def quota_available():
-    """Cheap probe: returns True if the API responds, False if rate-limited."""
     try:
         client.models.generate_content(model="gemini-flash-latest", contents="hi")
         return True
@@ -65,11 +62,6 @@ def real_llm_once(prompt):
 
 def create_run(input_summary, resume_id=None, target_role=None,
                location=None, work_mode=None, employment_type=None):
-    """
-    Create a run. Search configuration (role/location/work_mode/employment_type)
-    now lives on the RUN, not the resume — so one resume can be searched many
-    ways across different runs.
-    """
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
@@ -115,20 +107,31 @@ def fail_step(step_id, error_message):
     conn.close()
 
 
-def record_score(step_id, match_score, score_decision, llm_decision):
+def record_score(step_id, match_score, score_decision, llm_decision, breakdown=None):
+    """
+    Record the match score, decisions, and the per-category breakdown (stored as
+    JSONB). The breakdown (required/preferred/projects/experience) is valuable
+    trace context for a human reviewer: it shows WHERE the score came from, not
+    just the total.
+    """
     needs_review = score_decision != llm_decision
+    breakdown_json = json.dumps(breakdown) if breakdown else None
     conn = get_connection()
     cur = conn.cursor()
     if needs_review:
         cur.execute("""
             UPDATE steps SET match_score = %s, score_decision = %s, llm_decision = %s,
-                needs_human_review = TRUE, review_reason = 'score_disagreement' WHERE id = %s
-        """, (match_score, score_decision, llm_decision, step_id))
+                score_breakdown = %s,
+                needs_human_review = TRUE, review_reason = 'score_disagreement'
+            WHERE id = %s
+        """, (match_score, score_decision, llm_decision, breakdown_json, step_id))
     else:
         cur.execute("""
             UPDATE steps SET match_score = %s, score_decision = %s, llm_decision = %s,
-                needs_human_review = FALSE WHERE id = %s
-        """, (match_score, score_decision, llm_decision, step_id))
+                score_breakdown = %s,
+                needs_human_review = FALSE
+            WHERE id = %s
+        """, (match_score, score_decision, llm_decision, breakdown_json, step_id))
     conn.commit()
     conn.close()
     return needs_review
@@ -213,7 +216,6 @@ def finish_run(run_id, status="success"):
 def _log_llm_attempt(run_id, step_id, operation, prompt, response_text,
                      prompt_tokens, completion_tokens, latency_ms, cost,
                      status, error_message, attempt_number, retry_count, provider_request_id):
-    """Log a single HTTP attempt of an LLM call as its own llm_calls row."""
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
@@ -232,11 +234,6 @@ def _log_llm_attempt(run_id, step_id, operation, prompt, response_text,
 
 
 def logged_llm_call(prompt, run_id, step_id, operation="llm_call", max_retries=3):
-    """
-    Run an LLM call with retry, logging EACH HTTP attempt as its own row.
-    Failed attempts are logged with status='failed' and their attempt_number;
-    the succeeding attempt records retry_count = number of prior failures.
-    """
     last_error = None
     for attempt in range(1, max_retries + 1):
         start = time.time()
@@ -272,7 +269,6 @@ def logged_llm_call(prompt, run_id, step_id, operation="llm_call", max_retries=3
 
 
 def logged_tool_call(tool_name, tool_func, tool_input, run_id, step_id, operation=None):
-    """Run a tool and log it, tagged with the conceptual operation (stage) name."""
     start = time.time()
     try:
         result = tool_func(tool_input)

@@ -167,6 +167,15 @@ def run_agent(run_id=None, evaluate=False, resume_id=None,
 
         print(f"Parsed: {len(parsed['skills'])} skills, {len(parsed['projects'])} projects")
 
+        # Surface an experience discrepancy (LLM-stated total vs summed itemized
+        # durations) as a review signal, consistent with the surface-disagreements
+        # philosophy. parse_resume records this; here we act on it.
+        if parsed.get("experience_discrepancy"):
+            flag_for_review(step_id, reason="experience_discrepancy")
+            print(f"    ⚠ experience discrepancy "
+                  f"(stated {parsed['years_experience_stated']} vs "
+                  f"summed {parsed['years_experience_summed']}) — flagged for review")
+
         step_id = create_step(run_id, "search_jobs", 3)
         try:
             search_params = {
@@ -190,8 +199,7 @@ def run_agent(run_id=None, evaluate=False, resume_id=None,
             return
 
         # No jobs matched — a VALID outcome, not an error. Finish cleanly so the
-        # user sees an honest "no matches" rather than a failure or manufactured
-        # (arbitrary) jobs. We do not fabricate results just to fill the run.
+        # user sees an honest "no matches" rather than a failure or manufactured jobs.
         if not jobs:
             print(f"No jobs matched '{user_input['target_role']}' with the given filters.")
             finish_run(run_id, "no_matches")
@@ -299,7 +307,14 @@ def run_agent(run_id=None, evaluate=False, resume_id=None,
                         print(f"    eval: rel={rel} faith={faith} complete={comp} "
                               f"halluc={eval_result['hallucination_detected']}")
                     except Exception as eval_err:
-                        print(f"    (evaluation skipped: {eval_err})")
+                        # Evaluation was explicitly requested but failed. Don't let the
+                        # run report a clean 'success' — that overstates what happened.
+                        # Count it (→ completed_with_errors) and surface it for review,
+                        # while the matching decision itself still stands.
+                        failures += 1
+                        flag_for_review(step_id, reason="evaluation_failed")
+                        needs_review = True
+                        print(f"    ⚠ evaluation requested but FAILED: {eval_err}")
 
                 results.append({
                     "title": job["title"], "company": job["company"],

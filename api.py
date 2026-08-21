@@ -48,6 +48,7 @@ def dashboard():
     .failed { background: #3a1518; color: #f87171; }
     .running { background: #1e2a4a; color: #60a5fa; }
     .cancelled { background: #2a2e3a; color: #b0b4c0; }
+    .no_matches { background: #2a2e3a; color: #b0b4c0; }
     .detail { margin-top: 24px; }
     .step { background: #171a22; border: 1px solid #2a2e3a; border-radius: 6px; padding: 12px 16px; margin-bottom: 8px; }
     .review { border-color: #fbbf24; }
@@ -58,6 +59,7 @@ def dashboard():
     .call { color: #8b8f9c; font-size: 12px; margin-left: 16px; margin-top: 4px; }
     .call-failed { color: #f87171; }
     .op { color: #a78bfa; font-weight: 600; }
+    .bd { color: #9ca3af; font-size: 12px; margin-left: 16px; margin-top: 4px; font-family: ui-monospace, monospace; }
     .io { background: #0d0f15; border: 1px solid #2a2e3a; border-radius: 4px; padding: 8px; font-size: 11px; white-space: pre-wrap; word-break: break-word; max-height: 300px; overflow-y: auto; color: #b0b4c0; margin-top: 4px; }
     details summary { color: #60a5fa; font-size: 11px; cursor: pointer; margin-top: 4px; }
     h2 { font-size: 16px; margin: 8px 0 16px; }
@@ -84,7 +86,7 @@ def dashboard():
   </header>
   <div class="container">
 
-    <div class="section-title">Saved Resumes <span class="note">— pick one, set this search's options, and run. One resume, many searches. Location is informational only; it doesn't filter or score.</span></div>
+    <div class="section-title">Upload a Resume <span class="note">— the document only; you set search options when you run it</span></div>
     <div class="upload-form">
       <label>Resume PDF</label>
       <input type="file" id="resumeFile" accept="application/pdf">
@@ -96,7 +98,7 @@ def dashboard():
       <div id="uploadMsg" class="err"></div>
     </div>
 
-    <div class="section-title">Saved Resumes <span class="note">— pick one, set this search's options, and run. One resume, many searches.</span></div>
+    <div class="section-title">Saved Resumes <span class="note">— pick one, set this search's options, and run. One resume, many searches. Location is informational only; it doesn't filter or score.</span></div>
     <div id="resumeLibrary"></div>
 
     <div class="section-title">Pending Human Review</div>
@@ -124,7 +126,6 @@ def dashboard():
       const fileInput = document.getElementById('resumeFile');
       const msg = document.getElementById('uploadMsg');
       msg.textContent = '';
-
       if (!fileInput.files.length) { msg.textContent = 'Please choose a PDF file.'; return; }
       const file = fileInput.files[0];
       if (file.size > 5 * 1024 * 1024) { msg.textContent = 'File too large (max 5 MB).'; return; }
@@ -285,6 +286,7 @@ def dashboard():
           else if (r.status === 'failed') cls = 'failed';
           else if (r.status === 'running') cls = 'running';
           else if (r.status === 'cancelled') cls = 'cancelled';
+          else if (r.status === 'no_matches') cls = 'no_matches';
           const searchDesc = (r.target_role || '-') + (r.location ? ' / ' + r.location : '') + (r.work_mode ? ' / ' + r.work_mode : '');
           const tr = document.createElement('tr');
           tr.innerHTML = '<td>#' + escapeHtml(r.id) + '</td>' +
@@ -347,6 +349,14 @@ def dashboard():
               html += ' <span class="agree">&#10003;</span>';
             }
           }
+          // Score breakdown — shows WHERE the score came from, key context for review.
+          if (s.score_breakdown) {
+            const b = s.score_breakdown;
+            html += '<div class="bd">required ' + escapeHtml(b.required) + '/50 &nbsp; ' +
+                    'preferred ' + escapeHtml(b.preferred) + '/20 &nbsp; ' +
+                    'projects ' + escapeHtml(b.projects) + '/15 &nbsp; ' +
+                    'experience ' + escapeHtml(b.experience) + '/15</div>';
+          }
           if (s.error_message) {
             html += '<div class="call call-failed">error: ' + escapeHtml(s.error_message) + '</div>';
           }
@@ -396,7 +406,6 @@ def dashboard():
 
 @app.post("/upload")
 async def upload_resume(file: UploadFile = File(...), name: str = Form("")):
-    """Store ONLY the resume document. Search config is provided per-run, not here."""
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Please upload a PDF file")
 
@@ -544,7 +553,7 @@ def get_run(run_id: int):
     cur.execute("""
         SELECT id, step_name, status, match_score, score_decision,
                llm_decision, needs_human_review, review_status, error_message,
-               retrieved_context, reviewer, review_comment, review_reason
+               retrieved_context, reviewer, review_comment, review_reason, score_breakdown
         FROM steps WHERE run_id = %s ORDER BY step_order
     """, (run_id,))
     step_rows = cur.fetchall()
@@ -594,6 +603,7 @@ def get_run(run_id: int):
             "needs_human_review": s[6], "review_status": s[7],
             "error_message": s[8], "retrieved_context": s[9],
             "reviewer": s[10], "review_comment": s[11], "review_reason": s[12],
+            "score_breakdown": s[13],
             "tool_calls": tool_calls, "llm_calls": llm_calls,
             "evaluation": evaluation
         })
