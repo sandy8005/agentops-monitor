@@ -15,7 +15,7 @@ cur = conn.cursor()
 
 # runs: one row per agent run. Search config (target_role/location/work_mode/
 # employment_type) lives HERE, not on the resume, so one resume can be searched
-# many different ways across runs.
+# many ways. evaluation_status records whether LLM-as-judge ran for the run.
 cur.execute("""
 CREATE TABLE IF NOT EXISTS runs (
     id SERIAL PRIMARY KEY,
@@ -30,11 +30,12 @@ CREATE TABLE IF NOT EXISTS runs (
     target_role TEXT,
     location TEXT,
     work_mode TEXT,
-    employment_type TEXT
+    employment_type TEXT,
+    evaluation_status TEXT DEFAULT 'not_requested'
 )
 """)
 
-# steps: one row per conceptual stage of a run (load, parse, search, per-job, rank).
+# steps: one row per conceptual stage (load, parse, search, per-job, rank).
 cur.execute("""
 CREATE TABLE IF NOT EXISTS steps (
     id SERIAL PRIMARY KEY,
@@ -50,6 +51,7 @@ CREATE TABLE IF NOT EXISTS steps (
     llm_decision TEXT,
     needs_human_review BOOLEAN DEFAULT FALSE,
     retrieved_context JSONB,
+    score_breakdown JSONB,
     review_status TEXT,
     reviewed_at TIMESTAMP,
     reviewer TEXT,
@@ -59,7 +61,7 @@ CREATE TABLE IF NOT EXISTS steps (
 )
 """)
 
-# llm_calls: one row per HTTP attempt (retries logged separately via attempt_number).
+# llm_calls: one row per HTTP attempt (retries logged separately).
 cur.execute("""
 CREATE TABLE IF NOT EXISTS llm_calls (
     id SERIAL PRIMARY KEY,
@@ -112,14 +114,16 @@ CREATE TABLE IF NOT EXISTS job_postings (
     description TEXT NOT NULL,
     location TEXT,
     work_mode TEXT,
+    employment_type TEXT,
     source TEXT DEFAULT 'seed',
     created_at TIMESTAMP DEFAULT NOW()
 )
 """)
 
-# resumes: the stored resume DOCUMENT. Search config now lives on runs, not here.
+# resumes: the stored resume DOCUMENT. Search config lives on runs, not here.
+# is_deleted supports soft deletion so historical runs keep an intact link.
 # The legacy target_role/location/work_mode/employment_type columns are kept
-# (nullable, unused) so pre-normalization databases don't break; new code ignores them.
+# (nullable, unused) so pre-normalization databases don't break.
 cur.execute("""
 CREATE TABLE IF NOT EXISTS resumes (
     id SERIAL PRIMARY KEY,
@@ -129,6 +133,7 @@ CREATE TABLE IF NOT EXISTS resumes (
     location TEXT,
     work_mode TEXT,
     employment_type TEXT,
+    is_deleted BOOLEAN DEFAULT FALSE,
     created_at TIMESTAMP DEFAULT NOW()
 )
 """)
@@ -153,4 +158,4 @@ CREATE TABLE IF NOT EXISTS evaluations (
 
 conn.commit()
 conn.close()
-print("Postgres tables ready (complete schema: 7 tables, all columns)")
+print("Postgres tables ready — complete current schema (7 tables, all columns).")
