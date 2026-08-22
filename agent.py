@@ -264,16 +264,37 @@ def run_agent(run_id=None, evaluate=False, resume_id=None,
                     needs_review = True
                     print(f"    ⚠ insufficient job requirements — flagged for review")
 
+                # Capture a clean, complete structured evidence record for this decision:
+                # provenance, the job-description evidence (requirements) that drove it,
+                # matched/missing evidence, and which resume sections contributed.
                 record_context(step_id, {
+                    # --- provenance ---
                     "job_id": job.get("id"),
                     "job_source": job.get("source"),
-                    "required_skills": requirements["required_skills"],
-                    "required_any_of": requirements["required_any_of"],
-                    "preferred_skills": requirements["preferred_skills"],
-                    "min_years_experience": requirements["min_years_experience"],
+                    "job_source_url": job.get("url") or job.get("source_url"),
+
+                    # --- job-description evidence (what the requirements came from) ---
+                    "job_requirements": {
+                        "required_skills": requirements["required_skills"],
+                        "required_any_of": requirements["required_any_of"],
+                        "preferred_skills": requirements["preferred_skills"],
+                        "min_years_experience": requirements["min_years_experience"],
+                        "responsibilities": requirements.get("responsibilities", [])
+                    },
+
+                    # --- matched vs missing evidence ---
                     "matched_skills": overlap["matched_in_resume"],
                     "missing_skills": overlap["missing_from_resume"],
-                    "candidate_years": parsed["years_experience"]
+
+                    # --- resume sections used (which parts drove the score) ---
+                    "resume_evidence": {
+                        "skills": parsed.get("skills", []),
+                        "project_technologies": sorted({
+                            t for p in parsed.get("projects", []) for t in p.get("tech", [])
+                        }),
+                        "candidate_years": parsed["years_experience"],
+                        "score_breakdown": score_result["breakdown"]
+                    }
                 })
 
                 flag = "  ** REVIEW **" if needs_review else ""
