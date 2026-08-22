@@ -48,8 +48,15 @@ REQUIRED (ANY OF EACH GROUP): {requirements['required_any_of']}
 PREFERRED SKILLS: {requirements['preferred_skills']}
 MINIMUM YEARS EXPERIENCE: {requirements['min_years_experience']}
 
-A keyword check found these required skills missing from the resume: {overlap['missing_from_resume']}
-And these present: {overlap['matched_in_resume']}
+A keyword check found these required skills mentioned in the resume: {overlap['matched_in_resume']}
+And these NOT mentioned at all: {overlap['missing_from_resume']}
+
+IMPORTANT — the keyword check only confirms whether a term APPEARS in the resume
+text. It does NOT confirm real or deep experience. A skill listed in a flat
+skills section is weaker evidence than one demonstrated through projects, job
+responsibilities, or years of use. When you decide, weigh HOW the resume actually
+uses each skill (in real projects and roles, with duration and depth) rather than
+mere presence. Treat a bare mention with appropriate caution.
 
 Based on the match between the candidate and this job, respond with ONLY valid JSON
 (no markdown fences, no extra text) in exactly this shape:
