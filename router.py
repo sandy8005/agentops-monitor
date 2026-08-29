@@ -109,3 +109,113 @@ def dispatch(action, state, run_id):
         # process_job, rank_jobs, finish_* handled in step 3
         raise NotImplementedError(f"action '{action}' wired in a later step")
     state.record_action(action)
+
+# --- requirements cache (#2, #12): a job's requirements don't depend on the
+# resume, so extract once per job description and reuse. ---
+
+def _reqs_cache_get(desc_hash):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT reqs_json FROM job_reqs_cache WHERE desc_hash = %s", (desc_hash,))
+    row = cur.fetchone()
+    conn.close()
+    return json.loads(row[0]) if row else None
+
+
+def _reqs_cache_put(desc_hash, reqs):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO job_reqs_cache (desc_hash, reqs_json)
+        VALUES (%s, %s) ON CONFLICT (desc_hash) DO NOTHING
+    """, (desc_hash, json.dumps(reqs)))
+    conn.commit()
+    conn.close()
+
+
+def _parse_decision(raw):
+    cleaned = raw.strip().replace("```json", "").replace("```", "").strip()
+    return JobDecision(**json.loads(cleaned)).decision.value
+
+
+def do_process_job(state, run_id):
+    """
+    Process ONE job: keyword overlap (free) → requirements (cached) →
+    deterministic score (free) → Gemini judge ONLY if score is in the
+    uncertain middle band (20-80). Extremes skip the judge (#5,6,7).
+    """
+    job = state.jobs[state.current_job_index]
+    step_id = create_step(run_id, job["title"], len(state.completed_actions))
+    try:
+        # 1. keyword overlap — 0 LLM calls
+        overlap = keyword_overlap_tool(
+            {"resume": state.resume_text, "job_description": job["description"]}
+        )
+
+        # 2. requirements — cached by description hash (#2)
+        dhash = _hash(job["description"])
+        requirements = _reqs_cache_get(dhash)
+        if requirements is None:
+            requirements = extract_requirements(job, run_id, step_id)
+            state.llm_calls_made += 1
+            _reqs_cache_put(dhash, requirements)
+        else:
+            print(f"    (requirements for '{job['title']}' served from cache — 0 LLM calls)")
+
+        # 3. deterministic score — 0 LLM calls, runs FIRST (#4)
+        user_input = {
+            "target_role": state.target_role, "location": state.location,
+            "work_mode": state.work_mode, "employment_type": state.employment_type
+        }
+        score_result = calculate_match_score(state.parsed_resume, requirements,
+                                             state.resume_text, job, user_input)
+        score = score_result["score"]
+
+        # 4. Gemini judge ONLY in the uncertain middle band (#5,6,7).
+        #    Extremes skip the judge — recorded honestly, not faked as agreement.
+        if 20 <= score <= 80 and not state.budget_exceeded():
+            from agent import build_prompt   # reuse the existing prompt builder
+            prompt = build_prompt(state.resume_text, state.parsed_resume, job, overlap, requirements)
+            result = logged_llm_call(prompt, run_id, step_id, operation="job_judge")
+            state.llm_calls_made += 1
+            try:
+                llm_decision = _parse_decision(result)
+            except Exception:
+                llm_decision = "Unknown"
+        else:
+            reason = "score_extreme_low" if score < 20 else "score_extreme_high"
+            llm_decision = f"skipped ({reason})"
+
+        needs_review = record_score(step_id, score, score_result["decision"],
+                                    llm_decision, breakdown=score_result["breakdown"])
+
+        record_context(step_id, {
+            "job_id": job.get("id"), "job_source": job.get("source"),
+            "matched_skills": overlap["matched_in_resume"],
+            "missing_skills": overlap["missing_from_resume"],
+            "judge_skipped": not (20 <= score <= 80),
+            "score_breakdown": score_result["breakdown"],
+        })
+
+        state.job_results.append({
+            "title": job["title"], "company": job["company"],
+            "score": score, "decision": score_result["decision"],
+            "llm_decision": llm_decision, "needs_review": needs_review
+        })
+        finish_step(step_id, "success")
+    except Exception as e:
+        fail_step(step_id, e)
+        print(f"    job '{job['title']}' failed: {e}")
+
+    state.current_job_index += 1   # advance regardless, so the loop progresses
+
+
+def do_rank_jobs(state, run_id):
+    step_id = create_step(run_id, "rank_jobs", len(state.completed_actions))
+    try:
+        state.ranked = rank_jobs(state.job_results)
+        finish_step(step_id, "success")
+    except Exception as e:
+        fail_step(step_id, e)
+        state.ranked = state.job_results
+
