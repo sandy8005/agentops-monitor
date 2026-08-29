@@ -98,16 +98,19 @@ def do_search_jobs(state, run_id):
 
 
 def dispatch(action, state, run_id):
-    """Map a planner action to its tool. Returns nothing; mutates state."""
+    """Map a planner action to its tool. Mutates state."""
     if action == "load_resume":
         load_resume(state, run_id)
     elif action == "parse_resume":
         do_parse_resume(state, run_id)
     elif action == "search_jobs":
         do_search_jobs(state, run_id)
+    elif action == "process_job":
+        do_process_job(state, run_id)
+    elif action == "rank_jobs":
+        do_rank_jobs(state, run_id)
     else:
-        # process_job, rank_jobs, finish_* handled in step 3
-        raise NotImplementedError(f"action '{action}' wired in a later step")
+        raise NotImplementedError(f"unknown action '{action}'")
     state.record_action(action)
 
 # --- requirements cache (#2, #12): a job's requirements don't depend on the
