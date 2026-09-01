@@ -114,7 +114,13 @@ def record_score(step_id, match_score, score_decision, llm_decision, breakdown=N
     trace context for a human reviewer: it shows WHERE the score came from, not
     just the total.
     """
-    needs_review = score_decision != llm_decision
+    # Disagreement only counts when there is a REAL LLM decision to compare
+    # against. A skipped judge ("skipped (...)") or an unparseable one ("Unknown")
+    # is the ABSENCE of a second opinion — not a disagreement — so it must not be
+    # flagged as score_disagreement. Other review triggers still fire independently.
+    real_llm_decisions = {"Apply", "Maybe", "Skip"}
+    has_real_judgment = llm_decision in real_llm_decisions
+    needs_review = has_real_judgment and (score_decision != llm_decision)
     breakdown_json = json.dumps(breakdown) if breakdown else None
     conn = get_connection()
     cur = conn.cursor()
