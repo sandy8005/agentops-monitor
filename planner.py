@@ -20,6 +20,8 @@ def plan_next_action(state):
         return "finish_no_matches"
     if state.current_job_index < len(state.jobs):
         return "process_job"
-    if not state.ranking_done:           # use the flag, not has("ranked") —
-        return "rank_jobs"               # an empty ranked list must still count as done
+    if not state.ranking_done:           # flag, not has("ranked") — empty list still counts as done
+        return "rank_jobs"
+    if not state.advice_done:            # generate combined advice for top viable jobs (#9,#10)
+        return "generate_advice"
     return "done"
