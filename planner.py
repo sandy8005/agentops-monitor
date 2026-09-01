@@ -1,7 +1,7 @@
 """
 Planner: given AgentState, decide the next action. Pure Python — zero LLM calls.
-Routing through a known workflow is deterministic logic, not something that
-needs the model. The LLM is spent only inside the tools that truly need it.
+This single function IS items #13–18 (Python controls routing, stopping, etc.)
+and is the natural home for every 'when do we spend a Gemini call?' rule.
 """
 
 
@@ -20,6 +20,6 @@ def plan_next_action(state):
         return "finish_no_matches"
     if state.current_job_index < len(state.jobs):
         return "process_job"
-    if not state.has("ranked"):
-        return "rank_jobs"
+    if not state.ranking_done:           # use the flag, not has("ranked") —
+        return "rank_jobs"               # an empty ranked list must still count as done
     return "done"

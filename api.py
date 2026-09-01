@@ -3,7 +3,7 @@ from fastapi.responses import HTMLResponse
 from datetime import datetime
 import psycopg2, os, tempfile
 from dotenv import load_dotenv
-from agent import run_agent
+from autonomous_agent import run_agent_autonomous
 from llm import create_run, request_cancel
 from pdf_reader import read_resume_file
 
@@ -517,8 +517,12 @@ def start_run(background_tasks: BackgroundTasks, resume_id: int = None,
     run_id = create_run("job search run (dashboard)", resume_id=resume_id,
                         target_role=target_role, location=location,
                         work_mode=work_mode, employment_type=employment_type)
-    background_tasks.add_task(run_agent, run_id, evaluate, resume_id,
-                             target_role, location, work_mode, employment_type)
+    background_tasks.add_task(
+        run_agent_autonomous,
+        resume_id=resume_id, target_role=target_role, location=location,
+        work_mode=work_mode, employment_type=employment_type,
+        evaluate=evaluate, run_id=run_id
+    )
     return {"run_id": run_id, "resume_id": resume_id, "target_role": target_role,
             "message": f"Run {run_id} started in background."}
 

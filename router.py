@@ -210,7 +210,10 @@ def do_process_job(state, run_id):
         fail_step(step_id, e)
         print(f"    job '{job['title']}' failed: {e}")
 
-    state.current_job_index += 1   # advance regardless, so the loop progresses
+    finally:
+        # ALWAYS advance to the next job, success or failure. finally runs no
+        # matter what happens above — a failing job is skipped, never retried.
+        state.current_job_index += 1
 
 
 def do_rank_jobs(state, run_id):
@@ -221,4 +224,5 @@ def do_rank_jobs(state, run_id):
     except Exception as e:
         fail_step(step_id, e)
         state.ranked = state.job_results
-
+    finally:
+        state.ranking_done = True   # ranking ran (even if empty) — don't loop on it

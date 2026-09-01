@@ -25,13 +25,14 @@ class AgentState:
         self.current_job_index = 0
         self.job_results = []
         self.ranked = None
+        self.ranking_done = False        # True once the rank step has run (even if empty)
 
         # --- caches (populated by tools, checked by planner to skip work) ---
-        self.requirements_cache = {}   # job_id -> extracted requirements
+        self.requirements_cache = {}     # job_id -> extracted requirements
 
         # --- budget (call-reduction safety, enforced in the loop) ---
         self.llm_calls_made = 0
-        self.max_llm_calls = 30        # hard per-run ceiling (#20)
+        self.max_llm_calls = 30          # hard per-run ceiling (#20)
 
         # --- control ---
         self.completed_actions = []
