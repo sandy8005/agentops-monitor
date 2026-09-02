@@ -4,6 +4,21 @@ from llm import logged_llm_call
 from schemas import ParsedResume, _strict_float
 
 
+def _raw_number(v, default=0.0):
+    """
+    Extract just the numeric value from something like 24, "24", or "24 months",
+    WITHOUT any unit conversion. Used for the months field, where the unit is
+    already known from the field name — so we convert months->years exactly once
+    at the call site, never twice.
+    """
+    if v is None:
+        return default
+    if isinstance(v, (int, float)):
+        return float(v)
+    m = re.search(r"\d+(\.\d+)?", str(v))
+    return float(m.group()) if m else default
+
+
 def _to_float_or_default(v, default=0.0):
     """
     For fields where a MISSING value has a sensible default (like a per-entry
@@ -64,7 +79,10 @@ def _normalize_experience(exp_list):
         if x.get("years") is not None:
             years = _to_float_or_default(x.get("years"))
         elif x.get("months") is not None:
-            years = round(_to_float_or_default(x.get("months")) / 12.0, 2)
+            # months field: unit is known, so take the RAW number and convert
+            # to years exactly once. Do NOT route through _strict_float, which
+            # would ALSO convert "24 months"->2.0 and cause a double /12 (->0.17).
+            years = round(_raw_number(x.get("months")) / 12.0, 2)
         elif x.get("duration") is not None:
             years = _to_float_or_default(x.get("duration"))
         else:
