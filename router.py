@@ -89,76 +89,17 @@ def do_search_jobs(state, run_id):
     """Search jobs (0 LLM calls — pure DB query)."""
     step_id = create_step(run_id, "search_jobs", len(state.completed_actions))
     try:
-        state.jobs = search_jobs(state.target_role, state.location,
-                                 state.work_mode, state.employment_type)
+        state.jobs = logged_tool_call(
+            "search_jobs",
+            lambda p: search_jobs(p["target_role"], p["location"],
+                                  p["work_mode"], p["employment_type"]),
+            {"target_role": state.target_role, "location": state.location,
+             "work_mode": state.work_mode, "employment_type": state.employment_type},
+            run_id, step_id, operation="search_jobs")
         finish_step(step_id, "success")
     except Exception as e:
         fail_step(step_id, e)
         state.error = f"search failed: {e}"
-
-
-def _combined_advice(resume_text, job, requirements, missing_skills, run_id, step_id):
-    """
-    #9 + #10: ONE Gemini call returning BOTH application strategy and resume-edit
-    advice, instead of two separate calls. Used only for top viable jobs.
-    """
-    from llm import logged_llm_call
-    prompt = f"""
-You are a career advisor. For the job below, give the candidate BOTH:
-1. APPLICATION STRATEGY - how to position themselves for this specific role.
-2. RESUME EDITS - concrete, numbered edits to better match this job.
-
-CANDIDATE RESUME:
-{resume_text[:3000]}
-
-JOB: {job['title']} at {job.get('company','')}
-REQUIRED SKILLS: {requirements.get('required_skills', [])}
-PREFERRED SKILLS: {requirements.get('preferred_skills', [])}
-SKILLS THE RESUME IS MISSING: {missing_skills}
-
-Respond in exactly this format:
-STRATEGY:
-<one paragraph>
-
-RESUME EDITS:
-1. <edit>
-2. <edit>
-3. <edit>
-"""
-    return logged_llm_call(prompt, run_id, step_id, operation="combined_advice")
-
-
-def do_generate_advice(state, run_id, top_n=2):
-    """
-    #10: after ranking, generate combined advice for the TOP N viable
-    (Apply/Maybe) jobs only - not every job. One combined call each,
-    budget-permitting. This is where advice comes back cheaply.
-    """
-    step_id = create_step(run_id, "generate_advice", len(state.completed_actions))
-    try:
-        viable = [r for r in (state.ranked or [])
-                  if r.get("decision") in ("Apply", "Maybe")][:top_n]
-        for r in viable:
-            if state.budget_exceeded():
-                print("    (advice skipped - budget reached)")
-                break
-            job = next((j for j in state.jobs if j["title"] == r["title"]), None)
-            if not job:
-                continue
-            dhash = _hash(job["description"])
-            requirements = _reqs_cache_get(dhash) or {}
-            overlap = keyword_overlap_tool(
-                {"resume": state.resume_text, "job_description": job["description"]}
-            )
-            advice = _combined_advice(state.resume_text, job, requirements,
-                                      overlap["missing_from_resume"], run_id, step_id)
-            state.llm_calls_made += 1
-            print(f"\n  ADVICE for {r['title']}:\n{advice.strip()}\n")
-        finish_step(step_id, "success")
-        state.advice_done = True
-    except Exception as e:
-        fail_step(step_id, e)
-        state.advice_done = True   # don't loop on advice failure
 
 
 def dispatch(action, state, run_id):
@@ -173,8 +114,6 @@ def dispatch(action, state, run_id):
         do_process_job(state, run_id)
     elif action == "rank_jobs":
         do_rank_jobs(state, run_id)
-    elif action == "generate_advice":
-        do_generate_advice(state, run_id)
     else:
         raise NotImplementedError(f"unknown action '{action}'")
     state.record_action(action)
@@ -217,9 +156,10 @@ def do_process_job(state, run_id):
     step_id = create_step(run_id, job["title"], len(state.completed_actions))
     try:
         # 1. keyword overlap — 0 LLM calls
-        overlap = keyword_overlap_tool(
-            {"resume": state.resume_text, "job_description": job["description"]}
-        )
+        overlap = logged_tool_call(
+            "keyword_overlap_tool", keyword_overlap_tool,
+            {"resume": state.resume_text, "job_description": job["description"]},
+            run_id, step_id, operation="keyword_overlap")
 
         # 2. requirements — cached by description hash (#2)
         dhash = _hash(job["description"])
@@ -236,8 +176,12 @@ def do_process_job(state, run_id):
             "target_role": state.target_role, "location": state.location,
             "work_mode": state.work_mode, "employment_type": state.employment_type
         }
-        score_result = calculate_match_score(state.parsed_resume, requirements,
-                                             state.resume_text, job, user_input)
+        score_result = logged_tool_call(
+            "calculate_match_score",
+            lambda p: calculate_match_score(p["parsed"], p["reqs"], p["resume"], p["job"], p["ui"]),
+            {"parsed": state.parsed_resume, "reqs": requirements,
+             "resume": state.resume_text, "job": job, "ui": user_input},
+            run_id, step_id, operation="score")
         score = score_result["score"]
 
         # 4. Gemini judge ONLY in the uncertain middle band (#5,6,7).
@@ -271,33 +215,6 @@ def do_process_job(state, run_id):
             "score": score, "decision": score_result["decision"],
             "llm_decision": llm_decision, "needs_review": needs_review
         })
-
-        # --- Evaluator (#8): run ONLY on risky (flagged) jobs where the judge
-        # actually ran (so 'result' exists) and budget allows. Most jobs skip
-        # this entirely — that is the cost saving. ---
-        if (state.evaluate and needs_review and not state.budget_exceeded()
-                and llm_decision in ("Apply", "Maybe", "Skip")):
-            try:
-                from evaluator import evaluate_decision
-                from llm import save_evaluation, flag_for_review
-                eval_result = evaluate_decision(state.resume_text, job, result, run_id, step_id)
-                save_evaluation(run_id, step_id, eval_result)
-                state.llm_calls_made += 1
-                rel = eval_result["relevance_score"]
-                faith = eval_result["faithfulness_score"]
-                comp = eval_result["completeness_score"]
-                if eval_result["hallucination_detected"] or min(rel, faith, comp) <= 2:
-                    reason = ("hallucination" if eval_result["hallucination_detected"]
-                              else "low_evaluation_scores")
-                    flag_for_review(step_id, reason=reason)
-                print(f"    eval: rel={rel} faith={faith} complete={comp} "
-                      f"halluc={eval_result['hallucination_detected']}")
-            except Exception as eval_err:
-                from llm import flag_for_review
-                flag_for_review(step_id, reason="evaluation_failed")
-                state.llm_calls_made += 1
-                print(f"    evaluation requested but failed: {eval_err}")
-
         finish_step(step_id, "success")
     except Exception as e:
         fail_step(step_id, e)
@@ -309,7 +226,9 @@ def do_process_job(state, run_id):
 def do_rank_jobs(state, run_id):
     step_id = create_step(run_id, "rank_jobs", len(state.completed_actions))
     try:
-        state.ranked = rank_jobs(state.job_results)
+        state.ranked = logged_tool_call(
+            "rank_jobs", lambda r: rank_jobs(r), state.job_results,
+            run_id, step_id, operation="rank_jobs")
         finish_step(step_id, "success")
     except Exception as e:
         fail_step(step_id, e)
