@@ -1,4 +1,5 @@
 import psycopg2, os
+import re
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -28,11 +29,20 @@ def _role_matcher(target_role):
     specializing = [w for w in words if w not in GENERIC_ROLE_WORDS]
     generic = [w for w in words if w in GENERIC_ROLE_WORDS]
 
+    def _term_present(term, haystack_lower, haystack_tokens):
+        t = term.strip().lower()
+        if not t:
+            return False
+        if " " in t:                       # multi-word: phrase match
+            return t in haystack_lower
+        return t in haystack_tokens        # single word: WHOLE-WORD (token) match,
+                                           # so 'ml' won't match inside 'html'
+
     def matches(job):
-        haystack = f"{job['title']} {job['description']}".lower()
-        if specializing:
-            return any(term in haystack for term in specializing)
-        return any(term in haystack for term in generic)
+        haystack_lower = f"{job['title']} {job['description']}".lower()
+        haystack_tokens = set(re.findall(r"[a-z0-9\+\#\.]+", haystack_lower))
+        terms = specializing if specializing else generic
+        return any(_term_present(t, haystack_lower, haystack_tokens) for t in terms)
 
     return matches
 
