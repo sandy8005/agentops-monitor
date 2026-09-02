@@ -4,9 +4,9 @@ Reuses the EXISTING, already-tested tools (parse_resume, search_jobs,
 calculate_match_score, etc.) — the autonomous rewrite changes the control
 flow, not the tools themselves.
 
-Caching lives here: before spending a Gemini call, check state for a cached
-result. This is where autonomy (planner picks the step) and call-reduction
-(router skips the call if cached) meet.
+All tool executions pass through logged_tool_call() so the autonomous path
+keeps full AgentOps observability. Caching, cooperative cancellation, and
+conditional Gemini use also live here.
 """
 import hashlib
 import json
@@ -20,7 +20,8 @@ from tools import keyword_overlap_tool
 from schemas import JobDecision
 from llm import (
     create_step, finish_step, fail_step, logged_llm_call, logged_tool_call,
-    record_score, record_context, flag_for_review, get_connection
+    record_score, record_context, flag_for_review, get_connection,
+    is_cancel_requested
 )
 
 
@@ -74,7 +75,6 @@ def do_parse_resume(state, run_id):
             finish_step(step_id, "success")
             print("    (parsed resume served from cache — 0 LLM calls)")
             return
-        # cache miss → real LLM parse
         parsed = parse_resume(state.resume_text, run_id, step_id)
         state.llm_calls_made += 1
         _parse_cache_put(rhash, parsed)
@@ -86,7 +86,7 @@ def do_parse_resume(state, run_id):
 
 
 def do_search_jobs(state, run_id):
-    """Search jobs (0 LLM calls — pure DB query)."""
+    """Search jobs (0 LLM calls). Traced via logged_tool_call for observability."""
     step_id = create_step(run_id, "search_jobs", len(state.completed_actions))
     try:
         state.jobs = logged_tool_call(
@@ -101,22 +101,6 @@ def do_search_jobs(state, run_id):
         fail_step(step_id, e)
         state.error = f"search failed: {e}"
 
-
-def dispatch(action, state, run_id):
-    """Map a planner action to its tool. Mutates state."""
-    if action == "load_resume":
-        load_resume(state, run_id)
-    elif action == "parse_resume":
-        do_parse_resume(state, run_id)
-    elif action == "search_jobs":
-        do_search_jobs(state, run_id)
-    elif action == "process_job":
-        do_process_job(state, run_id)
-    elif action == "rank_jobs":
-        do_rank_jobs(state, run_id)
-    else:
-        raise NotImplementedError(f"unknown action '{action}'")
-    state.record_action(action)
 
 # --- requirements cache (#2, #12): a job's requirements don't depend on the
 # resume, so extract once per job description and reuse. ---
@@ -148,14 +132,20 @@ def _parse_decision(raw):
 
 def do_process_job(state, run_id):
     """
-    Process ONE job: keyword overlap (free) → requirements (cached) →
-    deterministic score (free) → Gemini judge ONLY if score is in the
-    uncertain middle band (20-80). Extremes skip the judge (#5,6,7).
+    Process ONE job: cancellation check → keyword overlap (traced) →
+    requirements (cached) → deterministic score (traced) → Gemini judge ONLY
+    if score is in the uncertain middle band (20-80) → evaluator on risky jobs.
+    Always advances current_job_index (finally), so the loop can't get stuck.
     """
+    # Cooperative cancellation: if the user hit Cancel, stop before this job.
+    if is_cancel_requested(run_id):
+        state.cancelled = True
+        return
+
     job = state.jobs[state.current_job_index]
     step_id = create_step(run_id, job["title"], len(state.completed_actions))
     try:
-        # 1. keyword overlap — 0 LLM calls
+        # 1. keyword overlap — traced (0 LLM calls)
         overlap = logged_tool_call(
             "keyword_overlap_tool", keyword_overlap_tool,
             {"resume": state.resume_text, "job_description": job["description"]},
@@ -171,7 +161,7 @@ def do_process_job(state, run_id):
         else:
             print(f"    (requirements for '{job['title']}' served from cache — 0 LLM calls)")
 
-        # 3. deterministic score — 0 LLM calls, runs FIRST (#4)
+        # 3. deterministic score — traced (0 LLM calls), runs FIRST (#4)
         user_input = {
             "target_role": state.target_role, "location": state.location,
             "work_mode": state.work_mode, "employment_type": state.employment_type
@@ -186,8 +176,9 @@ def do_process_job(state, run_id):
 
         # 4. Gemini judge ONLY in the uncertain middle band (#5,6,7).
         #    Extremes skip the judge — recorded honestly, not faked as agreement.
+        result = None
         if 20 <= score <= 80 and not state.budget_exceeded():
-            from agent import build_prompt   # reuse the existing prompt builder
+            from agent import build_prompt
             prompt = build_prompt(state.resume_text, state.parsed_resume, job, overlap, requirements)
             result = logged_llm_call(prompt, run_id, step_id, operation="job_judge")
             state.llm_calls_made += 1
@@ -215,15 +206,44 @@ def do_process_job(state, run_id):
             "score": score, "decision": score_result["decision"],
             "llm_decision": llm_decision, "needs_review": needs_review
         })
+
+        # --- Evaluator (#8): ONLY on risky (flagged) jobs where the judge ran
+        # (so 'result' exists) and budget allows. Most jobs skip this. ---
+        if (state.evaluate and needs_review and result is not None
+                and not state.budget_exceeded()
+                and llm_decision in ("Apply", "Maybe", "Skip")):
+            try:
+                from evaluator import evaluate_decision
+                from llm import save_evaluation
+                eval_result = evaluate_decision(state.resume_text, job, result, run_id, step_id)
+                save_evaluation(run_id, step_id, eval_result)
+                state.llm_calls_made += 1
+                rel = eval_result["relevance_score"]
+                faith = eval_result["faithfulness_score"]
+                comp = eval_result["completeness_score"]
+                if eval_result["hallucination_detected"] or min(rel, faith, comp) <= 2:
+                    reason = ("hallucination" if eval_result["hallucination_detected"]
+                              else "low_evaluation_scores")
+                    flag_for_review(step_id, reason=reason)
+                print(f"    eval: rel={rel} faith={faith} complete={comp} "
+                      f"halluc={eval_result['hallucination_detected']}")
+            except Exception as eval_err:
+                flag_for_review(step_id, reason="evaluation_failed")
+                state.llm_calls_made += 1
+                print(f"    evaluation requested but failed: {eval_err}")
+
         finish_step(step_id, "success")
     except Exception as e:
         fail_step(step_id, e)
         print(f"    job '{job['title']}' failed: {e}")
-
-    state.current_job_index += 1   # advance regardless, so the loop progresses
+    finally:
+        # ALWAYS advance to the next job, success or failure. finally runs no
+        # matter what — a failing job is skipped, never retried forever.
+        state.current_job_index += 1
 
 
 def do_rank_jobs(state, run_id):
+    """Rank scored jobs (traced). Sets ranking_done so the loop terminates."""
     step_id = create_step(run_id, "rank_jobs", len(state.completed_actions))
     try:
         state.ranked = logged_tool_call(
@@ -233,3 +253,87 @@ def do_rank_jobs(state, run_id):
     except Exception as e:
         fail_step(step_id, e)
         state.ranked = state.job_results
+    finally:
+        state.ranking_done = True   # ranking ran (even if empty) — don't loop on it
+
+
+def _combined_advice(resume_text, job, requirements, missing_skills, run_id, step_id):
+    """
+    #9 + #10: ONE Gemini call returning BOTH application strategy and resume-edit
+    advice, instead of two separate calls. Used only for top viable jobs.
+    """
+    prompt = f"""
+You are a career advisor. For the job below, give the candidate BOTH:
+1. APPLICATION STRATEGY - how to position themselves for this specific role.
+2. RESUME EDITS - concrete, numbered edits to better match this job.
+
+CANDIDATE RESUME:
+{resume_text[:3000]}
+
+JOB: {job['title']} at {job.get('company','')}
+REQUIRED SKILLS: {requirements.get('required_skills', [])}
+PREFERRED SKILLS: {requirements.get('preferred_skills', [])}
+SKILLS THE RESUME IS MISSING: {missing_skills}
+
+Respond in exactly this format:
+STRATEGY:
+<one paragraph>
+
+RESUME EDITS:
+1. <edit>
+2. <edit>
+3. <edit>
+"""
+    return logged_llm_call(prompt, run_id, step_id, operation="combined_advice")
+
+
+def do_generate_advice(state, run_id, top_n=2):
+    """
+    #10: after ranking, generate combined advice for the TOP N viable
+    (Apply/Maybe) jobs only - not every job. One combined call each,
+    budget-permitting. This is where advice comes back cheaply.
+    """
+    step_id = create_step(run_id, "generate_advice", len(state.completed_actions))
+    try:
+        viable = [r for r in (state.ranked or [])
+                  if r.get("decision") in ("Apply", "Maybe")][:top_n]
+        for r in viable:
+            if state.budget_exceeded():
+                print("    (advice skipped - budget reached)")
+                break
+            job = next((j for j in state.jobs if j["title"] == r["title"]), None)
+            if not job:
+                continue
+            dhash = _hash(job["description"])
+            requirements = _reqs_cache_get(dhash) or {}
+            overlap = keyword_overlap_tool(
+                {"resume": state.resume_text, "job_description": job["description"]}
+            )
+            advice = _combined_advice(state.resume_text, job, requirements,
+                                      overlap["missing_from_resume"], run_id, step_id)
+            state.llm_calls_made += 1
+            print(f"\n  ADVICE for {r['title']}:\n{advice.strip()}\n")
+        finish_step(step_id, "success")
+        state.advice_done = True
+    except Exception as e:
+        fail_step(step_id, e)
+        state.advice_done = True   # don't loop on advice failure
+
+
+def dispatch(action, state, run_id):
+    """Map a planner action to its tool. Mutates state."""
+    if action == "load_resume":
+        load_resume(state, run_id)
+    elif action == "parse_resume":
+        do_parse_resume(state, run_id)
+    elif action == "search_jobs":
+        do_search_jobs(state, run_id)
+    elif action == "process_job":
+        do_process_job(state, run_id)
+    elif action == "rank_jobs":
+        do_rank_jobs(state, run_id)
+    elif action == "generate_advice":
+        do_generate_advice(state, run_id)
+    else:
+        raise NotImplementedError(f"unknown action '{action}'")
+    state.record_action(action)

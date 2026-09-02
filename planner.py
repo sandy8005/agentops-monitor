@@ -8,6 +8,8 @@ and is the natural home for every 'when do we spend a Gemini call?' rule.
 def plan_next_action(state):
     if state.error:
         return "fail"
+    if state.cancelled:
+        return "finish_cancelled"
     if state.budget_exceeded():          # #20 — stop if we've hit the call ceiling
         return "finish_budget"
     if not state.has("resume_text"):

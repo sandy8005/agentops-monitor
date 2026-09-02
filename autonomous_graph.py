@@ -85,6 +85,8 @@ def route_after_search(gs: GraphState) -> str:
 def route_after_process_job(gs: GraphState) -> str:
     """The per-job LOOP: keep processing until all jobs done, then rank."""
     s = gs["state"]
+    if s.cancelled:
+        return "cancelled"
     if s.budget_exceeded():
         return "rank_jobs"               # stop judging, still rank what we have
     if s.current_job_index < len(s.jobs):
@@ -114,7 +116,7 @@ def build_graph():
     g.add_conditional_edges("search_jobs", route_after_search,
                             {"process_job": "process_job", "no_matches": END, "fail": END})
     g.add_conditional_edges("process_job", route_after_process_job,
-                            {"process_job": "process_job", "rank_jobs": "rank_jobs"})
+                            {"process_job": "process_job", "rank_jobs": "rank_jobs","cancelled": END})
     g.add_conditional_edges("rank_jobs", route_after_rank,
                             {"generate_advice": "generate_advice"})
     g.add_edge("generate_advice", END)
@@ -151,7 +153,9 @@ def run_agent_graph(resume_id, target_role=None, location=None,
         # spirit, at the graph level). Generous but bounded.
         GRAPH.invoke({"state": state, "run_id": run_id},
                      config={"recursion_limit": 100})
-        if state.error:
+        if state.cancelled:
+            final_status = "cancelled"
+        elif state.error:
             final_status = "failed"
     except Exception as e:
         final_status = "failed"

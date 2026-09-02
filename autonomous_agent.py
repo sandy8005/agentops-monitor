@@ -9,7 +9,7 @@ from planner import plan_next_action
 from router import dispatch
 from llm import create_run, finish_run
 
-TERMINAL = {"done", "fail", "finish_no_matches", "finish_budget"}
+TERMINAL = {"done", "fail", "finish_no_matches", "finish_budget","finish_cancelled"}
 
 
 def run_agent_autonomous(resume_id, target_role=None, location=None,
@@ -52,6 +52,8 @@ def run_agent_autonomous(resume_id, target_role=None, location=None,
                     final_status = "failed"
                 elif action == "finish_no_matches":
                     final_status = "no_matches"
+                elif action == "finish_cancelled":
+                    final_status = "cancelled"
                 elif action == "finish_budget":
                     final_status = "completed_with_errors"
                     print(f"    ⚠ LLM call budget ({state.max_llm_calls}) reached — stopping early")
