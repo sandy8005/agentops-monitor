@@ -28,6 +28,7 @@ class AgentState:
         self.ranking_done = False        # True once the rank step has run (even if empty)
         self.advice_done = False         # True once advice generation has run
         self.cancelled = False 
+        self.failed_jobs = 0             # count of jobs that errored during processing
 
         # --- caches (populated by tools, checked by planner to skip work) ---
         self.requirements_cache = {}     # job_id -> extracted requirements

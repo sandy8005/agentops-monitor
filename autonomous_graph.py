@@ -157,6 +157,8 @@ def run_agent_graph(resume_id, target_role=None, location=None,
             final_status = "cancelled"
         elif state.error:
             final_status = "failed"
+        elif state.failed_jobs > 0:
+            final_status = "completed_with_errors"
     except Exception as e:
         final_status = "failed"
         print(f"graph run failed: {e}")

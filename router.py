@@ -234,6 +234,7 @@ def do_process_job(state, run_id):
 
         finish_step(step_id, "success")
     except Exception as e:
+        state.failed_jobs += 1
         fail_step(step_id, e)
         print(f"    job '{job['title']}' failed: {e}")
     finally:

@@ -57,6 +57,9 @@ def run_agent_autonomous(resume_id, target_role=None, location=None,
                 elif action == "finish_budget":
                     final_status = "completed_with_errors"
                     print(f"    ⚠ LLM call budget ({state.max_llm_calls}) reached — stopping early")
+                else:  # "done"
+                    final_status = ("completed_with_errors"
+                                    if state.failed_jobs > 0 else "success")
                 # 'done' → success
                 state.done = True
                 break
