@@ -18,6 +18,7 @@ from scorer import calculate_match_score
 from ranker import rank_jobs
 from tools import keyword_overlap_tool
 from schemas import JobDecision
+from cache_version import parse_cache_version, reqs_cache_version
 from llm import (
     create_step, finish_step, fail_step, logged_llm_call, logged_tool_call,
     record_score, record_context, flag_for_review, get_connection,
@@ -28,6 +29,17 @@ from llm import (
 def _hash(text):
     """Stable hash for cache keys (#12) — detects when resume/job text changed."""
     return hashlib.sha256((text or "").encode("utf-8")).hexdigest()[:16]
+
+
+def _resume_cache_key(resume_text):
+    """Versioned parse-cache key: text + parser/schema/model version, so a prompt,
+    schema, or model change makes old cached parses unreachable (never served stale)."""
+    return _hash(f"{resume_text}|{parse_cache_version()}")
+
+
+def _reqs_cache_key(description):
+    """Versioned requirements-cache key: description + reqs/schema/model version."""
+    return _hash(f"{description}|{reqs_cache_version()}")
 
 
 def load_resume(state, run_id):
@@ -57,9 +69,9 @@ def _parse_cache_put(resume_hash, parsed):
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
-        INSERT INTO parsed_resume_cache (resume_hash, parsed_json)
-        VALUES (%s, %s) ON CONFLICT (resume_hash) DO NOTHING
-    """, (resume_hash, json.dumps(parsed)))
+        INSERT INTO parsed_resume_cache (resume_hash, parsed_json, cache_version)
+        VALUES (%s, %s, %s) ON CONFLICT (resume_hash) DO NOTHING
+    """, (resume_hash, json.dumps(parsed), parse_cache_version()))
     conn.commit()
     conn.close()
 
@@ -68,7 +80,7 @@ def do_parse_resume(state, run_id):
     """Parse the resume — but reuse the cache if we've parsed this exact text (#1)."""
     step_id = create_step(run_id, "parse_resume", len(state.completed_actions))
     try:
-        rhash = _hash(state.resume_text)
+        rhash = _resume_cache_key(state.resume_text)
         cached = _parse_cache_get(rhash)
         if cached is not None:
             state.parsed_resume = cached
@@ -118,9 +130,9 @@ def _reqs_cache_put(desc_hash, reqs):
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
-        INSERT INTO job_reqs_cache (desc_hash, reqs_json)
-        VALUES (%s, %s) ON CONFLICT (desc_hash) DO NOTHING
-    """, (desc_hash, json.dumps(reqs)))
+        INSERT INTO job_reqs_cache (desc_hash, reqs_json, cache_version)
+        VALUES (%s, %s, %s) ON CONFLICT (desc_hash) DO NOTHING
+    """, (desc_hash, json.dumps(reqs), reqs_cache_version()))
     conn.commit()
     conn.close()
 
@@ -152,7 +164,7 @@ def do_process_job(state, run_id):
             run_id, step_id, operation="keyword_overlap")
 
         # 2. requirements — cached by description hash (#2)
-        dhash = _hash(job["description"])
+        dhash = _reqs_cache_key(job["description"])
         requirements = _reqs_cache_get(dhash)
         if requirements is None:
             requirements = extract_requirements(job, run_id, step_id)
@@ -310,7 +322,7 @@ def do_generate_advice(state, run_id, top_n=2):
             job = next((j for j in state.jobs if j["title"] == r["title"]), None)
             if not job:
                 continue
-            dhash = _hash(job["description"])
+            dhash = _reqs_cache_key(job["description"])
             requirements = _reqs_cache_get(dhash) or {}
             overlap = keyword_overlap_tool(
                 {"resume": state.resume_text, "job_description": job["description"]}

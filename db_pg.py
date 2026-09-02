@@ -159,6 +159,7 @@ cur.execute("""
 CREATE TABLE IF NOT EXISTS parsed_resume_cache (
     resume_hash TEXT PRIMARY KEY,
     parsed_json TEXT NOT NULL,
+    cache_version TEXT,
     created_at TIMESTAMP DEFAULT NOW()
 )
 """)
@@ -168,6 +169,7 @@ cur.execute("""
 CREATE TABLE IF NOT EXISTS job_reqs_cache (
     desc_hash TEXT PRIMARY KEY,
     reqs_json TEXT NOT NULL,
+    cache_version TEXT,
     created_at TIMESTAMP DEFAULT NOW()
 )
 """)
