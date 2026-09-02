@@ -16,7 +16,6 @@ from job_source import search_jobs
 from job_parser import extract_requirements
 from scorer import calculate_match_score
 from ranker import rank_jobs
-from tools import keyword_overlap_tool
 from schemas import JobDecision
 from cache_version import parse_cache_version, reqs_cache_version
 from llm import (
@@ -144,7 +143,7 @@ def _parse_decision(raw):
 
 def do_process_job(state, run_id):
     """
-    Process ONE job: cancellation check → keyword overlap (traced) →
+    Process ONE job: cancellation check → requirements (structured) →
     requirements (cached) → deterministic score (traced) → Gemini judge ONLY
     if score is in the uncertain middle band (20-80) → evaluator on risky jobs.
     Always advances current_job_index (finally), so the loop can't get stuck.
@@ -157,13 +156,9 @@ def do_process_job(state, run_id):
     job = state.jobs[state.current_job_index]
     step_id = create_step(run_id, job["title"], len(state.completed_actions))
     try:
-        # 1. keyword overlap — traced (0 LLM calls)
-        overlap = logged_tool_call(
-            "keyword_overlap_tool", keyword_overlap_tool,
-            {"resume": state.resume_text, "job_description": job["description"]},
-            run_id, step_id, operation="keyword_overlap")
-
-        # 2. requirements — cached by description hash (#2)
+        # 1. requirements FIRST — structured, optional-aware extraction. This is
+        #    what makes "Docker is optional" land in preferred, not required.
+        #    (cached by description hash #2)
         dhash = _reqs_cache_key(job["description"])
         requirements = _reqs_cache_get(dhash)
         if requirements is None:
@@ -189,7 +184,6 @@ def do_process_job(state, run_id):
         # 4. Gemini judge ONLY in the uncertain middle band (#5,6,7).
         #    Extremes skip the judge — recorded honestly, not faked as agreement.
         result = None
-        result = None
         if not (20 <= score <= 80):
             # Extreme score — judge adds little; skip it (honest, not faked).
             reason = "score_extreme_low" if score < 20 else "score_extreme_high"
@@ -200,7 +194,9 @@ def do_process_job(state, run_id):
             llm_decision = "skipped (budget)"
         else:
             from agent import build_prompt
-            prompt = build_prompt(state.resume_text, state.parsed_resume, job, overlap, requirements)
+            evidence = {"matched_in_resume": score_result["matched_skills"],
+                        "missing_from_resume": score_result["missing_skills"]}
+            prompt = build_prompt(state.resume_text, state.parsed_resume, job, evidence, requirements)
             result = logged_llm_call(prompt, run_id, step_id, operation="job_judge", budget=state)
             try:
                 llm_decision = _parse_decision(result)
@@ -212,8 +208,8 @@ def do_process_job(state, run_id):
 
         record_context(step_id, {
             "job_id": job.get("id"), "job_source": job.get("source"),
-            "matched_skills": overlap["matched_in_resume"],
-            "missing_skills": overlap["missing_from_resume"],
+            "matched_skills": score_result["matched_skills"],
+            "missing_skills": score_result["missing_skills"],
             "judge_skipped": not (20 <= score <= 80),
             "score_breakdown": score_result["breakdown"],
         })
@@ -323,12 +319,16 @@ def do_generate_advice(state, run_id, top_n=2):
             if not job:
                 continue
             dhash = _reqs_cache_key(job["description"])
-            requirements = _reqs_cache_get(dhash) or {}
-            overlap = keyword_overlap_tool(
-                {"resume": state.resume_text, "job_description": job["description"]}
-            )
+            requirements = _reqs_cache_get(dhash) or {
+                "required_skills": [], "required_any_of": [], "preferred_skills": [],
+                "min_years_experience": 0, "responsibilities": []
+            }
+            # Missing skills come from the scorer's accurate, whole-word,
+            # required-only evidence — not a raw-text keyword scan.
+            sc = calculate_match_score(state.parsed_resume, requirements,
+                                       state.resume_text, job, None)
             advice = _combined_advice(state.resume_text, job, requirements,
-                                      overlap["missing_from_resume"], run_id, step_id,
+                                      sc["missing_skills"], run_id, step_id,
                                       budget=state)
             print(f"\n  ADVICE for {r['title']}:\n{advice.strip()}\n")
         finish_step(step_id, "success")
