@@ -180,8 +180,7 @@ def do_process_job(state, run_id):
         if 20 <= score <= 80 and not state.budget_exceeded():
             from agent import build_prompt
             prompt = build_prompt(state.resume_text, state.parsed_resume, job, overlap, requirements)
-            result = logged_llm_call(prompt, run_id, step_id, operation="job_judge")
-            state.llm_calls_made += 1
+            result = logged_llm_call(prompt, run_id, step_id, operation="job_judge", budget=state)
             try:
                 llm_decision = _parse_decision(result)
             except Exception:
@@ -234,7 +233,7 @@ def do_process_job(state, run_id):
 
         finish_step(step_id, "success")
     except Exception as e:
-        state.failed_jobs += 1
+        state.failed_jobs += 1   # count it so the run can report completed_with_errors
         fail_step(step_id, e)
         print(f"    job '{job['title']}' failed: {e}")
     finally:
@@ -258,7 +257,7 @@ def do_rank_jobs(state, run_id):
         state.ranking_done = True   # ranking ran (even if empty) — don't loop on it
 
 
-def _combined_advice(resume_text, job, requirements, missing_skills, run_id, step_id):
+def _combined_advice(resume_text, job, requirements, missing_skills, run_id, step_id, budget=None):
     """
     #9 + #10: ONE Gemini call returning BOTH application strategy and resume-edit
     advice, instead of two separate calls. Used only for top viable jobs.
@@ -285,7 +284,7 @@ RESUME EDITS:
 2. <edit>
 3. <edit>
 """
-    return logged_llm_call(prompt, run_id, step_id, operation="combined_advice")
+    return logged_llm_call(prompt, run_id, step_id, operation="combined_advice", budget=budget)
 
 
 def do_generate_advice(state, run_id, top_n=2):
@@ -311,8 +310,8 @@ def do_generate_advice(state, run_id, top_n=2):
                 {"resume": state.resume_text, "job_description": job["description"]}
             )
             advice = _combined_advice(state.resume_text, job, requirements,
-                                      overlap["missing_from_resume"], run_id, step_id)
-            state.llm_calls_made += 1
+                                      overlap["missing_from_resume"], run_id, step_id,
+                                      budget=state)
             print(f"\n  ADVICE for {r['title']}:\n{advice.strip()}\n")
         finish_step(step_id, "success")
         state.advice_done = True

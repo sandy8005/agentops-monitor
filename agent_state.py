@@ -2,7 +2,8 @@
 AgentState: the single object threaded through the autonomous loop.
 The planner reads it to decide the next action; tools update it.
 Cache fields live here so the planner can skip a tool when its result
-already exists — this is where autonomy and call-reduction meet.
+already exists. Budget methods (can_spend/spend) let logged_llm_call enforce
+the per-run LLM request cap at the true unit of quota consumption.
 """
 
 
@@ -27,15 +28,15 @@ class AgentState:
         self.ranked = None
         self.ranking_done = False        # True once the rank step has run (even if empty)
         self.advice_done = False         # True once advice generation has run
-        self.cancelled = False 
+        self.cancelled = False           # set True when a cancel request is detected
         self.failed_jobs = 0             # count of jobs that errored during processing
 
-        # --- caches (populated by tools, checked by planner to skip work) ---
-        self.requirements_cache = {}     # job_id -> extracted requirements
+        # --- caches ---
+        self.requirements_cache = {}
 
-        # --- budget (call-reduction safety, enforced in the loop) ---
+        # --- budget (enforced INSIDE logged_llm_call, per actual HTTP attempt) ---
         self.llm_calls_made = 0
-        self.max_llm_calls = 30          # hard per-run ceiling (#20)
+        self.max_llm_calls = 30
 
         # --- control ---
         self.completed_actions = []
@@ -49,5 +50,14 @@ class AgentState:
         val = getattr(self, attr, None)
         return val is not None and val != []
 
+    # --- budget protocol: logged_llm_call calls these per real request ---
+    def can_spend(self):
+        """True if another actual LLM request is within budget."""
+        return self.llm_calls_made < self.max_llm_calls
+
+    def spend(self):
+        """Record one actual LLM HTTP request (called per attempt, incl. retries)."""
+        self.llm_calls_made += 1
+
     def budget_exceeded(self):
-        return self.llm_calls_made >= self.max_llm_calls
+        return not self.can_spend()

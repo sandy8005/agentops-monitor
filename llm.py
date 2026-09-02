@@ -15,6 +15,12 @@ INPUT_TOKEN_RATE = 0.075 / 1_000_000
 OUTPUT_TOKEN_RATE = 0.30 / 1_000_000
 
 
+class BudgetExceeded(Exception):
+    """Raised when an LLM call is refused because the run's request budget is spent.
+    Not a transient error — it must NOT be retried."""
+    pass
+
+
 def get_connection():
     return psycopg2.connect(
         dbname=os.getenv("DB_NAME"),
@@ -239,9 +245,16 @@ def _log_llm_attempt(run_id, step_id, operation, prompt, response_text,
     conn.close()
 
 
-def logged_llm_call(prompt, run_id, step_id, operation="llm_call", max_retries=3):
+def logged_llm_call(prompt, run_id, step_id, operation="llm_call", max_retries=3, budget=None):
     last_error = None
     for attempt in range(1, max_retries + 1):
+        # Budget is enforced HERE, at the true unit of quota consumption (one HTTP
+        # attempt). Retries count. Every caller passing a budget is covered.
+        if budget is not None:
+            if not budget.can_spend():
+                raise BudgetExceeded(
+                    f"LLM budget reached before attempt {attempt} of {operation}")
+            budget.spend()
         start = time.time()
         try:
             result = real_llm_once(prompt)
@@ -256,6 +269,8 @@ def logged_llm_call(prompt, run_id, step_id, operation="llm_call", max_retries=3
                 "success", None, attempt, attempt - 1, result.get("provider_request_id")
             )
             return result["text"]
+        except BudgetExceeded:
+            raise   # budget stop is not transient — propagate immediately, no retry
         except Exception as e:
             latency_ms = int((time.time() - start) * 1000)
             last_error = e
