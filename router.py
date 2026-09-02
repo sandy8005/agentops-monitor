@@ -177,7 +177,16 @@ def do_process_job(state, run_id):
         # 4. Gemini judge ONLY in the uncertain middle band (#5,6,7).
         #    Extremes skip the judge — recorded honestly, not faked as agreement.
         result = None
-        if 20 <= score <= 80 and not state.budget_exceeded():
+        result = None
+        if not (20 <= score <= 80):
+            # Extreme score — judge adds little; skip it (honest, not faked).
+            reason = "score_extreme_low" if score < 20 else "score_extreme_high"
+            llm_decision = f"skipped ({reason})"
+        elif state.budget_exceeded():
+            # Middle-band, but quota is spent. Keep the deterministic score and
+            # skip the judge cleanly — the job still SUCCEEDS, just no LLM opinion.
+            llm_decision = "skipped (budget)"
+        else:
             from agent import build_prompt
             prompt = build_prompt(state.resume_text, state.parsed_resume, job, overlap, requirements)
             result = logged_llm_call(prompt, run_id, step_id, operation="job_judge", budget=state)
@@ -185,9 +194,6 @@ def do_process_job(state, run_id):
                 llm_decision = _parse_decision(result)
             except Exception:
                 llm_decision = "Unknown"
-        else:
-            reason = "score_extreme_low" if score < 20 else "score_extreme_high"
-            llm_decision = f"skipped ({reason})"
 
         needs_review = record_score(step_id, score, score_result["decision"],
                                     llm_decision, breakdown=score_result["breakdown"])

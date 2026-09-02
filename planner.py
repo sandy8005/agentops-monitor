@@ -1,7 +1,8 @@
 """
 Planner: given AgentState, decide the next action. Pure Python — zero LLM calls.
-This single function IS items #13–18 (Python controls routing, stopping, etc.)
-and is the natural home for every 'when do we spend a Gemini call?' rule.
+Routes on WHAT WORK REMAINS, not on budget. Budget is enforced at the actual
+Gemini call (logged_llm_call), so free work — cache hits, scoring, ranking,
+no-matches — always runs even when quota is exhausted.
 """
 
 
@@ -10,8 +11,6 @@ def plan_next_action(state):
         return "fail"
     if state.cancelled:
         return "finish_cancelled"
-    if state.budget_exceeded():          # #20 — stop if we've hit the call ceiling
-        return "finish_budget"
     if not state.has("resume_text"):
         return "load_resume"
     if not state.has("parsed_resume"):
@@ -22,8 +21,8 @@ def plan_next_action(state):
         return "finish_no_matches"
     if state.current_job_index < len(state.jobs):
         return "process_job"
-    if not state.ranking_done:           # flag, not has("ranked") — empty list still counts as done
+    if not state.ranking_done:
         return "rank_jobs"
-    if not state.advice_done:            # generate combined advice for top viable jobs (#9,#10)
+    if not state.advice_done:
         return "generate_advice"
     return "done"
