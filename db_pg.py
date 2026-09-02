@@ -13,9 +13,7 @@ conn = psycopg2.connect(
 )
 cur = conn.cursor()
 
-# runs: one row per agent run. Search config (target_role/location/work_mode/
-# employment_type) lives HERE, not on the resume, so one resume can be searched
-# many ways. evaluation_status records whether LLM-as-judge ran for the run.
+# runs: one row per agent run. Search config lives HERE (not on the resume).
 cur.execute("""
 CREATE TABLE IF NOT EXISTS runs (
     id SERIAL PRIMARY KEY,
@@ -35,7 +33,7 @@ CREATE TABLE IF NOT EXISTS runs (
 )
 """)
 
-# steps: one row per conceptual stage (load, parse, search, per-job, rank).
+# steps: one row per conceptual stage of a run.
 cur.execute("""
 CREATE TABLE IF NOT EXISTS steps (
     id SERIAL PRIMARY KEY,
@@ -121,9 +119,6 @@ CREATE TABLE IF NOT EXISTS job_postings (
 """)
 
 # resumes: the stored resume DOCUMENT. Search config lives on runs, not here.
-# is_deleted supports soft deletion so historical runs keep an intact link.
-# The legacy target_role/location/work_mode/employment_type columns are kept
-# (nullable, unused) so pre-normalization databases don't break.
 cur.execute("""
 CREATE TABLE IF NOT EXISTS resumes (
     id SERIAL PRIMARY KEY,
@@ -156,6 +151,27 @@ CREATE TABLE IF NOT EXISTS evaluations (
 )
 """)
 
+# --- Autonomous-agent caches (call reduction). A fresh install needs these so
+# the autonomous agent works immediately without running migrations. ---
+
+# parsed_resume_cache: reuse a parsed resume by content hash (skips the parse LLM call).
+cur.execute("""
+CREATE TABLE IF NOT EXISTS parsed_resume_cache (
+    resume_hash TEXT PRIMARY KEY,
+    parsed_json TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT NOW()
+)
+""")
+
+# job_reqs_cache: reuse extracted job requirements by description hash (skips the extract LLM call).
+cur.execute("""
+CREATE TABLE IF NOT EXISTS job_reqs_cache (
+    desc_hash TEXT PRIMARY KEY,
+    reqs_json TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT NOW()
+)
+""")
+
 conn.commit()
 conn.close()
-print("Postgres tables ready — complete current schema (7 tables, all columns).")
+print("Postgres tables ready — complete schema: 9 tables (7 core + 2 autonomous caches), all columns.")
