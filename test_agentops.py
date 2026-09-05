@@ -142,7 +142,7 @@ def db_available():
         pytest.skip("database not available for search filter tests")
 
 def test_zero_match_returns_empty(db_available):
-    assert search_jobs(target_role="quantum blockchain astrologer") == []
+    assert search_jobs(target_role="xyzzy plugh frobnicate") == []   # truly nonsense tokens
 
 def test_engineer_search_returns_matches(db_available):
     assert len(search_jobs(target_role="engineer")) >= 0
