@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <title>AgentOps Monitor</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+  <header>
+    <h1>AgentOps Monitor</h1>
+    <div class="sub">AI job-search agent observability</div>
+  </header>
+  <div class="container">
+
+    <div class="section-title">Upload a Resume <span class="note">— the document only; you set search options when you run it</span></div>
+    <div class="upload-form">
+      <label>Resume PDF</label>
+      <input type="file" id="resumeFile" accept="application/pdf">
+      <label>Resume label (optional)</label>
+      <input type="text" id="resumeName" placeholder="e.g. Backend-focused resume">
+      <div style="margin-top:14px;">
+        <button id="uploadBtn" onclick="uploadResume()">&#9654; Upload Resume</button>
+      </div>
+      <div id="uploadMsg" class="err"></div>
+    </div>
+
+    <div class="section-title">Saved Resumes <span class="note">— pick one, set this search's options, and run. One resume, many searches. Location is informational only; it doesn't filter or score.</span></div>
+    <div id="resumeLibrary"></div>
+
+    <div class="section-title">Pending Human Review</div>
+    <div id="pending"></div>
+
+    <div class="section-title">Runs <span class="note">— cost is an estimate from published token rates, not the actual provider bill</span></div>
+    <table id="runs">
+      <thead><tr><th>Run</th><th>Status</th><th>Search</th><th>Started</th><th>Tokens</th><th>Est. Cost</th></tr></thead>
+      <tbody></tbody>
+    </table>
+    <div class="detail" id="detail"></div>
+  </div>
+
+  <script src="/static/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,49 @@
+body { font-family: system-ui, sans-serif; margin: 0; background: #0f1117; color: #e4e6eb; }
+    header { background: #1a1d27; padding: 20px 32px; border-bottom: 1px solid #2a2e3a; }
+    h1 { margin: 0; font-size: 20px; }
+    .sub { color: #8b8f9c; font-size: 13px; margin-top: 4px; }
+    .container { padding: 24px 32px; }
+    button { background: #2563eb; color: white; border: none; padding: 10px 18px; border-radius: 6px; font-size: 14px; cursor: pointer; margin-bottom: 20px; }
+    button:disabled { background: #374151; cursor: default; }
+    .btn-sm { padding: 4px 12px; font-size: 12px; margin: 0 4px 0 0; }
+    .btn-approve { background: #15803d; }
+    .btn-reject { background: #b91c1c; }
+    table { width: 100%; border-collapse: collapse; }
+    th { text-align: left; padding: 10px 12px; color: #8b8f9c; font-size: 12px; text-transform: uppercase; border-bottom: 1px solid #2a2e3a; }
+    td { padding: 10px 12px; border-bottom: 1px solid #1e2129; font-size: 14px; }
+    tr:hover td { background: #171a22; cursor: pointer; }
+    .status { padding: 3px 8px; border-radius: 4px; font-size: 12px; }
+    .success { background: #14361f; color: #4ade80; }
+    .errors { background: #3a2814; color: #fbbf24; }
+    .failed { background: #3a1518; color: #f87171; }
+    .running { background: #1e2a4a; color: #60a5fa; }
+    .cancelled { background: #2a2e3a; color: #b0b4c0; }
+    .no_matches { background: #2a2e3a; color: #b0b4c0; }
+    .detail { margin-top: 24px; }
+    .step { background: #171a22; border: 1px solid #2a2e3a; border-radius: 6px; padding: 12px 16px; margin-bottom: 8px; }
+    .review { border-color: #fbbf24; }
+    .flag { color: #fbbf24; font-size: 12px; font-weight: 600; }
+    .agree { color: #4ade80; }
+    .reviewed { color: #60a5fa; font-size: 12px; font-weight: 600; }
+    .reason { color: #fbbf24; font-size: 12px; }
+    .call { color: #8b8f9c; font-size: 12px; margin-left: 16px; margin-top: 4px; }
+    .call-failed { color: #f87171; }
+    .op { color: #a78bfa; font-weight: 600; }
+    .bd { color: #9ca3af; font-size: 12px; margin-left: 16px; margin-top: 4px; font-family: ui-monospace, monospace; }
+    .io { background: #0d0f15; border: 1px solid #2a2e3a; border-radius: 4px; padding: 8px; font-size: 11px; white-space: pre-wrap; word-break: break-word; max-height: 300px; overflow-y: auto; color: #b0b4c0; margin-top: 4px; }
+    details summary { color: #60a5fa; font-size: 11px; cursor: pointer; margin-top: 4px; }
+    h2 { font-size: 16px; margin: 8px 0 16px; }
+    .section-title { font-size: 14px; color: #8b8f9c; text-transform: uppercase; margin: 24px 0 8px; }
+    .upload-form { background: #171a22; border: 1px solid #2a2e3a; border-radius: 8px; padding: 16px 20px; margin-bottom: 20px; max-width: 640px; }
+    .upload-form label { display: block; font-size: 12px; color: #8b8f9c; margin: 8px 0 4px; }
+    .upload-form input, .upload-form select { width: 100%; box-sizing: border-box; background: #0d0f15; border: 1px solid #2a2e3a; border-radius: 4px; padding: 8px; color: #e4e6eb; font-size: 13px; }
+    .search-form { margin-top: 10px; padding: 10px; background: #0d0f15; border: 1px solid #2a2e3a; border-radius: 6px; }
+    .search-form input, .search-form select { background: #171a22; border: 1px solid #2a2e3a; border-radius: 4px; padding: 6px; color: #e4e6eb; font-size: 12px; margin: 2px 4px 2px 0; }
+    .search-form label { font-size: 11px; color: #8b8f9c; }
+    .row { display: flex; gap: 12px; }
+    .row > div { flex: 1; }
+    .err { color: #f87171; font-size: 12px; margin-top: 8px; }
+    .progress { border-color: #60a5fa !important; }
+    .rev-input { background: #0d0f15; border: 1px solid #2a2e3a; border-radius: 4px; padding: 5px; color: #e4e6eb; font-size: 12px; margin-right: 6px; }
+    .note { text-transform: none; color: #8b8f9c; font-weight: normal; font-size: 12px; }
+    .retry { color: #fbbf24; font-size: 11px; }
