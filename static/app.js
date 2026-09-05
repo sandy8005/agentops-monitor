@@ -280,6 +280,53 @@ var NL = String.fromCharCode(10);
       }
     }
 
+
+    // ---- LangGraph human-review flow ----
+    async function renderGraphReviews() {
+      const box = document.getElementById('graphReviews');
+      if (!box) return;
+      try {
+        const res = await fetch('/runs');
+        const runs = await res.json();
+        const waiting = runs.filter(function(r){ return r.status === 'waiting_for_human'; });
+        if (!waiting.length) { box.innerHTML = ''; return; }
+        let html = '<div class="section-title">Runs Awaiting Your Review</div>';
+        for (const r of waiting) {
+          const detail = await (await fetch('/runs/' + r.id)).json();
+          const pr = detail.pending_review || {};
+          html += '<div class="step review">' +
+            '<strong>Run #' + escapeHtml(r.id) + '</strong> &mdash; ' +
+            escapeHtml(pr.job_title || '(job)') +
+            ' | score ' + escapeHtml(pr.score) + ' (' + escapeHtml(pr.score_decision) + ')' +
+            ' | LLM: ' + escapeHtml(pr.llm_decision) +
+            '<div style="margin-top:8px;">' +
+              '<input id="grc_' + r.id + '" class="rev-input" placeholder="comment (optional)" style="width:260px;">' +
+            '</div>' +
+            '<div style="margin-top:8px;">' +
+              '<button class="btn-sm btn-approve" onclick="resumeRun(' + r.id + ', \'Apply\')">Apply</button>' +
+              '<button class="btn-sm" onclick="resumeRun(' + r.id + ', \'Maybe\')">Maybe</button>' +
+              '<button class="btn-sm btn-reject" onclick="resumeRun(' + r.id + ', \'Skip\')">Skip</button>' +
+            '</div></div>';
+        }
+        box.innerHTML = html;
+      } catch (err) {
+        box.innerHTML = '<div class="step" style="color:#f87171;">Could not load reviews: ' + escapeHtml(err.message) + '</div>';
+      }
+    }
+
+    async function resumeRun(runId, decision) {
+      const el = document.getElementById('grc_' + runId);
+      const comment = el ? el.value : '';
+      const qs = '?decision=' + decision + '&comment=' + encodeURIComponent(comment);
+      try {
+        const res = await fetch('/runs/' + runId + '/resume' + qs, { method: 'POST' });
+        if (!res.ok) { const e = await res.json(); throw new Error(e.detail || 'resume failed'); }
+        setTimeout(function() { loadRuns(); renderGraphReviews(); }, 1200);
+      } catch (err) { alert('Error: ' + err.message); }
+    }
+
     loadResumes();
     loadPending();
+    renderGraphReviews();
+    setInterval(renderGraphReviews, 4000);
     loadRuns();
