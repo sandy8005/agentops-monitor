@@ -61,3 +61,39 @@ class AgentState:
 
     def budget_exceeded(self):
         return not self.can_spend()
+
+
+    # --- Serialization for LangGraph checkpointing ---
+    # Every field must round-trip: from_dict(to_dict(s)) must reproduce s exactly.
+    # If a field is added to __init__, it MUST be added here too, or state silently
+    # drops across a checkpoint pause/resume.
+
+    _FIELDS = (
+        "goal", "resume_id", "target_role", "location", "work_mode",
+        "employment_type", "evaluate", "resume_text", "parsed_resume", "jobs",
+        "current_job_index", "job_results", "ranked", "ranking_done",
+        "advice_done", "cancelled", "failed_jobs", "requirements_cache",
+        "llm_calls_made", "max_llm_calls", "completed_actions", "done", "error",
+    )
+
+    def to_dict(self):
+        """Flat, JSON-serializable snapshot of the entire state."""
+        return {f: getattr(self, f) for f in self._FIELDS}
+
+    @classmethod
+    def from_dict(cls, d):
+        """Reconstruct an AgentState from a to_dict() snapshot."""
+        obj = cls(goal=d["goal"], resume_id=d.get("resume_id"),
+                  target_role=d.get("target_role"), location=d.get("location"),
+                  work_mode=d.get("work_mode"), employment_type=d.get("employment_type"),
+                  evaluate=d.get("evaluate", False))
+        for f in cls._FIELDS:
+            if f in d:
+                setattr(obj, f, d[f])
+        return obj
+
+    def __eq__(self, other):
+        """Equality by serialized state — used to prove the round-trip is lossless."""
+        if not isinstance(other, AgentState):
+            return NotImplemented
+        return self.to_dict() == other.to_dict()
