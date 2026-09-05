@@ -83,12 +83,12 @@ def route_after_search(gs: GraphState) -> str:
     return "process_job"
 
 def route_after_process_job(gs: GraphState) -> str:
-    """The per-job LOOP: keep processing until all jobs done, then rank."""
+    """The per-job LOOP: keep processing until all jobs done, then rank.
+    NO budget short-circuit — over-budget jobs still get scored and skip the
+    judge cleanly (matches the hand-rolled planner: budget gates Gemini, not work)."""
     s = gs["state"]
     if s.cancelled:
         return "cancelled"
-    if s.budget_exceeded():
-        return "rank_jobs"               # stop judging, still rank what we have
     if s.current_job_index < len(s.jobs):
         return "process_job"             # loop back to next job
     return "rank_jobs"
@@ -157,6 +157,8 @@ def run_agent_graph(resume_id, target_role=None, location=None,
             final_status = "cancelled"
         elif state.error:
             final_status = "failed"
+        elif state.jobs is not None and len(state.jobs) == 0:
+            final_status = "no_matches"
         elif state.failed_jobs > 0:
             final_status = "completed_with_errors"
     except Exception as e:
