@@ -228,6 +228,19 @@ def do_process_job(state, run_id):
             "llm_decision": llm_decision, "needs_review": needs_review
         })
 
+        # Surface review status to the graph so routing can pause for a human.
+        state.last_job_needs_review = bool(needs_review)
+        if needs_review:
+            state.last_review_step_id = step_id
+            state.last_review_info = {
+                "step_id": step_id,
+                "job_title": job["title"],
+                "company": job.get("company"),
+                "score": score,
+                "score_decision": score_result["decision"],
+                "llm_decision": llm_decision,
+            }
+
         # --- Evaluator (#8): ONLY on risky (flagged) jobs where the judge ran
         # (so 'result' exists) and budget allows. Most jobs skip this. ---
         if (state.evaluate and needs_review and result is not None
@@ -344,6 +357,24 @@ def do_generate_advice(state, run_id, top_n=2):
     except Exception as e:
         fail_step(step_id, e)
         state.advice_done = True   # don't loop on advice failure
+
+
+def apply_human_decision(state, run_id, step_id, decision, comment=""):
+    """
+    Record the human's Apply/Maybe/Skip decision for a reviewed step as the
+    AUTHORITATIVE outcome, preserving the agent's original decisions in the
+    trace (audit). Called after a LangGraph resume.
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE steps
+        SET review_status = %s, reviewed_at = %s, reviewer = %s, review_comment = %s
+        WHERE id = %s
+    """, (decision, __import__("datetime").datetime.now(), "human", comment, step_id))
+    conn.commit()
+    conn.close()
+    state.human_decisions[str(step_id)] = {"decision": decision, "comment": comment}
 
 
 def dispatch(action, state, run_id):

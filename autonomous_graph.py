@@ -13,12 +13,13 @@ This is the foundation for LangGraph checkpointing + human-in-the-loop interrupt
 import os
 from typing import TypedDict, Optional, List
 from langgraph.graph import StateGraph, END
+from langgraph.types import interrupt, Command
 from langgraph.checkpoint.postgres import PostgresSaver
 
 from agent_state import AgentState
 from router import (
     load_resume, do_parse_resume, do_search_jobs, do_process_job,
-    do_rank_jobs, do_generate_advice,
+    do_rank_jobs, do_generate_advice, apply_human_decision,
 )
 from llm import create_run, finish_run
 
@@ -108,6 +109,26 @@ def node_process_job(state: GraphState) -> dict:
     s.record_action("process_job")
     return _dump(s, state["run_id"])
 
+def node_human_review(state: GraphState) -> dict:
+    """
+    A flagged job pauses here for human review. interrupt() suspends the graph
+    (state is already checkpointed) and returns control to the caller. On resume
+    via Command(resume={"decision":..., "comment":...}), interrupt() RETURNS that
+    value, and we apply it as the authoritative decision.
+    """
+    s = _hydrate(state)
+    payload = s.last_review_info or {"step_id": s.last_review_step_id}
+    # --- PAUSE HERE. Resumes with the human's decision. ---
+    human = interrupt({"type": "review_request", **payload})
+    decision = (human or {}).get("decision", "Maybe")
+    comment = (human or {}).get("comment", "")
+    apply_human_decision(s, state["run_id"], s.last_review_step_id, decision, comment)
+    # clear the flag so we don't re-review on the next loop
+    s.last_job_needs_review = False
+    s.record_action("human_review")
+    return _dump(s, state["run_id"])
+
+
 def node_rank_jobs(state: GraphState) -> dict:
     s = _hydrate(state)
     do_rank_jobs(s, state["run_id"])
@@ -141,9 +162,20 @@ def route_after_search(state: GraphState) -> str:
     return "process_job"
 
 def route_after_process_job(state: GraphState) -> str:
-    """Per-job LOOP: keep processing until all jobs done, then rank.
+    """Per-job LOOP with human-in-the-loop: a flagged job pauses for review.
     NO budget short-circuit — over-budget jobs still get scored and skip the
-    judge cleanly (matches the hand-rolled planner: budget gates Gemini, not work)."""
+    judge cleanly (budget gates Gemini, not work)."""
+    if state.get("cancelled"):
+        return "cancelled"
+    if state.get("last_job_needs_review"):
+        return "human_review"                 # PAUSE for a human
+    if state.get("current_job_index", 0) < len(state.get("jobs") or []):
+        return "process_job"
+    return "rank_jobs"
+
+
+def route_after_human_review(state: GraphState) -> str:
+    """After the human decides: continue the job loop, or rank if done."""
     if state.get("cancelled"):
         return "cancelled"
     if state.get("current_job_index", 0) < len(state.get("jobs") or []):
@@ -161,6 +193,7 @@ def build_graph(checkpointer=None):
     g.add_node("parse_resume", node_parse_resume)
     g.add_node("search_jobs", node_search_jobs)
     g.add_node("process_job", node_process_job)
+    g.add_node("human_review", node_human_review)
     g.add_node("rank_jobs", node_rank_jobs)
     g.add_node("generate_advice", node_generate_advice)
 
@@ -173,6 +206,9 @@ def build_graph(checkpointer=None):
     g.add_conditional_edges("search_jobs", route_after_search,
                             {"process_job": "process_job", "no_matches": END, "fail": END})
     g.add_conditional_edges("process_job", route_after_process_job,
+                            {"process_job": "process_job", "rank_jobs": "rank_jobs",
+                             "human_review": "human_review", "cancelled": END})
+    g.add_conditional_edges("human_review", route_after_human_review,
                             {"process_job": "process_job", "rank_jobs": "rank_jobs", "cancelled": END})
     g.add_conditional_edges("rank_jobs", route_after_rank,
                             {"generate_advice": "generate_advice"})
@@ -212,16 +248,24 @@ def run_agent_graph(resume_id, target_role=None, location=None,
 
     final_status = "success"
     final_state = initial
+
     try:
-        # Open the Postgres checkpointer for this run. setup() creates the
-        # checkpoint tables on first use (idempotent). The graph is compiled
-        # WITH the checkpointer so state is persisted per thread_id (= run_id).
         with PostgresSaver.from_conn_string(_db_uri()) as checkpointer:
             checkpointer.setup()
             graph = build_graph(checkpointer=checkpointer)
             config = {"configurable": {"thread_id": str(run_id)},
                       "recursion_limit": 100}
-            final_state = graph.invoke(initial, config=config)
+            result = graph.invoke(initial, config=config)
+
+        # If the graph PAUSED at an interrupt, result carries "__interrupt__".
+        if isinstance(result, dict) and result.get("__interrupt__"):
+            _mark_run_status(run_id, "waiting_for_human")
+            intr = result["__interrupt__"]
+            print(f"Run {run_id} PAUSED for human review: "
+                  f"{intr[0].value if intr else '(interrupt)'}")
+            return result
+
+        final_state = result
         if final_state.get("cancelled"):
             final_status = "cancelled"
         elif final_state.get("error"):
@@ -230,10 +274,12 @@ def run_agent_graph(resume_id, target_role=None, location=None,
             final_status = "no_matches"
         elif final_state.get("failed_jobs", 0) > 0:
             final_status = "completed_with_errors"
+        else:
+            final_status = "success"
+        finish_run(run_id, final_status)
     except Exception as e:
         final_status = "failed"
         print(f"graph run failed: {e}")
-    finally:
         finish_run(run_id, final_status)
 
     print(f"Run {run_id} (langgraph) finished: {final_status} "
@@ -245,6 +291,54 @@ def run_agent_graph(resume_id, target_role=None, location=None,
             print(f"{i}. {r['title']} ({r['company']}) — "
                   f"score {r['score']} ({r['decision']}), judge: {r['llm_decision']}")
     return final_state
+
+
+def _mark_run_status(run_id, status):
+    """Set the run's status directly (used for waiting_for_human)."""
+    from llm import get_connection
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("UPDATE runs SET status = %s WHERE id = %s", (status, run_id))
+    conn.commit()
+    conn.close()
+
+
+def resume_agent_graph(run_id, decision, comment=""):
+    """
+    Resume a paused run with the human's decision. Reopens the checkpointer,
+    loads the checkpoint by thread_id, and continues via Command(resume=...).
+    May pause AGAIN for the next flagged job (returns __interrupt__ again).
+    """
+    with PostgresSaver.from_conn_string(_db_uri()) as checkpointer:
+        checkpointer.setup()
+        graph = build_graph(checkpointer=checkpointer)
+        config = {"configurable": {"thread_id": str(run_id)},
+                  "recursion_limit": 100}
+        result = graph.invoke(
+            Command(resume={"decision": decision, "comment": comment}),
+            config=config)
+
+    if isinstance(result, dict) and result.get("__interrupt__"):
+        _mark_run_status(run_id, "waiting_for_human")
+        print(f"Run {run_id} PAUSED again for the next review.")
+        return result
+
+    # completed after resume
+    fs = result
+    if fs.get("cancelled"):
+        status = "cancelled"
+    elif fs.get("failed_jobs", 0) > 0:
+        status = "completed_with_errors"
+    else:
+        status = "success"
+    finish_run(run_id, status)
+    print(f"Run {run_id} resumed and finished: {status}")
+    if fs.get("ranked"):
+        print("\nRANKED JOBS:")
+        for i, r in enumerate(fs["ranked"], 1):
+            print(f"{i}. {r['title']} ({r['company']}) — "
+                  f"score {r['score']} ({r['decision']}), judge: {r['llm_decision']}")
+    return result
 
 
 if __name__ == "__main__":

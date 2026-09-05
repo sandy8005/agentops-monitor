@@ -30,6 +30,11 @@ class AgentState:
         self.advice_done = False         # True once advice generation has run
         self.cancelled = False           # set True when a cancel request is detected
         self.failed_jobs = 0             # count of jobs that errored during processing
+        # --- human-in-the-loop review (LangGraph interrupt) ---
+        self.last_job_needs_review = False   # did the just-processed job get flagged?
+        self.last_review_step_id = None      # step_id of that job (for the interrupt payload)
+        self.last_review_info = None         # dict shown to the human at the interrupt
+        self.human_decisions = {}            # step_id -> {"decision":..., "comment":...}
 
         # --- caches ---
         self.requirements_cache = {}
@@ -69,6 +74,8 @@ class AgentState:
     # drops across a checkpoint pause/resume.
 
     _FIELDS = (
+        "last_job_needs_review", "last_review_step_id", "last_review_info",
+        "human_decisions",
         "goal", "resume_id", "target_role", "location", "work_mode",
         "employment_type", "evaluate", "resume_text", "parsed_resume", "jobs",
         "current_job_index", "job_results", "ranked", "ranking_done",
