@@ -10,8 +10,10 @@ logic (caching, judge signals, budget, cancellation checks) is reused as-is.
 
 This is the foundation for LangGraph checkpointing + human-in-the-loop interrupts.
 """
+import os
 from typing import TypedDict, Optional, List
 from langgraph.graph import StateGraph, END
+from langgraph.checkpoint.postgres import PostgresSaver
 
 from agent_state import AgentState
 from router import (
@@ -19,6 +21,17 @@ from router import (
     do_rank_jobs, do_generate_advice,
 )
 from llm import create_run, finish_run
+
+
+def _db_uri():
+    """
+    libpq keyword/value connection string (NOT a URI). This avoids URI parsing
+    entirely, so special characters in the password (@, #, :, /) are safe —
+    a URI would mis-split on them. psycopg / PostgresSaver accept this format.
+    """
+    return (f"host={os.getenv('DB_HOST')} port={os.getenv('DB_PORT')} "
+            f"dbname={os.getenv('DB_NAME')} user={os.getenv('DB_USER')} "
+            f"password={os.getenv('DB_PASSWORD')}")
 
 
 # --- Flat, serializable graph state. Every field is JSON-serializable so the
@@ -141,7 +154,7 @@ def route_after_rank(state: GraphState) -> str:
     return "generate_advice"
 
 
-def build_graph():
+def build_graph(checkpointer=None):
     g = StateGraph(GraphState)
 
     g.add_node("load_resume", node_load_resume)
@@ -165,10 +178,14 @@ def build_graph():
                             {"generate_advice": "generate_advice"})
     g.add_edge("generate_advice", END)
 
-    return g.compile()
+    # Compile WITH the checkpointer if provided — that's what enables state
+    # persistence (and, later, interrupt/resume). Without it, a plain graph.
+    return g.compile(checkpointer=checkpointer)
 
 
-GRAPH = build_graph()
+# NOTE: the graph is no longer compiled at import. The checkpointer holds a live
+# DB connection scoped to a `with` block, so the graph is built per-run inside
+# run_agent_graph. (A ConnectionPool could keep it warm later; simple first.)
 
 
 def run_agent_graph(resume_id, target_role=None, location=None,
@@ -196,7 +213,15 @@ def run_agent_graph(resume_id, target_role=None, location=None,
     final_status = "success"
     final_state = initial
     try:
-        final_state = GRAPH.invoke(initial, config={"recursion_limit": 100})
+        # Open the Postgres checkpointer for this run. setup() creates the
+        # checkpoint tables on first use (idempotent). The graph is compiled
+        # WITH the checkpointer so state is persisted per thread_id (= run_id).
+        with PostgresSaver.from_conn_string(_db_uri()) as checkpointer:
+            checkpointer.setup()
+            graph = build_graph(checkpointer=checkpointer)
+            config = {"configurable": {"thread_id": str(run_id)},
+                      "recursion_limit": 100}
+            final_state = graph.invoke(initial, config=config)
         if final_state.get("cancelled"):
             final_status = "cancelled"
         elif final_state.get("error"):
