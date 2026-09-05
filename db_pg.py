@@ -55,6 +55,9 @@ CREATE TABLE IF NOT EXISTS steps (
     reviewer TEXT,
     review_comment TEXT,
     review_reason TEXT,
+    judge_status TEXT,
+    judge_skip_reason TEXT,
+    cache_hit BOOLEAN,
     FOREIGN KEY (run_id) REFERENCES runs(id)
 )
 """)

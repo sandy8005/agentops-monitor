@@ -21,7 +21,7 @@ from cache_version import parse_cache_version, reqs_cache_version
 from llm import (
     create_step, finish_step, fail_step, logged_llm_call, logged_tool_call,
     record_score, record_context, flag_for_review, get_connection,
-    is_cancel_requested
+    is_cancel_requested, record_judge_signals
 )
 
 
@@ -161,6 +161,7 @@ def do_process_job(state, run_id):
         #    (cached by description hash #2)
         dhash = _reqs_cache_key(job["description"])
         requirements = _reqs_cache_get(dhash)
+        cache_hit = requirements is not None
         if requirements is None:
             requirements = extract_requirements(job, run_id, step_id)
             state.llm_calls_made += 1
@@ -184,15 +185,19 @@ def do_process_job(state, run_id):
         # 4. Gemini judge ONLY in the uncertain middle band (#5,6,7).
         #    Extremes skip the judge — recorded honestly, not faked as agreement.
         result = None
+        judge_status = "skipped"
+        judge_skip_reason = None
         if not (20 <= score <= 80):
             # Extreme score — judge adds little; skip it (honest, not faked).
-            reason = "score_extreme_low" if score < 20 else "score_extreme_high"
-            llm_decision = f"skipped ({reason})"
+            judge_skip_reason = "score_extreme_low" if score < 20 else "score_extreme_high"
+            llm_decision = f"skipped ({judge_skip_reason})"
         elif state.budget_exceeded():
             # Middle-band, but quota is spent. Keep the deterministic score and
             # skip the judge cleanly — the job still SUCCEEDS, just no LLM opinion.
+            judge_skip_reason = "budget"
             llm_decision = "skipped (budget)"
         else:
+            judge_status = "ran"
             from agent import build_prompt
             evidence = {"matched_in_resume": score_result["matched_skills"],
                         "missing_from_resume": score_result["missing_skills"]}
@@ -213,6 +218,9 @@ def do_process_job(state, run_id):
             "judge_skipped": not (20 <= score <= 80),
             "score_breakdown": score_result["breakdown"],
         })
+
+        # Structured AgentOps signals (queryable columns).
+        record_judge_signals(step_id, judge_status, judge_skip_reason, cache_hit)
 
         state.job_results.append({
             "title": job["title"], "company": job["company"],

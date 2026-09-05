@@ -175,6 +175,25 @@ def record_context(step_id, context):
     conn.close()
 
 
+def record_judge_signals(step_id, judge_status, judge_skip_reason=None, cache_hit=None):
+    """
+    Store structured AgentOps signals for a job step:
+      judge_status      — 'ran' | 'skipped'
+      judge_skip_reason — 'score_extreme_low' | 'score_extreme_high' | 'budget' | None
+      cache_hit         — True if requirements came from cache this step, else False/None
+    Queryable columns (not JSONB) so aggregate stats — cache hit rate, skip-reason
+    distribution — are one SQL GROUP BY away.
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE steps SET judge_status = %s, judge_skip_reason = %s, cache_hit = %s
+        WHERE id = %s
+    """, (judge_status, judge_skip_reason, cache_hit, step_id))
+    conn.commit()
+    conn.close()
+
+
 def is_cancel_requested(run_id):
     conn = get_connection()
     cur = conn.cursor()
