@@ -1,14 +1,16 @@
 """
-LangGraph orchestration of the autonomous agent.
+LangGraph orchestration of the autonomous agent — TypedDict state edition.
 
-Design: LangGraph replaces the hand-rolled while-loop in autonomous_agent.py.
-It ORCHESTRATES only — every routing decision is a pure-Python rule (your
-planner logic), so LangGraph adds ZERO Gemini calls. All the real work stays
-in the existing tool functions in router.py; nodes are thin wrappers that call
-them. State is your existing AgentState, carried inside the graph state dict
-and mutated in place (Option B — keeps all tool functions unchanged).
+The graph state is now a FLAT, JSON-SERIALIZABLE TypedDict (not an AgentState
+object), so it can be checkpointed reliably by a persistence backend. Each node
+uses the ADAPTER pattern: hydrate an AgentState from the dict (from_dict), run the
+existing, unchanged router tool (which mutates the object), then return the flat
+dict (to_dict) for LangGraph to merge. router.py is UNTOUCHED — all its tested
+logic (caching, judge signals, budget, cancellation checks) is reused as-is.
+
+This is the foundation for LangGraph checkpointing + human-in-the-loop interrupts.
 """
-from typing import TypedDict
+from typing import TypedDict, Optional, List
 from langgraph.graph import StateGraph, END
 
 from agent_state import AgentState
@@ -19,81 +21,123 @@ from router import (
 from llm import create_run, finish_run
 
 
-# --- Graph state: a single-key dict carrying your AgentState object. ---
-class GraphState(TypedDict):
-    state: AgentState
+# --- Flat, serializable graph state. Every field is JSON-serializable so the
+# checkpointer can persist it across a pause/resume. Mirrors AgentState's fields
+# plus run_id. ---
+class GraphState(TypedDict, total=False):
     run_id: int
+    # identity / config
+    goal: str
+    resume_id: int
+    target_role: Optional[str]
+    location: Optional[str]
+    work_mode: Optional[str]
+    employment_type: Optional[str]
+    evaluate: bool
+    # accumulated results
+    resume_text: Optional[str]
+    parsed_resume: Optional[dict]
+    jobs: Optional[list]
+    current_job_index: int
+    job_results: list
+    ranked: Optional[list]
+    # control flags
+    ranking_done: bool
+    advice_done: bool
+    cancelled: bool
+    done: bool
+    error: Optional[str]
+    # budget & failure accounting
+    llm_calls_made: int
+    max_llm_calls: int
+    failed_jobs: int
+    # misc
+    requirements_cache: dict
+    completed_actions: list
 
 
-# --- Nodes: thin wrappers around existing tools. Each mutates AgentState in
-# place and returns the (same) state dict so LangGraph carries it forward. ---
+# --- Adapter helpers: dict <-> AgentState, so router.py stays unchanged. ---
 
-def node_load_resume(gs: GraphState) -> GraphState:
-    load_resume(gs["state"], gs["run_id"])
-    gs["state"].record_action("load_resume")
-    return gs
+def _hydrate(state: GraphState) -> AgentState:
+    """Rebuild an AgentState from the flat graph-state dict."""
+    return AgentState.from_dict(state)
 
-def node_parse_resume(gs: GraphState) -> GraphState:
-    do_parse_resume(gs["state"], gs["run_id"])
-    gs["state"].record_action("parse_resume")
-    return gs
-
-def node_search_jobs(gs: GraphState) -> GraphState:
-    do_search_jobs(gs["state"], gs["run_id"])
-    gs["state"].record_action("search_jobs")
-    return gs
-
-def node_process_job(gs: GraphState) -> GraphState:
-    do_process_job(gs["state"], gs["run_id"])
-    gs["state"].record_action("process_job")
-    return gs
-
-def node_rank_jobs(gs: GraphState) -> GraphState:
-    do_rank_jobs(gs["state"], gs["run_id"])
-    gs["state"].record_action("rank_jobs")
-    return gs
-
-def node_generate_advice(gs: GraphState) -> GraphState:
-    do_generate_advice(gs["state"], gs["run_id"])
-    gs["state"].record_action("generate_advice")
-    return gs
+def _dump(s: AgentState, run_id: int) -> dict:
+    """Flatten an AgentState back to a serializable dict, carrying run_id."""
+    d = s.to_dict()
+    d["run_id"] = run_id
+    return d
 
 
-# --- Conditional routing: PURE PYTHON (your planner rules). Zero LLM calls. ---
+# --- Nodes: hydrate -> run existing tool -> return flat dict. ---
 
-def route_after_start(gs: GraphState) -> str:
-    """After load: error?  else parse."""
-    s = gs["state"]
-    if s.error:
+def node_load_resume(state: GraphState) -> dict:
+    s = _hydrate(state)
+    load_resume(s, state["run_id"])
+    s.record_action("load_resume")
+    return _dump(s, state["run_id"])
+
+def node_parse_resume(state: GraphState) -> dict:
+    s = _hydrate(state)
+    do_parse_resume(s, state["run_id"])
+    s.record_action("parse_resume")
+    return _dump(s, state["run_id"])
+
+def node_search_jobs(state: GraphState) -> dict:
+    s = _hydrate(state)
+    do_search_jobs(s, state["run_id"])
+    s.record_action("search_jobs")
+    return _dump(s, state["run_id"])
+
+def node_process_job(state: GraphState) -> dict:
+    s = _hydrate(state)
+    do_process_job(s, state["run_id"])
+    s.record_action("process_job")
+    return _dump(s, state["run_id"])
+
+def node_rank_jobs(state: GraphState) -> dict:
+    s = _hydrate(state)
+    do_rank_jobs(s, state["run_id"])
+    s.record_action("rank_jobs")
+    return _dump(s, state["run_id"])
+
+def node_generate_advice(state: GraphState) -> dict:
+    s = _hydrate(state)
+    do_generate_advice(s, state["run_id"])
+    s.record_action("generate_advice")
+    return _dump(s, state["run_id"])
+
+
+# --- Conditional routing: PURE PYTHON reading the flat dict. Zero LLM calls. ---
+
+def route_after_start(state: GraphState) -> str:
+    if state.get("error"):
         return "fail"
     return "parse_resume"
 
-def route_after_parse(gs: GraphState) -> str:
-    s = gs["state"]
-    if s.error:
+def route_after_parse(state: GraphState) -> str:
+    if state.get("error"):
         return "fail"
     return "search_jobs"
 
-def route_after_search(gs: GraphState) -> str:
-    s = gs["state"]
-    if s.error:
+def route_after_search(state: GraphState) -> str:
+    if state.get("error"):
         return "fail"
-    if not s.jobs:                       # honest empty — no jobs matched
+    if not state.get("jobs"):            # honest empty — no jobs matched
         return "no_matches"
     return "process_job"
 
-def route_after_process_job(gs: GraphState) -> str:
-    """The per-job LOOP: keep processing until all jobs done, then rank.
+def route_after_process_job(state: GraphState) -> str:
+    """Per-job LOOP: keep processing until all jobs done, then rank.
     NO budget short-circuit — over-budget jobs still get scored and skip the
     judge cleanly (matches the hand-rolled planner: budget gates Gemini, not work)."""
-    s = gs["state"]
-    if s.cancelled:
+    if state.get("cancelled"):
         return "cancelled"
-    if s.current_job_index < len(s.jobs):
-        return "process_job"             # loop back to next job
+    if state.get("current_job_index", 0) < len(state.get("jobs") or []):
+        return "process_job"
     return "rank_jobs"
 
-def route_after_rank(gs: GraphState) -> str:
+def route_after_rank(state: GraphState) -> str:
     return "generate_advice"
 
 
@@ -116,7 +160,7 @@ def build_graph():
     g.add_conditional_edges("search_jobs", route_after_search,
                             {"process_job": "process_job", "no_matches": END, "fail": END})
     g.add_conditional_edges("process_job", route_after_process_job,
-                            {"process_job": "process_job", "rank_jobs": "rank_jobs","cancelled": END})
+                            {"process_job": "process_job", "rank_jobs": "rank_jobs", "cancelled": END})
     g.add_conditional_edges("rank_jobs", route_after_rank,
                             {"generate_advice": "generate_advice"})
     g.add_edge("generate_advice", END)
@@ -124,7 +168,6 @@ def build_graph():
     return g.compile()
 
 
-# Build once at import (compiling is cheap; reuse across runs).
 GRAPH = build_graph()
 
 
@@ -132,34 +175,35 @@ def run_agent_graph(resume_id, target_role=None, location=None,
                     work_mode=None, employment_type=None, evaluate=False,
                     run_id=None, max_llm_calls=30):
     """
-    LangGraph entry point — same signature as run_agent_autonomous, so the
-    dashboard can call this instead. Returns the final AgentState.
+    LangGraph entry point — same signature as run_agent_autonomous.
+    Builds the initial flat state, invokes the graph, derives the run status
+    from the FINAL state dict, and finalizes the run.
     """
-    state = AgentState(
-        goal="match resume to jobs", resume_id=resume_id,
-        target_role=target_role, location=location,
-        work_mode=work_mode, employment_type=employment_type, evaluate=evaluate,
-    )
-    state.max_llm_calls = max_llm_calls
-
     if run_id is None:
         run_id = create_run("autonomous job search (langgraph)", resume_id=resume_id,
                             target_role=target_role, location=location,
                             work_mode=work_mode, employment_type=employment_type)
 
+    # Build the initial flat state via AgentState (so defaults match exactly).
+    seed = AgentState(
+        goal="match resume to jobs", resume_id=resume_id,
+        target_role=target_role, location=location,
+        work_mode=work_mode, employment_type=employment_type, evaluate=evaluate,
+    )
+    seed.max_llm_calls = max_llm_calls
+    initial = _dump(seed, run_id)
+
     final_status = "success"
+    final_state = initial
     try:
-        # recursion_limit guards against a routing bug looping forever (your #20
-        # spirit, at the graph level). Generous but bounded.
-        GRAPH.invoke({"state": state, "run_id": run_id},
-                     config={"recursion_limit": 100})
-        if state.cancelled:
+        final_state = GRAPH.invoke(initial, config={"recursion_limit": 100})
+        if final_state.get("cancelled"):
             final_status = "cancelled"
-        elif state.error:
+        elif final_state.get("error"):
             final_status = "failed"
-        elif state.jobs is not None and len(state.jobs) == 0:
+        elif final_state.get("jobs") is not None and len(final_state.get("jobs")) == 0:
             final_status = "no_matches"
-        elif state.failed_jobs > 0:
+        elif final_state.get("failed_jobs", 0) > 0:
             final_status = "completed_with_errors"
     except Exception as e:
         final_status = "failed"
@@ -168,13 +212,14 @@ def run_agent_graph(resume_id, target_role=None, location=None,
         finish_run(run_id, final_status)
 
     print(f"Run {run_id} (langgraph) finished: {final_status} "
-          f"({state.llm_calls_made} LLM calls)")
-    if state.ranked:
+          f"({final_state.get('llm_calls_made', 0)} LLM calls)")
+    ranked = final_state.get("ranked")
+    if ranked:
         print("\nRANKED JOBS:")
-        for i, r in enumerate(state.ranked, 1):
+        for i, r in enumerate(ranked, 1):
             print(f"{i}. {r['title']} ({r['company']}) — "
                   f"score {r['score']} ({r['decision']}), judge: {r['llm_decision']}")
-    return state
+    return final_state
 
 
 if __name__ == "__main__":
