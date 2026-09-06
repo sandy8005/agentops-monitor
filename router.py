@@ -147,6 +147,9 @@ def do_process_job(state, run_id):
     requirements (cached) → deterministic score (traced) → Gemini judge ONLY
     if score is in the uncertain middle band (20-80) → evaluator on risky jobs.
     Always advances current_job_index (finally), so the loop can't get stuck.
+
+    KEY: if the judge fails (quota/API), the job KEEPS its deterministic score
+    and ranks anyway — a failed judge no longer discards the whole job.
     """
     # Cooperative cancellation: if the user hit Cancel, stop before this job.
     if is_cancel_requested(run_id):
@@ -156,9 +159,7 @@ def do_process_job(state, run_id):
     job = state.jobs[state.current_job_index]
     step_id = create_step(run_id, job["title"], len(state.completed_actions))
     try:
-        # 1. requirements FIRST — structured, optional-aware extraction. This is
-        #    what makes "Docker is optional" land in preferred, not required.
-        #    (cached by description hash #2)
+        # 1. requirements FIRST — structured, optional-aware extraction (cached #2).
         dhash = _reqs_cache_key(job["description"])
         requirements = _reqs_cache_get(dhash)
         cache_hit = requirements is not None
@@ -169,7 +170,7 @@ def do_process_job(state, run_id):
         else:
             print(f"    (requirements for '{job['title']}' served from cache — 0 LLM calls)")
 
-        # 3. deterministic score — traced (0 LLM calls), runs FIRST (#4)
+        # 2. deterministic score — traced (0 LLM calls), runs FIRST (#4)
         user_input = {
             "target_role": state.target_role, "location": state.location,
             "work_mode": state.work_mode, "employment_type": state.employment_type
@@ -182,8 +183,7 @@ def do_process_job(state, run_id):
             run_id, step_id, operation="score")
         score = score_result["score"]
 
-        # 4. Gemini judge ONLY in the uncertain middle band (#5,6,7).
-        #    Extremes skip the judge — recorded honestly, not faked as agreement.
+        # 3. Gemini judge ONLY in the uncertain middle band (#5,6,7).
         result = None
         judge_status = "skipped"
         judge_skip_reason = None
@@ -192,21 +192,28 @@ def do_process_job(state, run_id):
             judge_skip_reason = "score_extreme_low" if score < 20 else "score_extreme_high"
             llm_decision = f"skipped ({judge_skip_reason})"
         elif state.budget_exceeded():
-            # Middle-band, but quota is spent. Keep the deterministic score and
-            # skip the judge cleanly — the job still SUCCEEDS, just no LLM opinion.
+            # Middle-band, but quota is spent. Keep the score, skip judge cleanly.
             judge_skip_reason = "budget"
             llm_decision = "skipped (budget)"
         else:
-            judge_status = "ran"
+            # Middle-band: judge SHOULD run. But if it fails (quota/API/budget) the
+            # job KEEPS its deterministic score instead of being discarded — degrade
+            # to "scored, judge unavailable" rather than failing the whole job.
             from agent import build_prompt
             evidence = {"matched_in_resume": score_result["matched_skills"],
                         "missing_from_resume": score_result["missing_skills"]}
             prompt = build_prompt(state.resume_text, state.parsed_resume, job, evidence, requirements)
-            result = logged_llm_call(prompt, run_id, step_id, operation="job_judge", budget=state)
             try:
-                llm_decision = _parse_decision(result)
-            except Exception:
-                llm_decision = "Unknown"
+                result = logged_llm_call(prompt, run_id, step_id, operation="job_judge", budget=state)
+                judge_status = "ran"
+                try:
+                    llm_decision = _parse_decision(result)
+                except Exception:
+                    llm_decision = "Unknown"
+            except Exception as judge_err:
+                judge_skip_reason = "judge_unavailable"
+                llm_decision = "skipped (judge_unavailable)"
+                print(f"    judge unavailable for '{job['title']}' ({judge_err}) — keeping score")
 
         needs_review = record_score(step_id, score, score_result["decision"],
                                     llm_decision, breakdown=score_result["breakdown"])
@@ -344,8 +351,6 @@ def do_generate_advice(state, run_id, top_n=2):
                 "required_skills": [], "required_any_of": [], "preferred_skills": [],
                 "min_years_experience": 0, "responsibilities": []
             }
-            # Missing skills come from the scorer's accurate, whole-word,
-            # required-only evidence — not a raw-text keyword scan.
             sc = calculate_match_score(state.parsed_resume, requirements,
                                        state.resume_text, job, None)
             advice = _combined_advice(state.resume_text, job, requirements,
