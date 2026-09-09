@@ -3,7 +3,7 @@ from llm import logged_llm_call
 from schemas import Evaluation
 
 
-def evaluate_decision(resume_text, job, agent_response, run_id, step_id):
+def evaluate_decision(resume_text, job, agent_response, run_id, step_id, budget=None):
     prompt = f"""
 You are an evaluation judge. Grade the AI agent's job recommendation below.
 
@@ -35,7 +35,7 @@ Return ONLY valid JSON, no markdown fences, no explanation, in exactly this shap
   "notes": "one sentence"
 }}
 """
-    raw = logged_llm_call(prompt, run_id, step_id, operation="evaluation")
+    raw = logged_llm_call(prompt, run_id, step_id, budget=budget)
     cleaned = raw.strip().replace("```json", "").replace("```", "").strip()
     data = json.loads(cleaned)
     return Evaluation(**data).model_dump()

@@ -86,8 +86,7 @@ def do_parse_resume(state, run_id):
             finish_step(step_id, "success")
             print("    (parsed resume served from cache — 0 LLM calls)")
             return
-        parsed = parse_resume(state.resume_text, run_id, step_id)
-        state.llm_calls_made += 1
+        parsed = parse_resume(state.resume_text, run_id, step_id, budget=state)
         _parse_cache_put(rhash, parsed)
         state.parsed_resume = parsed
         finish_step(step_id, "success")
@@ -178,8 +177,7 @@ def do_process_job(state, run_id):
         requirements = _reqs_cache_get(dhash)
         cache_hit = requirements is not None
         if requirements is None:
-            requirements = extract_requirements(job, run_id, step_id)
-            state.llm_calls_made += 1
+            requirements = extract_requirements(job, run_id, step_id, budget=state)
             _reqs_cache_put(dhash, requirements)
         else:
             print(f"    (requirements for '{job['title']}' served from cache — 0 LLM calls)")
@@ -272,9 +270,8 @@ def do_process_job(state, run_id):
             try:
                 from evaluator import evaluate_decision
                 from llm import save_evaluation
-                eval_result = evaluate_decision(state.resume_text, job, result, run_id, step_id)
+                eval_result = evaluate_decision(state.resume_text, job, result, run_id, step_id, budget=state)
                 save_evaluation(run_id, step_id, eval_result)
-                state.llm_calls_made += 1
                 rel = eval_result["relevance_score"]
                 faith = eval_result["faithfulness_score"]
                 comp = eval_result["completeness_score"]
@@ -286,7 +283,6 @@ def do_process_job(state, run_id):
                       f"halluc={eval_result['hallucination_detected']}")
             except Exception as eval_err:
                 flag_for_review(step_id, reason="evaluation_failed")
-                state.llm_calls_made += 1
                 print(f"    evaluation requested but failed: {eval_err}")
 
         finish_step(step_id, "success")

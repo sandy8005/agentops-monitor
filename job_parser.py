@@ -3,7 +3,7 @@ from llm import logged_llm_call
 from schemas import JobRequirements
 
 
-def extract_requirements(job, run_id, step_id):
+def extract_requirements(job, run_id, step_id, budget=None):
     prompt = f"""
 Extract structured requirements from this job posting.
 
@@ -30,7 +30,7 @@ Return ONLY valid JSON, no markdown fences, no explanation, in exactly this shap
 
 If there are no "or" alternatives in the posting, return an empty list for required_any_of: [].
 """
-    raw = logged_llm_call(prompt, run_id, step_id, operation="extract_requirements")
+    raw = logged_llm_call(prompt, run_id, step_id, budget=budget)
     cleaned = raw.strip().replace("```json", "").replace("```", "").strip()
     data = json.loads(cleaned)
     return JobRequirements(**data).model_dump()
