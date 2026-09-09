@@ -110,13 +110,13 @@ def upsert_adzuna_jobs(jobs):
         cur.execute("""
             INSERT INTO job_postings
             (title, company, description, location, work_mode, employment_type,
-             source, external_id, search_location, fetched_at, last_seen_at, posted_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+             source, external_id, search_location, fetched_at, last_seen_at, posted_at, apply_url)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (external_id) WHERE external_id IS NOT NULL
             DO UPDATE SET last_seen_at = EXCLUDED.last_seen_at
         """, (j["title"], j["company"], j["description"], j["location"],
               j["work_mode"], j["employment_type"], j["source"], j["external_id"],
-              j.get("search_location"), now, now, j.get("posted_at")))
+              j.get("search_location"), now, now, j.get("posted_at"), j.get("apply_url")))
         # rowcount is 1 for both insert and update; count true inserts separately
         inserted += 1 if cur.statusmessage and "INSERT 0 1" in cur.statusmessage else 0
     conn.commit()
@@ -125,13 +125,70 @@ def upsert_adzuna_jobs(jobs):
     return (inserted, len(jobs) - inserted)
 
 
-def fetch_and_upsert_adzuna(role, location=None, limit=10):
-    """Fetch real Adzuna jobs for role+location and upsert them. The single call
-    the agent makes. Returns (inserted, skipped)."""
-    jobs = fetch_adzuna_jobs(role, location, limit)
-    inserted, skipped = upsert_adzuna_jobs(jobs)
-    if jobs:
-        print(f"    adzuna: fetched {len(jobs)}, added {inserted} new, {skipped} already known")
+def _log_adzuna_call(run_id, step_id, role, location, latency_ms,
+                     fetched, inserted, duplicates, status, error_message):
+    """
+    Write an AgentOps trace row for the Adzuna external API call — so its latency,
+    jobs returned, inserts, duplicates, and errors are observed like every other
+    tool. No-op if run_id/step_id aren't provided (e.g. standalone CLI use).
+    """
+    if run_id is None or step_id is None:
+        return
+    try:
+        import json
+        from datetime import datetime
+        from llm import get_connection
+        conn = get_connection()
+        cur = conn.cursor()
+        input_json = json.dumps({"role": role, "location": location})
+        output_json = json.dumps({
+            "fetched": fetched, "inserted": inserted, "duplicates": duplicates,
+        })
+        cur.execute("""
+            INSERT INTO tool_calls
+            (run_id, step_id, tool_name, input_json, output_json, latency_ms,
+             status, error_message, created_at, operation_name)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """, (run_id, step_id, "adzuna_fetch", input_json, output_json, latency_ms,
+              status, error_message, datetime.now(), "live_fetch"))
+        conn.commit()
+        cur.close()
+        conn.close()
+    except Exception as log_err:
+        # Never let trace-logging break the run.
+        print(f"    (adzuna trace log failed: {log_err})")
+
+
+def fetch_and_upsert_adzuna(role, location=None, limit=10, run_id=None, step_id=None):
+    """
+    Fetch real Adzuna jobs for role+location and upsert them. The single call the
+    agent makes. Now OBSERVED: logs latency, jobs returned, inserted, duplicates,
+    and any HTTP/rate-limit error to the AgentOps tool_calls trace.
+    Returns (inserted, skipped).
+    """
+    import time
+    start = time.time()
+    status = "success"
+    error_message = None
+    fetched = inserted = skipped = 0
+    try:
+        jobs = fetch_adzuna_jobs(role, location, limit)
+        fetched = len(jobs)
+        inserted, skipped = upsert_adzuna_jobs(jobs)
+        if fetched == 0:
+            status = "empty"   # fetch returned nothing (API error/rate limit already
+                               # printed inside fetch_adzuna_jobs; recorded here too)
+    except Exception as e:
+        status = "failed"
+        error_message = str(e)
+    latency_ms = int((time.time() - start) * 1000)
+
+    _log_adzuna_call(run_id, step_id, role, location, latency_ms,
+                     fetched, inserted, skipped, status, error_message)
+
+    if fetched:
+        print(f"    adzuna: fetched {fetched}, added {inserted} new, {skipped} already "
+              f"known ({latency_ms}ms)")
     return (inserted, skipped)
 
 

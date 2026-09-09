@@ -109,7 +109,8 @@ def do_search_jobs(state, run_id):
         # to the existing pool if the API is unavailable or keys are missing.
         try:
             from adzuna_jobs import fetch_and_upsert_adzuna
-            fetch_and_upsert_adzuna(state.target_role, state.location)
+            fetch_and_upsert_adzuna(state.target_role, state.location,
+                                    run_id=run_id, step_id=step_id)
         except Exception as live_err:
             print(f"    adzuna fetch skipped ({live_err}) — using existing pool")
 
@@ -233,6 +234,7 @@ def do_process_job(state, run_id):
 
         record_context(step_id, {
             "job_id": job.get("id"), "job_source": job.get("source"),
+            "apply_url": job.get("apply_url"),
             "matched_skills": score_result["matched_skills"],
             "missing_skills": score_result["missing_skills"],
             "judge_skipped": not (20 <= score <= 80),
@@ -245,7 +247,8 @@ def do_process_job(state, run_id):
         state.job_results.append({
             "title": job["title"], "company": job["company"],
             "score": score, "decision": score_result["decision"],
-            "llm_decision": llm_decision, "needs_review": needs_review
+            "llm_decision": llm_decision, "needs_review": needs_review,
+            "apply_url": job.get("apply_url")
         })
 
         # Surface review status to the graph so routing can pause for a human.
