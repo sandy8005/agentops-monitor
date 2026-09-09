@@ -83,6 +83,7 @@ def fetch_adzuna_jobs(role, location=None, limit=10):
             "employment_type": _infer_employment_type(
                 j.get("contract_time"), j.get("contract_type")),
             "source": "adzuna",
+            "search_location": (location or "").strip() or None,
         })
     return out
 
@@ -104,11 +105,12 @@ def upsert_adzuna_jobs(jobs):
     for j in jobs:
         cur.execute("""
             INSERT INTO job_postings
-            (title, company, description, location, work_mode, employment_type, source, external_id)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            (title, company, description, location, work_mode, employment_type, source, external_id, search_location)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (external_id) WHERE external_id IS NOT NULL DO NOTHING
         """, (j["title"], j["company"], j["description"], j["location"],
-              j["work_mode"], j["employment_type"], j["source"], j["external_id"]))
+              j["work_mode"], j["employment_type"], j["source"], j["external_id"],
+              j.get("search_location")))
         inserted += cur.rowcount
     conn.commit()
     cur.close()

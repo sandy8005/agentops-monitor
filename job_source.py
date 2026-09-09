@@ -74,7 +74,7 @@ def search_jobs(target_role=None, location=None, work_mode=None,
     # each job came from (seed/csv/api/scraped) is valuable trace context that
     # should survive downstream, not be dropped at the search boundary.
     cur.execute("""
-        SELECT id, title, company, description, location, work_mode, employment_type, source
+        SELECT id, title, company, description, location, work_mode, employment_type, source, search_location
         FROM job_postings ORDER BY id
     """)
     rows = cur.fetchall()
@@ -82,7 +82,8 @@ def search_jobs(target_role=None, location=None, work_mode=None,
 
     all_jobs = [
         {"id": r[0], "title": r[1], "company": r[2], "description": r[3],
-         "location": r[4], "work_mode": r[5], "employment_type": r[6], "source": r[7]}
+         "location": r[4], "work_mode": r[5], "employment_type": r[6], "source": r[7],
+         "search_location": r[8]}
         for r in rows
     ]
 
@@ -92,6 +93,22 @@ def search_jobs(target_role=None, location=None, work_mode=None,
     # --- role filter: require a specializing term, not just a generic word ---
     role_matches = _role_matcher(target_role)
     filtered = [j for j in all_jobs if role_matches(j)]
+
+    # --- location filter (on search_location, NOT the messy display address) ---
+    # Jobs fetched FOR a location (Adzuna) carry search_location. A job is kept if:
+    #   - it has no search_location (seed/csv/scraped — location-agnostic pool), OR
+    #   - its search_location matches the requested location (case-insensitive).
+    # This filters on search INTENT, avoiding brittle parsing of "Plano, TX" -> "Texas".
+    if location and location.strip():
+        loc = location.strip().lower()
+
+        def location_ok(job):
+            sl = (job.get("search_location") or "").strip().lower()
+            if not sl:
+                return True          # not tied to a location search — always eligible
+            return sl == loc         # matches the location it was fetched for
+
+        filtered = [j for j in filtered if location_ok(j)]
 
     # --- work_mode filter (only excludes jobs that HAVE a mode and clearly conflict) ---
     # Location is intentionally NOT used to filter (informational only).
