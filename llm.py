@@ -15,12 +15,6 @@ INPUT_TOKEN_RATE = 0.075 / 1_000_000
 OUTPUT_TOKEN_RATE = 0.30 / 1_000_000
 
 
-class BudgetExceeded(Exception):
-    """Raised when an LLM call is refused because the run's request budget is spent.
-    Not a transient error — it must NOT be retried."""
-    pass
-
-
 def get_connection():
     return psycopg2.connect(
         dbname=os.getenv("DB_NAME"),
@@ -175,25 +169,6 @@ def record_context(step_id, context):
     conn.close()
 
 
-def record_judge_signals(step_id, judge_status, judge_skip_reason=None, cache_hit=None):
-    """
-    Store structured AgentOps signals for a job step:
-      judge_status      — 'ran' | 'skipped'
-      judge_skip_reason — 'score_extreme_low' | 'score_extreme_high' | 'budget' | None
-      cache_hit         — True if requirements came from cache this step, else False/None
-    Queryable columns (not JSONB) so aggregate stats — cache hit rate, skip-reason
-    distribution — are one SQL GROUP BY away.
-    """
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("""
-        UPDATE steps SET judge_status = %s, judge_skip_reason = %s, cache_hit = %s
-        WHERE id = %s
-    """, (judge_status, judge_skip_reason, cache_hit, step_id))
-    conn.commit()
-    conn.close()
-
-
 def is_cancel_requested(run_id):
     conn = get_connection()
     cur = conn.cursor()
@@ -264,16 +239,9 @@ def _log_llm_attempt(run_id, step_id, operation, prompt, response_text,
     conn.close()
 
 
-def logged_llm_call(prompt, run_id, step_id, operation="llm_call", max_retries=3, budget=None):
+def logged_llm_call(prompt, run_id, step_id, operation="llm_call", max_retries=3):
     last_error = None
     for attempt in range(1, max_retries + 1):
-        # Budget is enforced HERE, at the true unit of quota consumption (one HTTP
-        # attempt). Retries count. Every caller passing a budget is covered.
-        if budget is not None:
-            if not budget.can_spend():
-                raise BudgetExceeded(
-                    f"LLM budget reached before attempt {attempt} of {operation}")
-            budget.spend()
         start = time.time()
         try:
             result = real_llm_once(prompt)
@@ -288,8 +256,6 @@ def logged_llm_call(prompt, run_id, step_id, operation="llm_call", max_retries=3
                 "success", None, attempt, attempt - 1, result.get("provider_request_id")
             )
             return result["text"]
-        except BudgetExceeded:
-            raise   # budget stop is not transient — propagate immediately, no retry
         except Exception as e:
             latency_ms = int((time.time() - start) * 1000)
             last_error = e
@@ -308,13 +274,24 @@ def logged_llm_call(prompt, run_id, step_id, operation="llm_call", max_retries=3
         raise last_error
 
 
-def logged_tool_call(tool_name, tool_func, tool_input, run_id, step_id, operation=None):
+def logged_tool_call(tool_name, tool_func, tool_input, run_id, step_id,
+                     operation=None, swallow_errors=False):
+    """
+    Run a tool, trace it, and return its result. On error: ALWAYS log the failure
+    to the trace, then — by default — RE-RAISE it, so a real failure (e.g. a
+    PostgreSQL error) is not silently returned as None and mistaken for an empty
+    result. Pass swallow_errors=True only for per-item calls where a failure
+    should be caught-and-continued (e.g. one job's tool failing shouldn't kill the
+    whole run) — the caller then handles the None.
+    """
     start = time.time()
+    error = None
     try:
         result = tool_func(tool_input)
         status, error_message = "success", None
     except Exception as e:
         result, status, error_message = None, "failed", str(e)
+        error = e
     end = time.time()
     latency_ms = int((end - start) * 1000)
 
@@ -331,6 +308,10 @@ def logged_tool_call(tool_name, tool_func, tool_input, run_id, step_id, operatio
     ))
     conn.commit()
     conn.close()
+
+    # Logged the failure; now surface it unless the caller opted to swallow.
+    if error is not None and not swallow_errors:
+        raise error
     return result
 
 
