@@ -177,7 +177,21 @@ def do_process_job(state, run_id):
         requirements = _reqs_cache_get(dhash)
         cache_hit = requirements is not None
         if requirements is None:
-            requirements = extract_requirements(job, run_id, step_id, budget=state)
+            # Extract requirements: LLM when budget allows (best quality), else
+            # rule-based fallback (no LLM) so the job still gets requirements and
+            # never drops out just because quota ran out. Graceful degradation,
+            # same pattern as the judge.
+            if not state.budget_exceeded():
+                try:
+                    requirements = extract_requirements(job, run_id, step_id, budget=state)
+                except Exception as extract_err:
+                    from rule_requirements import extract_requirements_rule_based
+                    requirements = extract_requirements_rule_based(job)
+                    print(f"    requirements via rules (LLM failed: {extract_err}) — 0 LLM calls")
+            else:
+                from rule_requirements import extract_requirements_rule_based
+                requirements = extract_requirements_rule_based(job)
+                print(f"    requirements via rules (budget spent) — 0 LLM calls")
             _reqs_cache_put(dhash, requirements)
         else:
             print(f"    (requirements for '{job['title']}' served from cache — 0 LLM calls)")
