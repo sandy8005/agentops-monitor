@@ -1,5 +1,6 @@
 import psycopg2, os
 import re
+from datetime import datetime, timedelta
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -17,6 +18,9 @@ def get_connection():
         dbname=os.getenv("DB_NAME"), user=os.getenv("DB_USER"),
         password=os.getenv("DB_PASSWORD"), host=os.getenv("DB_HOST"), port=os.getenv("DB_PORT")
     )
+
+
+STALE_AFTER_DAYS = 14   # jobs not seen in this many days drop out of search
 
 
 def _role_matcher(target_role):
@@ -47,23 +51,52 @@ def _role_matcher(target_role):
     return matches
 
 
+# Source preference: when two rows are the same posting, keep the better one.
+# Adzuna (real search) > live/api (Remotive) > scraped > csv > seed.
+_SOURCE_RANK = {"adzuna": 5, "live": 4, "api": 3, "scraped": 2, "csv": 1, "seed": 0}
+
+
+def _dedupe_key(job):
+    """
+    Strongest available identity for a posting, in priority order:
+      1. external_id                 (stable per-posting id from the source)
+      2. apply/source URL            (unique per posting when present)
+      3. title + company + LOCATION  (same role in two cities stays distinct)
+    Including LOCATION in the fallback means 'AI Engineer @ Wipro' in Texas and
+    in California are treated as DIFFERENT jobs, not merged.
+    """
+    ext = (job.get("external_id") or "").strip().lower()
+    if ext:
+        return ("ext", ext)
+    url = (job.get("url") or job.get("source_url") or "").strip().lower()
+    if url:
+        return ("url", url)
+    return ("tcl",
+            (job.get("title") or "").strip().lower(),
+            (job.get("company") or "").strip().lower(),
+            (job.get("location") or "").strip().lower())
+
+
 def _dedupe_jobs(jobs):
     """
-    Collapse duplicate postings — the SAME job can enter the pool from multiple
-    sources (e.g. Remotive via both the 'api' batch and the 'live' fetch), as
-    separate rows. Dedupe on (title, company), case-insensitive, so each real
-    posting appears once. Keeps the first occurrence.
+    Collapse duplicate postings using the strongest available identity
+    (external_id -> URL -> title+company+location). On a collision, keep the row
+    from the PREFERRED source (Adzuna > Remotive > scraped > ...), so a better/
+    newer record wins over an older one instead of just 'first seen'.
     """
-    seen = set()
-    unique = []
+    best = {}
+    order = []
     for j in jobs:
-        key = ((j.get("title") or "").strip().lower(),
-               (j.get("company") or "").strip().lower())
-        if key in seen:
-            continue
-        seen.add(key)
-        unique.append(j)
-    return unique
+        key = _dedupe_key(j)
+        if key not in best:
+            best[key] = j
+            order.append(key)
+        else:
+            cur = best[key]
+            if (_SOURCE_RANK.get((j.get("source") or "").lower(), -1) >
+                    _SOURCE_RANK.get((cur.get("source") or "").lower(), -1)):
+                best[key] = j
+    return [best[k] for k in order]
 
 
 def search_jobs(target_role=None, location=None, work_mode=None,
@@ -73,7 +106,7 @@ def search_jobs(target_role=None, location=None, work_mode=None,
     # Select provenance (source) + search_location (what location a job was
     # FETCHED for) — both are valuable trace/filter context.
     cur.execute("""
-        SELECT id, title, company, description, location, work_mode, employment_type, source, search_location
+        SELECT id, title, company, description, location, work_mode, employment_type, source, search_location, external_id, last_seen_at
         FROM job_postings ORDER BY id
     """)
     rows = cur.fetchall()
@@ -82,9 +115,17 @@ def search_jobs(target_role=None, location=None, work_mode=None,
     all_jobs = [
         {"id": r[0], "title": r[1], "company": r[2], "description": r[3],
          "location": r[4], "work_mode": r[5], "employment_type": r[6], "source": r[7],
-         "search_location": r[8]}
+         "search_location": r[8], "external_id": r[9], "last_seen_at": r[10]}
         for r in rows
     ]
+
+    # --- freshness filter: drop jobs not seen recently ---
+    # Jobs with no last_seen_at (seed/csv/scraped — not time-based) are always fresh.
+    cutoff = datetime.now() - timedelta(days=STALE_AFTER_DAYS)
+    def _is_fresh(job):
+        ls = job.get("last_seen_at")
+        return ls is None or ls >= cutoff
+    all_jobs = [j for j in all_jobs if _is_fresh(j)]
 
     if not target_role:
         return all_jobs
