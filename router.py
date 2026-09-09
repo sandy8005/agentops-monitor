@@ -97,9 +97,22 @@ def do_parse_resume(state, run_id):
 
 
 def do_search_jobs(state, run_id):
-    """Search jobs (0 LLM calls). Traced via logged_tool_call for observability."""
+    """
+    Fetch LIVE jobs for this search, upsert them (dedup on external_id), then
+    search the COMBINED pool (seeded + live). Live fetch is best-effort — if it
+    fails (network/API), we simply search the existing pool. 0 LLM calls.
+    """
     step_id = create_step(run_id, "search_jobs", len(state.completed_actions))
     try:
+        # Refresh the pool with REAL live jobs matching this role + location
+        # (Adzuna does real search + location filtering). Best-effort — falls back
+        # to the existing pool if the API is unavailable or keys are missing.
+        try:
+            from adzuna_jobs import fetch_and_upsert_adzuna
+            fetch_and_upsert_adzuna(state.target_role, state.location)
+        except Exception as live_err:
+            print(f"    adzuna fetch skipped ({live_err}) — using existing pool")
+
         state.jobs = logged_tool_call(
             "search_jobs",
             lambda p: search_jobs(p["target_role"], p["location"],
