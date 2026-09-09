@@ -1,5 +1,4 @@
 import psycopg2, os
-import re
 from dotenv import load_dotenv
 load_dotenv()
 
@@ -29,22 +28,32 @@ def _role_matcher(target_role):
     specializing = [w for w in words if w not in GENERIC_ROLE_WORDS]
     generic = [w for w in words if w in GENERIC_ROLE_WORDS]
 
-    def _term_present(term, haystack_lower, haystack_tokens):
-        t = term.strip().lower()
-        if not t:
-            return False
-        if " " in t:                       # multi-word: phrase match
-            return t in haystack_lower
-        return t in haystack_tokens        # single word: WHOLE-WORD (token) match,
-                                           # so 'ml' won't match inside 'html'
-
     def matches(job):
-        haystack_lower = f"{job['title']} {job['description']}".lower()
-        haystack_tokens = set(re.findall(r"[a-z0-9\+\#\.]+", haystack_lower))
-        terms = specializing if specializing else generic
-        return any(_term_present(t, haystack_lower, haystack_tokens) for t in terms)
+        haystack = f"{job['title']} {job['description']}".lower()
+        if specializing:
+            return any(term in haystack for term in specializing)
+        return any(term in haystack for term in generic)
 
     return matches
+
+
+def _dedupe_jobs(jobs):
+    """
+    Collapse duplicate postings — the SAME job can enter the pool from multiple
+    sources (e.g. Remotive via both the 'api' batch and the 'live' fetch), as
+    separate rows. Dedupe on (title, company), case-insensitive, so each real
+    posting appears once in the results. Keeps the first occurrence.
+    """
+    seen = set()
+    unique = []
+    for j in jobs:
+        key = ((j.get("title") or "").strip().lower(),
+               (j.get("company") or "").strip().lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(j)
+    return unique
 
 
 def search_jobs(target_role=None, location=None, work_mode=None,
@@ -101,6 +110,9 @@ def search_jobs(target_role=None, location=None, work_mode=None,
             return jt == et
 
         filtered = [j for j in filtered if type_ok(j)]
+
+    # Collapse same-posting duplicates that entered via multiple sources.
+    filtered = _dedupe_jobs(filtered)
 
     # --- results handling: honest empty result, never manufactured jobs ---
     if len(filtered) == 0:
