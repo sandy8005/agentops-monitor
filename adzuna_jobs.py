@@ -85,7 +85,8 @@ def fetch_adzuna_jobs(role, location=None, limit=10):
                 j.get("contract_time"), j.get("contract_type")),
             "source": "adzuna",
             "search_location": (location or "").strip() or None,
-            "posted_at": j.get("created"),   # Adzuna's posting timestamp (ISO string)
+            "posted_at": j.get("created"), 
+            "apply_url": j.get("redirect_url"),  # Adzuna's posting timestamp (ISO string)
         })
     return out
 
