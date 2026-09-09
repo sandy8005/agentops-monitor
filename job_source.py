@@ -22,8 +22,9 @@ def get_connection():
 def _role_matcher(target_role):
     """
     Require at least one SPECIALIZING term from the query (e.g. 'ai', 'ml',
-    'backend'), so a generic word like 'engineer' alone does NOT pull in
-    unrelated roles. If the query is only generic words, match on those.
+    'backend'), matched as a WHOLE WORD — so short terms like 'ai'/'ml' don't
+    false-match inside 'airline'/'HTML'. Multi-word terms phrase-match. If the
+    query is only generic words, match on those.
     """
     words = [w.lower() for w in target_role.replace("/", " ").split() if w.strip()]
     specializing = [w for w in words if w not in GENERIC_ROLE_WORDS]
@@ -35,8 +36,7 @@ def _role_matcher(target_role):
             return False
         if " " in t:                       # multi-word: phrase match
             return t in haystack_lower
-        return t in haystack_tokens        # single word: WHOLE-WORD (token) match,
-                                           # so 'ml' won't match inside 'html'
+        return t in haystack_tokens        # single word: WHOLE-WORD (token) match
 
     def matches(job):
         haystack_lower = f"{job['title']} {job['description']}".lower()
@@ -52,7 +52,7 @@ def _dedupe_jobs(jobs):
     Collapse duplicate postings — the SAME job can enter the pool from multiple
     sources (e.g. Remotive via both the 'api' batch and the 'live' fetch), as
     separate rows. Dedupe on (title, company), case-insensitive, so each real
-    posting appears once in the results. Keeps the first occurrence.
+    posting appears once. Keeps the first occurrence.
     """
     seen = set()
     unique = []
@@ -70,9 +70,8 @@ def search_jobs(target_role=None, location=None, work_mode=None,
                 employment_type=None, min_results=3):
     conn = get_connection()
     cur = conn.cursor()
-    # Select provenance (source) too — for an observability tool, knowing WHERE
-    # each job came from (seed/csv/api/scraped) is valuable trace context that
-    # should survive downstream, not be dropped at the search boundary.
+    # Select provenance (source) + search_location (what location a job was
+    # FETCHED for) — both are valuable trace/filter context.
     cur.execute("""
         SELECT id, title, company, description, location, work_mode, employment_type, source, search_location
         FROM job_postings ORDER BY id
@@ -90,43 +89,47 @@ def search_jobs(target_role=None, location=None, work_mode=None,
     if not target_role:
         return all_jobs
 
-    # --- role filter: require a specializing term, not just a generic word ---
+    # --- role filter: whole-word specializing-term match ---
     role_matches = _role_matcher(target_role)
     filtered = [j for j in all_jobs if role_matches(j)]
 
-    # --- location filter (on search_location, NOT the messy display address) ---
-    # Jobs fetched FOR a location (Adzuna) carry search_location. A job is kept if:
-    #   - it has no search_location (seed/csv/scraped — location-agnostic pool), OR
-    #   - its search_location matches the requested location (case-insensitive).
-    # This filters on search INTENT, avoiding brittle parsing of "Plano, TX" -> "Texas".
+    # --- location filter (on search_location = fetch intent, not messy display address) ---
+    # Keep a job if it has no search_location (seed/csv/scraped — location-agnostic)
+    # OR its search_location matches the requested location.
     if location and location.strip():
         loc = location.strip().lower()
 
         def location_ok(job):
             sl = (job.get("search_location") or "").strip().lower()
             if not sl:
-                return True          # not tied to a location search — always eligible
-            return sl == loc         # matches the location it was fetched for
+                return True
+            return sl == loc
 
         filtered = [j for j in filtered if location_ok(j)]
 
-    # --- work_mode filter (only excludes jobs that HAVE a mode and clearly conflict) ---
-    # Location is intentionally NOT used to filter (informational only).
+    # --- work_mode filter (compatibility, not "remote is always OK") ---
+    # A job matches if: its mode is unknown (soft — don't exclude), OR equals the
+    # request, OR hybrid is involved (partial match either way). A remote job is
+    # correctly EXCLUDED from an onsite request (and vice versa).
     if work_mode:
-        wm = work_mode.lower()
+        wm = work_mode.lower().strip()
 
         def mode_ok(job):
-            jm = (job.get("work_mode") or "").lower()
+            jm = (job.get("work_mode") or "").lower().strip()
             jl = (job.get("location") or "").lower()
-            if not jm and "remote" not in jl:
-                return True
-            if "remote" in jm or "remote" in jl:
-                return True
-            return wm in jm
+            if not jm and "remote" in jl:
+                jm = "remote"
+            if not jm:
+                return True          # unknown mode → don't exclude (soft filter)
+            if wm == jm:
+                return True          # exact match
+            if "hybrid" in (wm, jm):
+                return True          # hybrid is a partial match either direction
+            return False             # clear conflict (e.g. remote job, onsite request)
 
         filtered = [j for j in filtered if mode_ok(j)]
 
-    # --- employment_type filter (SOFT: keep unknown-type jobs, exclude known mismatches) ---
+    # --- employment_type filter (SOFT: keep unknown-type, exclude known mismatch) ---
     if employment_type:
         et = employment_type.lower().strip()
 
