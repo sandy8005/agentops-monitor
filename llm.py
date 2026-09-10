@@ -15,6 +15,13 @@ INPUT_TOKEN_RATE = 0.075 / 1_000_000
 OUTPUT_TOKEN_RATE = 0.30 / 1_000_000
 
 
+class BudgetExceeded(Exception):
+    """Raised when an LLM call is refused because the run's request budget is spent.
+    NOT a transient error — must not be retried."""
+    pass
+
+
+
 def get_connection():
     return psycopg2.connect(
         dbname=os.getenv("DB_NAME"),
@@ -169,6 +176,36 @@ def record_context(step_id, context):
     conn.close()
 
 
+def record_judge_signals(step_id, judge_status, judge_skip_reason=None, cache_hit=None):
+    """Structured AgentOps signals per job step (queryable columns)."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        UPDATE steps SET judge_status = %s, judge_skip_reason = %s, cache_hit = %s
+        WHERE id = %s
+    """, (judge_status, judge_skip_reason, cache_hit, step_id))
+    conn.commit()
+    conn.close()
+
+
+def set_stop_reason(run_id, reason):
+    """Record WHY a run ended (queryable)."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("UPDATE runs SET stop_reason = %s WHERE id = %s", (reason, run_id))
+    conn.commit()
+    conn.close()
+
+
+def set_evaluation_status(run_id, status):
+    """Record whether LLM-as-judge evaluation ran for this run."""
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("UPDATE runs SET evaluation_status = %s WHERE id = %s", (status, run_id))
+    conn.commit()
+    conn.close()
+
+
 def is_cancel_requested(run_id):
     conn = get_connection()
     cur = conn.cursor()
@@ -204,7 +241,7 @@ def save_evaluation(run_id, step_id, evaluation):
     conn.close()
 
 
-def finish_run(run_id, status="success"):
+def finish_run(run_id, status="success", stop_reason=None):
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
@@ -215,6 +252,8 @@ def finish_run(run_id, status="success"):
                           FROM llm_calls WHERE run_id = %s)
         WHERE id = %s
     """, (datetime.now(), status, run_id, run_id, run_id))
+    if stop_reason is not None:
+        cur.execute("UPDATE runs SET stop_reason = %s WHERE id = %s", (stop_reason, run_id))
     conn.commit()
     conn.close()
 
@@ -239,9 +278,15 @@ def _log_llm_attempt(run_id, step_id, operation, prompt, response_text,
     conn.close()
 
 
-def logged_llm_call(prompt, run_id, step_id, operation="llm_call", max_retries=3):
+def logged_llm_call(prompt, run_id, step_id, operation="llm_call", max_retries=3, budget=None):
     last_error = None
     for attempt in range(1, max_retries + 1):
+        # Budget enforced HERE at the true unit (one HTTP attempt); retries count.
+        if budget is not None:
+            if not budget.can_spend():
+                raise BudgetExceeded(
+                    f"LLM budget reached before attempt {attempt} of {operation}")
+            budget.spend()
         start = time.time()
         try:
             result = real_llm_once(prompt)
@@ -256,6 +301,8 @@ def logged_llm_call(prompt, run_id, step_id, operation="llm_call", max_retries=3
                 "success", None, attempt, attempt - 1, result.get("provider_request_id")
             )
             return result["text"]
+        except BudgetExceeded:
+            raise   # budget stop is not transient — propagate, no retry
         except Exception as e:
             latency_ms = int((time.time() - start) * 1000)
             last_error = e
