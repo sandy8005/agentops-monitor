@@ -529,20 +529,31 @@ def start_run(background_tasks: BackgroundTasks, resume_id: int = None,
 
 
 @app.post("/runs/{run_id}/cancel")
-def cancel_run(run_id: int):
+def cancel_run(run_id: int, background_tasks: BackgroundTasks):
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("SELECT status FROM runs WHERE id = %s", (run_id,))
     row = cur.fetchone()
-    if not row:
-        conn.close()
-        raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
-    if row[0] != "running":
-        conn.close()
-        raise HTTPException(status_code=400, detail=f"Run {run_id} is not running (status: {row[0]})")
     conn.close()
-    request_cancel(run_id)
-    return {"run_id": run_id, "cancel_requested": True}
+    if not row:
+        raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
+    status = row[0]
+
+    if status == "running":
+        # Cooperative cancel: the running loop checks is_cancel_requested between jobs.
+        request_cancel(run_id)
+        return {"run_id": run_id, "cancel_requested": True}
+
+    if status == "waiting_for_human":
+        # Paused at an interrupt — not executing, so no loop is checking the flag.
+        # Set the flag AND resume the graph so it wakes, sees the cancel, and
+        # terminates through its normal 'cancelled' routing (no orphaned checkpoint).
+        request_cancel(run_id)
+        background_tasks.add_task(resume_agent_graph, run_id, "Skip", "cancelled by user")
+        return {"run_id": run_id, "cancel_requested": True, "resumed_to_cancel": True}
+
+    raise HTTPException(status_code=400,
+                        detail=f"Run {run_id} cannot be cancelled (status: {status})")
 
 
 @app.get("/runs/{run_id}")
