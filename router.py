@@ -149,6 +149,32 @@ def _reqs_cache_put(desc_hash, reqs):
     conn.close()
 
 
+_REAL_DECISIONS = {"Apply", "Maybe", "Skip"}
+
+
+def _compute_final_decision(score_decision, llm_decision, human_decision=None):
+    """
+    The AUTHORITATIVE decision that controls downstream ranking/advice:
+      human_decision  if a human reviewed (overrides everything)
+      else llm_decision  if the judge produced a real Apply/Maybe/Skip
+      else score_decision  (deterministic fallback)
+    """
+    if human_decision in _REAL_DECISIONS:
+        return human_decision
+    if llm_decision in _REAL_DECISIONS:
+        return llm_decision
+    return score_decision
+
+
+def _store_final_decision(step_id, final_decision):
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("UPDATE steps SET final_decision = %s WHERE id = %s",
+                (final_decision, step_id))
+    conn.commit()
+    conn.close()
+
+
 def _parse_decision(raw):
     cleaned = raw.strip().replace("```json", "").replace("```", "").strip()
     return JobDecision(**json.loads(cleaned)).decision.value
@@ -244,6 +270,11 @@ def do_process_job(state, run_id):
         needs_review = record_score(step_id, score, score_result["decision"],
                                     llm_decision, breakdown=score_result["breakdown"])
 
+        # Compute the authoritative decision (human > llm > score). Defaults to the
+        # best automated signal now; a human review overrides it later.
+        final_decision = _compute_final_decision(score_result["decision"], llm_decision)
+        _store_final_decision(step_id, final_decision)
+
         record_context(step_id, {
             "job_id": job.get("id"), "job_source": job.get("source"),
             "apply_url": job.get("apply_url"),
@@ -257,10 +288,11 @@ def do_process_job(state, run_id):
         record_judge_signals(step_id, judge_status, judge_skip_reason, cache_hit)
 
         state.job_results.append({
+            "step_id": step_id,
             "title": job["title"], "company": job["company"],
             "score": score, "decision": score_result["decision"],
-            "llm_decision": llm_decision, "needs_review": needs_review,
-            "apply_url": job.get("apply_url")
+            "llm_decision": llm_decision, "final_decision": final_decision,
+            "needs_review": needs_review, "apply_url": job.get("apply_url")
         })
 
         # Surface review status to the graph so routing can pause for a human.
@@ -364,7 +396,7 @@ def do_generate_advice(state, run_id, top_n=2):
     step_id = create_step(run_id, "generate_advice", len(state.completed_actions))
     try:
         viable = [r for r in (state.ranked or [])
-                  if r.get("decision") in ("Apply", "Maybe")][:top_n]
+                  if r.get("final_decision", r.get("decision")) in ("Apply", "Maybe")][:top_n]
         for r in viable:
             if state.budget_exceeded():
                 print("    (advice skipped - budget reached)")
@@ -400,12 +432,20 @@ def apply_human_decision(state, run_id, step_id, decision, comment=""):
     cur = conn.cursor()
     cur.execute("""
         UPDATE steps
-        SET review_status = %s, reviewed_at = %s, reviewer = %s, review_comment = %s
+        SET review_status = %s, reviewed_at = %s, reviewer = %s, review_comment = %s,
+            final_decision = %s
         WHERE id = %s
-    """, (decision, __import__("datetime").datetime.now(), "human", comment, step_id))
+    """, (decision, __import__("datetime").datetime.now(), "human", comment, decision, step_id))
     conn.commit()
     conn.close()
     state.human_decisions[str(step_id)] = {"decision": decision, "comment": comment}
+
+    # Make the human decision authoritative in the in-memory results too, so
+    # downstream ranking/advice (which read final_decision) use the human's call.
+    for r in state.job_results:
+        if r.get("step_id") == step_id:
+            r["final_decision"] = decision
+            break
 
 
 def dispatch(action, state, run_id):
