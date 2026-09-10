@@ -673,14 +673,23 @@ def resume_run(run_id: int, background_tasks: BackgroundTasks,
         raise HTTPException(status_code=400, detail="decision must be Apply, Maybe, or Skip")
     conn = get_connection()
     cur = conn.cursor()
+    # ATOMIC compare-and-swap: flip waiting_for_human -> running ONLY if still
+    # waiting. Prevents a double-click / concurrent request from resuming the same
+    # checkpoint twice — the DB guarantees exactly one winner (rowcount == 1).
+    cur.execute("""
+        UPDATE runs SET status = 'running'
+        WHERE id = %s AND status = 'waiting_for_human'
+    """, (run_id,))
+    won = cur.rowcount == 1
+    conn.commit()
     cur.execute("SELECT status FROM runs WHERE id = %s", (run_id,))
     row = cur.fetchone()
     conn.close()
     if not row:
         raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
-    if row[0] != "waiting_for_human":
-        raise HTTPException(status_code=400,
-                            detail=f"Run {run_id} is not awaiting review (status: {row[0]})")
+    if not won:
+        raise HTTPException(status_code=409,
+                            detail=f"Run {run_id} is not awaiting review (already {row[0]})")
     background_tasks.add_task(resume_agent_graph, run_id, decision, comment)
     return {"run_id": run_id, "resumed_with": decision}
 
