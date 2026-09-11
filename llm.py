@@ -171,7 +171,7 @@ def record_context(step_id, context):
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("UPDATE steps SET retrieved_context = %s WHERE id = %s",
-                (json.dumps(context), step_id))
+                (json.dumps(context, default=str), step_id))
     conn.commit()
     conn.close()
 
@@ -349,8 +349,8 @@ def logged_tool_call(tool_name, tool_func, tool_input, run_id, step_id,
         (run_id, step_id, tool_name, input_json, output_json, latency_ms, status, error_message, created_at, operation_name)
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     """, (
-        run_id, step_id, tool_name, json.dumps(tool_input),
-        json.dumps(result) if result is not None else None,
+        run_id, step_id, tool_name, json.dumps(tool_input, default=str),
+        json.dumps(result, default=str) if result is not None else None,
         latency_ms, status, error_message, datetime.now(), operation or tool_name
     ))
     conn.commit()
