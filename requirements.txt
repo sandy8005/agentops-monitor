@@ -1,50 +1,36 @@
-﻿annotated-doc==0.0.5
-annotated-types==0.7.0
-anyio==4.14.2
-beautifulsoup4==4.15.0
-certifi==2026.6.17
-cffi==2.1.0
-charset-normalizer==3.4.9
-click==8.4.2
-colorama==0.4.6
-cryptography==49.0.0
-distro==1.9.0
+﻿# AgentOps Monitor — direct dependencies, pinned to known-working versions.
+# A fresh clone: python -m venv venv; pip install -r requirements.txt
+
+# --- Web / API ---
 fastapi==0.141.1
-google-ai-generativelanguage==0.6.15
-google-api-core==2.32.0
-google-api-python-client==2.198.0
-google-auth==2.55.2
-google-auth-httplib2==0.4.0
-google-genai==2.12.1
-googleapis-common-protos==1.75.0
-grpcio==1.82.1
-grpcio-status==1.71.2
-h11==0.16.0
-httpcore==1.0.9
-httplib2==0.32.0
-httpx==0.28.1
-idna==3.18
-proto-plus==1.28.1
-protobuf==5.29.6
-psycopg2-binary==2.9.12
-pyasn1==0.6.4
-pyasn1_modules==0.4.2
-pycparser==3.0
-pydantic==2.13.4
-pydantic_core==2.46.4
-pyparsing==3.3.2
-pypdf==6.14.2
-python-dotenv==1.2.2
-python-multipart==0.0.32
-requests==2.34.2
-sniffio==1.3.1
-soupsieve==2.9.2
-starlette==1.3.1
-tenacity==9.1.4
-tqdm==4.69.0
-typing-inspection==0.4.2
-typing_extensions==4.16.0
-uritemplate==4.2.0
-urllib3==2.7.0
 uvicorn==0.52.0
-websockets==16.1.1
+python-multipart==0.0.32          # FastAPI file uploads (resume upload)
+starlette==1.3.1                  # FastAPI's ASGI framework (StaticFiles serving)
+
+# --- Database ---
+psycopg2-binary==2.9.12           # main app DB driver
+psycopg[binary]==3.3.5            # psycopg v3 — required by the LangGraph Postgres checkpointer
+psycopg-pool==3.3.1               # connection pool (checkpointer dependency)
+
+# --- LLM / Gemini ---
+google-genai==2.12.1
+
+# --- LangGraph agent orchestration + Postgres checkpointing ---
+langgraph==1.2.11
+langgraph-checkpoint==4.2.0
+langgraph-checkpoint-postgres==3.1.2
+
+# --- Data / parsing ---
+pydantic==2.13.4                  # validation throughout
+beautifulsoup4==4.15.0            # scraper + HTML description cleaning
+requests==2.34.2                  # Adzuna / Remotive APIs, scraper
+pypdf==6.14.2                     # resume PDF reading
+
+# --- Auth ---
+bcrypt==5.0.0                     # password hashing
+
+# --- Config ---
+python-dotenv==1.2.2              # .env loading
+
+# --- Testing ---
+pytest==9.1.1
