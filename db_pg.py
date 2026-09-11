@@ -13,7 +13,6 @@ conn = psycopg2.connect(
 )
 cur = conn.cursor()
 
-# runs: one row per agent run. Search config lives HERE (not on the resume).
 cur.execute("""
 CREATE TABLE IF NOT EXISTS runs (
     id SERIAL PRIMARY KEY,
@@ -24,16 +23,10 @@ CREATE TABLE IF NOT EXISTS runs (
     total_tokens INTEGER DEFAULT 0,
     total_cost NUMERIC(12,6) DEFAULT 0,
     resume_id INTEGER,
-    cancel_requested BOOLEAN DEFAULT FALSE,
-    target_role TEXT,
-    location TEXT,
-    work_mode TEXT,
-    employment_type TEXT,
-    evaluation_status TEXT DEFAULT 'not_requested'
+    cancel_requested BOOLEAN DEFAULT FALSE
 )
 """)
 
-# steps: one row per conceptual stage of a run.
 cur.execute("""
 CREATE TABLE IF NOT EXISTS steps (
     id SERIAL PRIMARY KEY,
@@ -49,20 +42,14 @@ CREATE TABLE IF NOT EXISTS steps (
     llm_decision TEXT,
     needs_human_review BOOLEAN DEFAULT FALSE,
     retrieved_context JSONB,
-    score_breakdown JSONB,
     review_status TEXT,
     reviewed_at TIMESTAMP,
     reviewer TEXT,
     review_comment TEXT,
-    review_reason TEXT,
-    judge_status TEXT,
-    judge_skip_reason TEXT,
-    cache_hit BOOLEAN,
     FOREIGN KEY (run_id) REFERENCES runs(id)
 )
 """)
 
-# llm_calls: one row per HTTP attempt (retries logged separately).
 cur.execute("""
 CREATE TABLE IF NOT EXISTS llm_calls (
     id SERIAL PRIMARY KEY,
@@ -78,16 +65,11 @@ CREATE TABLE IF NOT EXISTS llm_calls (
     created_at TIMESTAMP,
     status TEXT DEFAULT 'success',
     error_message TEXT,
-    operation_name TEXT,
-    attempt_number INTEGER DEFAULT 1,
-    retry_count INTEGER DEFAULT 0,
-    provider_request_id TEXT,
     FOREIGN KEY (run_id) REFERENCES runs(id),
     FOREIGN KEY (step_id) REFERENCES steps(id)
 )
 """)
 
-# tool_calls: one row per tool invocation, tagged with the conceptual operation.
 cur.execute("""
 CREATE TABLE IF NOT EXISTS tool_calls (
     id SERIAL PRIMARY KEY,
@@ -100,13 +82,11 @@ CREATE TABLE IF NOT EXISTS tool_calls (
     status TEXT,
     error_message TEXT,
     created_at TIMESTAMP,
-    operation_name TEXT,
     FOREIGN KEY (run_id) REFERENCES runs(id),
     FOREIGN KEY (step_id) REFERENCES steps(id)
 )
 """)
 
-# job_postings: the searchable job pool (populated by the four importers).
 cur.execute("""
 CREATE TABLE IF NOT EXISTS job_postings (
     id SERIAL PRIMARY KEY,
@@ -115,13 +95,11 @@ CREATE TABLE IF NOT EXISTS job_postings (
     description TEXT NOT NULL,
     location TEXT,
     work_mode TEXT,
-    employment_type TEXT,
     source TEXT DEFAULT 'seed',
     created_at TIMESTAMP DEFAULT NOW()
 )
 """)
 
-# resumes: the stored resume DOCUMENT. Search config lives on runs, not here.
 cur.execute("""
 CREATE TABLE IF NOT EXISTS resumes (
     id SERIAL PRIMARY KEY,
@@ -131,12 +109,10 @@ CREATE TABLE IF NOT EXISTS resumes (
     location TEXT,
     work_mode TEXT,
     employment_type TEXT,
-    is_deleted BOOLEAN DEFAULT FALSE,
     created_at TIMESTAMP DEFAULT NOW()
 )
 """)
 
-# evaluations: LLM-as-judge grades for a step's decision.
 cur.execute("""
 CREATE TABLE IF NOT EXISTS evaluations (
     id SERIAL PRIMARY KEY,
@@ -154,29 +130,6 @@ CREATE TABLE IF NOT EXISTS evaluations (
 )
 """)
 
-# --- Autonomous-agent caches (call reduction). A fresh install needs these so
-# the autonomous agent works immediately without running migrations. ---
-
-# parsed_resume_cache: reuse a parsed resume by content hash (skips the parse LLM call).
-cur.execute("""
-CREATE TABLE IF NOT EXISTS parsed_resume_cache (
-    resume_hash TEXT PRIMARY KEY,
-    parsed_json TEXT NOT NULL,
-    cache_version TEXT,
-    created_at TIMESTAMP DEFAULT NOW()
-)
-""")
-
-# job_reqs_cache: reuse extracted job requirements by description hash (skips the extract LLM call).
-cur.execute("""
-CREATE TABLE IF NOT EXISTS job_reqs_cache (
-    desc_hash TEXT PRIMARY KEY,
-    reqs_json TEXT NOT NULL,
-    cache_version TEXT,
-    created_at TIMESTAMP DEFAULT NOW()
-)
-""")
-
 conn.commit()
 conn.close()
-print("Postgres tables ready — complete schema: 9 tables (7 core + 2 autonomous caches), all columns.")
+print("Postgres tables ready (complete schema: 7 tables)")
