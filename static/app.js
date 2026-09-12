@@ -234,6 +234,13 @@ var NL = String.fromCharCode(10);
               html += ' <span class="agree">&#10003;</span>';
             }
           }
+          // after showing score/source/etc., if the job has an apply_url:
+          var ctx = s.retrieved_context || {};
+           if (ctx.apply_url) {
+            html += ' &nbsp; <a href="' + escapeHtml(ctx.apply_url) +
+           '" target="_blank" rel="noopener" style="color:#4 da6ff;">Apply →</a>';
+           style="color:#4da6ff;"
+           }
           // Score breakdown — shows WHERE the score came from, key context for review.
           if (s.score_breakdown) {
             const b = s.score_breakdown;
