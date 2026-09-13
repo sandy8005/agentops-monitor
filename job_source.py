@@ -29,29 +29,129 @@ LIVE_SOURCES = {"adzuna", "live"}
 PRACTICE_SOURCES = {"seed", "csv", "scraped", "api"}
 
 
+# --- Role aliases: expand a query term into equivalent phrases/abbreviations. ---
+# ONE-WAY expansion: a query for any phrase in a group also searches for every
+# other phrase in that group, so "ML Engineer" matches "machine learning" jobs and
+# vice-versa. A job's wording never pulls in an UNRELATED query — only the typed
+# query is expanded, not the job text. To extend, add a group (list of equivalent
+# phrases, any casing); every phrase in the group becomes a mutual alias.
+ROLE_ALIAS_GROUPS = [
+    ["ml", "machine learning"],
+    ["ai", "artificial intelligence"],
+    ["nlp", "natural language processing"],
+    ["cv", "computer vision"],
+    ["frontend", "front end", "front-end"],
+    ["backend", "back end", "back-end"],
+    ["fullstack", "full stack", "full-stack"],
+    ["devops", "sre", "site reliability"],
+    ["qa", "quality assurance", "test engineer", "sdet"],
+    ["data scientist", "ml scientist"],
+    ["data engineer", "data engineering"],
+    ["ios", "swift developer"],
+    ["android", "kotlin developer"],
+    ["pm", "product manager"],
+    ["ux", "user experience"],
+    ["ui", "user interface"],
+    ["k8s", "kubernetes"],
+]
+
+
+def _build_alias_index(groups):
+    """
+    Flatten the alias groups into a lookup: normalized phrase -> set of ALL
+    phrases in its group (including itself). Lets us expand a query term to every
+    equivalent phrase in one dict hit. Built once at import.
+    """
+    index = {}
+    for group in groups:
+        normalized = [p.strip().lower() for p in group if p and p.strip()]
+        phrase_set = set(normalized)
+        for phrase in normalized:
+            # If a phrase appears in two groups, union them (rare, but safe).
+            index.setdefault(phrase, set()).update(phrase_set)
+    return index
+
+
+_ALIAS_INDEX = _build_alias_index(ROLE_ALIAS_GROUPS)
+
+# Multi-word alias phrases, longest first, so we detect "machine learning" in a
+# raw query BEFORE it's split into single tokens (otherwise its alias 'ml' is
+# never triggered). Single-word aliases are handled by the normal token path.
+_MULTIWORD_ALIASES = sorted(
+    (p for p in _ALIAS_INDEX if " " in p),
+    key=lambda p: -len(p),
+)
+
+
+def _extract_query_terms(target_role):
+    """
+    Turn a raw query into the specializing/generic term lists, but FIRST pull out
+    any known multi-word alias phrases as single units (e.g. 'machine learning'),
+    so they can be alias-expanded. Remaining words are split and bucketed as
+    before. Multi-word phrases are always specializing.
+    """
+    raw = " " + target_role.replace("/", " ").lower() + " "
+    phrases = []
+    for phrase in _MULTIWORD_ALIASES:
+        pad = f" {phrase} "
+        if pad in raw:
+            phrases.append(phrase)
+            raw = raw.replace(pad, " ")   # consume it so its words aren't re-bucketed
+    leftover = [w for w in raw.split() if w.strip()]
+    specializing = phrases + [w for w in leftover if w not in GENERIC_ROLE_WORDS]
+    generic = [w for w in leftover if w in GENERIC_ROLE_WORDS]
+    return specializing, generic
+
+
+def _expand_terms(terms):
+    """
+    ONE-WAY query expansion: for each query term, add every alias in its group.
+    Order-stable and de-duplicated. Terms with no alias pass through unchanged.
+    """
+    expanded = []
+    seen = set()
+    for t in terms:
+        key = t.strip().lower()
+        group = _ALIAS_INDEX.get(key, {key})
+        for phrase in [key] + sorted(group - {key}):
+            if phrase and phrase not in seen:
+                seen.add(phrase)
+                expanded.append(phrase)
+    return expanded
+
+
 def _role_matcher(target_role):
     """
     Require at least one SPECIALIZING term from the query (e.g. 'ai', 'ml',
     'backend'), matched as a WHOLE WORD — so short terms like 'ai'/'ml' don't
     false-match inside 'airline'/'HTML'. Multi-word terms phrase-match. If the
     query is only generic words, match on those.
+
+    Each query term is first EXPANDED through the role-alias table (one-way), so
+    e.g. "ML Engineer" also matches "machine learning" postings AND "machine
+    learning engineer" matches "ML" postings — while keeping the same whole-word/
+    phrase rigor (an alias like 'ai' still won't hit 'airline').
     """
-    words = [w.lower() for w in target_role.replace("/", " ").split() if w.strip()]
-    specializing = [w for w in words if w not in GENERIC_ROLE_WORDS]
-    generic = [w for w in words if w in GENERIC_ROLE_WORDS]
+    specializing, generic = _extract_query_terms(target_role)
+
+    # Expand whichever set we'll actually match on, through the alias table.
+    base_terms = specializing if specializing else generic
+    terms = _expand_terms(base_terms)
 
     def _term_present(term, haystack_lower, haystack_tokens):
         t = term.strip().lower()
         if not t:
             return False
-        if " " in t:                       # multi-word: phrase match
+        # Multi-word OR hyphenated phrases ('front-end', 'machine learning') are
+        # phrase-matched against the raw text, since the tokenizer splits on space
+        # and hyphen and would never surface them as a single token.
+        if " " in t or "-" in t:
             return t in haystack_lower
         return t in haystack_tokens        # single word: WHOLE-WORD (token) match
 
     def matches(job):
         haystack_lower = f"{job['title']} {job['description']}".lower()
         haystack_tokens = set(re.findall(r"[a-z0-9\+\#\.]+", haystack_lower))
-        terms = specializing if specializing else generic
         return any(_term_present(t, haystack_lower, haystack_tokens) for t in terms)
 
     return matches
