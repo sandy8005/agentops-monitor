@@ -9,7 +9,8 @@ the per-run LLM request cap at the true unit of quota consumption.
 
 class AgentState:
     def __init__(self, goal, resume_id=None, target_role=None, location=None,
-                 work_mode=None, employment_type=None, evaluate=False):
+                 work_mode=None, employment_type=None, evaluate=False,
+                 live_only=False):
         # --- goal / inputs ---
         self.goal = goal
         self.resume_id = resume_id
@@ -18,6 +19,9 @@ class AgentState:
         self.work_mode = work_mode
         self.employment_type = employment_type
         self.evaluate = evaluate
+        # Live Mode: search ONLY live-sourced jobs this run fetched, never the
+        # seed/CSV/scraped practice pool.
+        self.live_only = live_only
 
         # --- accumulated results ---
         self.resume_text = None
@@ -77,7 +81,7 @@ class AgentState:
         "last_job_needs_review", "last_review_step_id", "last_review_info",
         "human_decisions",
         "goal", "resume_id", "target_role", "location", "work_mode",
-        "employment_type", "evaluate", "resume_text", "parsed_resume", "jobs",
+        "employment_type", "evaluate", "live_only", "resume_text", "parsed_resume", "jobs",
         "current_job_index", "job_results", "ranked", "ranking_done",
         "advice_done", "cancelled", "failed_jobs", "requirements_cache",
         "llm_calls_made", "max_llm_calls", "completed_actions", "done", "error",
@@ -93,7 +97,7 @@ class AgentState:
         obj = cls(goal=d["goal"], resume_id=d.get("resume_id"),
                   target_role=d.get("target_role"), location=d.get("location"),
                   work_mode=d.get("work_mode"), employment_type=d.get("employment_type"),
-                  evaluate=d.get("evaluate", False))
+                  evaluate=d.get("evaluate", False), live_only=d.get("live_only", False))
         for f in cls._FIELDS:
             if f in d:
                 setattr(obj, f, d[f])

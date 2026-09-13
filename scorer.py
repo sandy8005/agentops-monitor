@@ -27,14 +27,21 @@ def calculate_match_score(parsed_resume, requirements, resume_text, job=None, us
 
     insufficient = (len(required) == 0 and len(any_of_groups) == 0 and len(preferred) == 0)
 
-    breakdown = {}
+    # --- Scoring model ---------------------------------------------------------
+    # Each category contributes a FRACTION (0..1) of how well it's satisfied, and
+    # carries a base weight. The final score is the weighted average over only the
+    # categories that APPLY, times 100. "Preferred" is optional: when the job listed
+    # NO preferred skills there is nothing to score, so its weight is dropped and the
+    # remaining categories are renormalized proportionally (their relative weights
+    # are preserved). A perfect candidate therefore scores 100 whether or not the
+    # posting happened to list preferred skills. Required/projects/experience always
+    # apply (projects scores 0 if the required tech simply isn't in the resume's
+    # projects — that's a real signal, not an absent category).
+    BASE_WEIGHTS = {"required": 50.0, "preferred": 20.0, "projects": 15.0, "experience": 15.0}
+    fractions = {}       # category -> satisfied fraction in [0, 1]
+    applicable = {}      # category -> weight, only for categories that apply
 
-    # Required section — 50 pts. Flat required skills + any-of groups.
-    # A group counts as one item, satisfied if ANY of its alternatives is present.
-    # While scoring the required section, capture which required skills are
-    # present vs missing — this is the ACCURATE, whole-word, requirements-based
-    # evidence (computed against the STRUCTURED required list, so an "optional"
-    # skill that extraction placed in preferred is never counted as missing).
+    # Required — flat required skills + any-of groups (each group is one item).
     matched_required = []
     missing_required = []
     total_required_items = len(required) + len(any_of_groups)
@@ -52,11 +59,12 @@ def calculate_match_score(parsed_resume, requirements, resume_text, job=None, us
                 matched_required.append(" / ".join(group))
             else:
                 missing_required.append(" / ".join(group))
-        breakdown["required"] = round(50 * met / total_required_items, 1)
+        fractions["required"] = met / total_required_items
     else:
-        breakdown["required"] = 0.0
+        fractions["required"] = 0.0
+    applicable["required"] = BASE_WEIGHTS["required"]   # required always applies
 
-    # Preferred skills — 20 pts.
+    # Preferred — OPTIONAL. Applies only if the job actually listed preferred skills.
     matched_preferred = []
     missing_preferred = []
     if preferred:
@@ -65,15 +73,13 @@ def calculate_match_score(parsed_resume, requirements, resume_text, job=None, us
                 matched_preferred.append(s)
             else:
                 missing_preferred.append(s)
-        breakdown["preferred"] = round(20 * len(matched_preferred) / len(preferred), 1)
-    else:
-        breakdown["preferred"] = 0.0
+        fractions["preferred"] = len(matched_preferred) / len(preferred)
+        applicable["preferred"] = BASE_WEIGHTS["preferred"]
+    # else: no preferred skills to score → category ABSENT; its weight is not added
+    # to `applicable`, so it's redistributed across the present categories below.
 
-    # Project relevance — 15 pts. Uses the SAME group semantics as the required
-    # section: each flat required skill is one unit, and each any-of GROUP is one
-    # unit satisfied if ANY member appears in the projects. This keeps the project
-    # score consistent with the required score — a Django-only candidate gets full
-    # credit for a "Flask OR Django" group in BOTH sections, not half in projects.
+    # Project relevance — same group semantics as required (each flat skill / any-of
+    # group is one unit, satisfied if it appears in the candidate's project tech).
     def _in_projects(skill):
         s = skill.lower().strip()
         if " " in s:
@@ -89,19 +95,39 @@ def calculate_match_score(parsed_resume, requirements, resume_text, job=None, us
         for group in any_of_groups:
             if any(_in_projects(s) for s in group):
                 units_met += 1
-        breakdown["projects"] = round(15 * units_met / total_project_units, 1)
+        fractions["projects"] = units_met / total_project_units
     else:
-        breakdown["projects"] = 0.0
+        fractions["projects"] = 0.0
+    applicable["projects"] = BASE_WEIGHTS["projects"]   # projects always applies
 
-    # Experience — 15 pts.
+    # Experience.
     if candidate_years >= min_years:
-        breakdown["experience"] = 15.0
+        fractions["experience"] = 1.0
     elif min_years > 0:
-        breakdown["experience"] = round(15 * candidate_years / min_years, 1)
+        fractions["experience"] = candidate_years / min_years
     else:
-        breakdown["experience"] = 15.0
+        fractions["experience"] = 1.0
+    applicable["experience"] = BASE_WEIGHTS["experience"]   # experience always applies
 
-    total = round(sum(breakdown.values()), 1)
+    # --- Normalize over applicable weight and build the reported breakdown --------
+    # Renormalize the applicable weights so they still sum to 100 (this is where an
+    # absent optional category's weight is proportionally redistributed). The
+    # breakdown reports each present category's EARNED points on the normalized
+    # scale, rounded for display; the TOTAL is summed from the UNROUNDED earned
+    # points so per-bucket rounding can never push it past 100.
+    applicable_total = sum(applicable.values()) or 1.0
+    breakdown = {}
+    exact_total = 0.0
+    for cat in ("required", "preferred", "projects", "experience"):
+        if cat in applicable:
+            norm_weight = applicable[cat] * 100.0 / applicable_total
+            earned = fractions[cat] * norm_weight
+            exact_total += earned
+            breakdown[cat] = round(earned, 1)
+        else:
+            breakdown[cat] = 0.0   # absent optional category — shown as 0 for clarity
+
+    total = round(exact_total, 1)
 
     if insufficient:
         decision = "Maybe"
