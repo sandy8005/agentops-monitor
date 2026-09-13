@@ -36,9 +36,11 @@ def _resume_cache_key(resume_text):
     return _hash(f"{resume_text}|{parse_cache_version()}")
 
 
-def _reqs_cache_key(description):
-    """Versioned requirements-cache key: description + reqs/schema/model version."""
-    return _hash(f"{description}|{reqs_cache_version()}")
+def _reqs_cache_key(title, description):
+    """Versioned requirements-cache key: TITLE + description + reqs/schema/model
+    version. Including the title distinguishes postings that share a description
+    but differ by role, and lets a title-borne requirement signal affect the key."""
+    return _hash(f"{title}\n{description}|{reqs_cache_version()}")
 
 
 def load_resume(state, run_id):
@@ -129,24 +131,44 @@ def do_search_jobs(state, run_id):
 
 
 # --- requirements cache (#2, #12): a job's requirements don't depend on the
-# resume, so extract once per job description and reuse. ---
+# resume, so extract once per (title+description) and reuse. Each row also records
+# PROVENANCE — how it was produced (llm vs rule_based) and under which model/version
+# — so a cache hit is traceable and its quality is known. ---
 
 def _reqs_cache_get(desc_hash):
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT reqs_json FROM job_reqs_cache WHERE desc_hash = %s", (desc_hash,))
-    row = cur.fetchone()
-    conn.close()
-    return json.loads(row[0]) if row else None
-
-
-def _reqs_cache_put(desc_hash, reqs):
+    """
+    Return (reqs, provenance) on hit, or (None, None) on miss. provenance is a dict
+    {"extraction_method":..., "source_model":...} describing how the cached row was
+    produced, so callers can trace/trust it without re-extracting.
+    """
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
-        INSERT INTO job_reqs_cache (desc_hash, reqs_json, cache_version)
-        VALUES (%s, %s, %s) ON CONFLICT (desc_hash) DO NOTHING
-    """, (desc_hash, json.dumps(reqs), reqs_cache_version()))
+        SELECT reqs_json, extraction_method, source_model
+        FROM job_reqs_cache WHERE desc_hash = %s
+    """, (desc_hash,))
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return (None, None)
+    provenance = {"extraction_method": row[1], "source_model": row[2]}
+    return (json.loads(row[0]), provenance)
+
+
+def _reqs_cache_put(desc_hash, reqs, extraction_method):
+    """
+    Store a requirements row WITH provenance: the extraction_method ('llm' |
+    'rule_based') and the source_model/version it was produced under. Idempotent
+    (ON CONFLICT DO NOTHING) — first writer wins for a given key.
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        INSERT INTO job_reqs_cache
+            (desc_hash, reqs_json, cache_version, extraction_method, source_model)
+        VALUES (%s, %s, %s, %s, %s) ON CONFLICT (desc_hash) DO NOTHING
+    """, (desc_hash, json.dumps(reqs), reqs_cache_version(),
+          extraction_method, reqs_cache_version()))
     conn.commit()
     conn.close()
 
@@ -201,17 +223,19 @@ def do_process_job(state, run_id):
     step_id = create_step(run_id, job["title"], len(state.completed_actions))
     try:
         # 1. requirements FIRST — structured, optional-aware extraction (cached #2).
-        dhash = _reqs_cache_key(job["description"])
-        requirements = _reqs_cache_get(dhash)
+        dhash = _reqs_cache_key(job["title"], job["description"])
+        requirements, provenance = _reqs_cache_get(dhash)
         cache_hit = requirements is not None
         if requirements is None:
             # Extract requirements: LLM when budget allows (best quality), else
             # rule-based fallback (no LLM) so the job still gets requirements and
             # never drops out just because quota ran out. Graceful degradation,
             # same pattern as the judge.
+            extraction_method = "rule_based"   # default unless the LLM path succeeds
             if not state.budget_exceeded():
                 try:
                     requirements = extract_requirements(job, run_id, step_id, budget=state)
+                    extraction_method = "llm"
                 except Exception as extract_err:
                     from rule_requirements import extract_requirements_rule_based
                     requirements = extract_requirements_rule_based(job)
@@ -220,9 +244,11 @@ def do_process_job(state, run_id):
                 from rule_requirements import extract_requirements_rule_based
                 requirements = extract_requirements_rule_based(job)
                 print(f"    requirements via rules (budget spent) — 0 LLM calls")
-            _reqs_cache_put(dhash, requirements)
+            _reqs_cache_put(dhash, requirements, extraction_method)
         else:
-            print(f"    (requirements for '{job['title']}' served from cache — 0 LLM calls)")
+            method = (provenance or {}).get("extraction_method") or "unknown"
+            print(f"    (requirements for '{job['title']}' served from cache "
+                  f"[{method}] — 0 LLM calls)")
 
         # 2. deterministic score — traced (0 LLM calls), runs FIRST (#4)
         user_input = {
@@ -406,8 +432,9 @@ def do_generate_advice(state, run_id, top_n=2):
             job = next((j for j in state.jobs if j["title"] == r["title"]), None)
             if not job:
                 continue
-            dhash = _reqs_cache_key(job["description"])
-            requirements = _reqs_cache_get(dhash) or {
+            dhash = _reqs_cache_key(job["title"], job["description"])
+            cached_reqs, _prov = _reqs_cache_get(dhash)
+            requirements = cached_reqs or {
                 "required_skills": [], "required_any_of": [], "preferred_skills": [],
                 "min_years_experience": 0, "responsibilities": []
             }
@@ -466,3 +493,4 @@ def dispatch(action, state, run_id):
         do_generate_advice(state, run_id)
     else:
         raise NotImplementedError(f"unknown action '{action}'")
+    state.record_action(action)

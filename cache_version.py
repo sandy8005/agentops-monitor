@@ -11,7 +11,7 @@ stored on each row so you can query/prune by version.
 - MODEL_VERSION:  the Gemini model string in use (keep in sync with llm.py).
 """
 PARSER_VERSION = "1"
-REQS_VERSION = "1"
+REQS_VERSION = "2"   # bumped: cache key now includes TITLE + description (was desc-only)
 SCHEMA_VERSION = "1"
 MODEL_VERSION = "gemini-flash-latest"
 

@@ -10,6 +10,9 @@ cur.execute("""
 CREATE TABLE IF NOT EXISTS job_reqs_cache (
     desc_hash TEXT PRIMARY KEY,
     reqs_json TEXT NOT NULL,
+    cache_version TEXT,
+    extraction_method TEXT,
+    source_model TEXT,
     created_at TIMESTAMP DEFAULT NOW()
 )
 """)
