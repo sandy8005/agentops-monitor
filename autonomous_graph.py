@@ -268,10 +268,9 @@ def run_agent_graph(resume_id, target_role=None, location=None,
 
         # If the graph PAUSED at an interrupt, result carries "__interrupt__".
         if isinstance(result, dict) and result.get("__interrupt__"):
-            _mark_run_status(run_id, "waiting_for_human")
-            intr = result["__interrupt__"]
-            print(f"Run {run_id} PAUSED for human review: "
-                  f"{intr[0].value if intr else '(interrupt)'}")
+            payload = _extract_interrupt_payload(result)
+            _mark_run_status(run_id, "waiting_for_human", pending_review=payload)
+            print(f"Run {run_id} PAUSED for human review: {payload or '(interrupt)'}")
             return result
 
         final_state = result
@@ -286,10 +285,12 @@ def run_agent_graph(resume_id, target_role=None, location=None,
         else:
             final_status = "success"
         finish_run(run_id, final_status)
+        _clear_pending_review(run_id)   # run completed → no outstanding review
     except Exception as e:
         final_status = "failed"
         print(f"graph run failed: {e}")
         finish_run(run_id, final_status)
+        _clear_pending_review(run_id)   # failed too → clear any stale review card
 
     print(f"Run {run_id} (langgraph) finished: {final_status} "
           f"({final_state.get('llm_calls_made', 0)} LLM calls)")
@@ -302,14 +303,67 @@ def run_agent_graph(resume_id, target_role=None, location=None,
     return final_state
 
 
-def _mark_run_status(run_id, status):
-    """Set the run's status directly (used for waiting_for_human)."""
+def _extract_interrupt_payload(result):
+    """
+    Pull the value dict passed to interrupt() out of a paused graph result.
+    result["__interrupt__"] is a sequence of Interrupt objects; the first one's
+    .value is exactly the dict we sent in node_human_review
+    ({"type": "review_request", "step_id":..., "job_title":..., "score":..., ...}).
+    Returns that dict, or None if it can't be read.
+    """
+    try:
+        interrupts = result.get("__interrupt__") if isinstance(result, dict) else None
+        if not interrupts:
+            return None
+        value = interrupts[0].value
+        return value if isinstance(value, dict) else {"payload": value}
+    except Exception:
+        return None
+
+
+def _mark_run_status(run_id, status, pending_review="__unset__"):
+    """
+    Set the run's status. Also manages runs.pending_review:
+      - On a pause (status == 'waiting_for_human') pass the interrupt payload dict
+        as pending_review; it's persisted (JSONB) so the dashboard shows exactly
+        what the run is paused on, and a SECOND pause REPLACES the prior payload.
+      - For any other status transition, pending_review is CLEARED (set NULL) so a
+        finished/failed/cancelled run never shows a stale review card.
+    Pass pending_review explicitly to control it; the '__unset__' sentinel means
+    "apply the default policy for this status" (write on pause, clear otherwise).
+    """
+    import json
     from llm import get_connection
+
+    if pending_review == "__unset__":
+        # Default policy keyed off the status.
+        payload = None  # cleared for every non-waiting transition
+    else:
+        payload = pending_review
+    payload_json = json.dumps(payload) if payload is not None else None
+
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute("UPDATE runs SET status = %s WHERE id = %s", (status, run_id))
+    cur.execute(
+        "UPDATE runs SET status = %s, pending_review = %s WHERE id = %s",
+        (status, payload_json, run_id),
+    )
     conn.commit()
     conn.close()
+
+
+def _clear_pending_review(run_id):
+    """Clear runs.pending_review (set NULL). Called on any terminal transition so a
+    finished/failed/cancelled run never shows a stale review card. Best-effort."""
+    from llm import get_connection
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("UPDATE runs SET pending_review = NULL WHERE id = %s", (run_id,))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"    (clear pending_review failed: {e})")
 
 
 def resume_agent_graph(run_id, decision, comment=""):
@@ -328,7 +382,8 @@ def resume_agent_graph(run_id, decision, comment=""):
             config=config)
 
     if isinstance(result, dict) and result.get("__interrupt__"):
-        _mark_run_status(run_id, "waiting_for_human")
+        payload = _extract_interrupt_payload(result)
+        _mark_run_status(run_id, "waiting_for_human", pending_review=payload)
         print(f"Run {run_id} PAUSED again for the next review.")
         return result
 
@@ -341,6 +396,7 @@ def resume_agent_graph(run_id, decision, comment=""):
     else:
         status = "success"
     finish_run(run_id, status)
+    _clear_pending_review(run_id)   # resolved → clear the review card
     print(f"Run {run_id} resumed and finished: {status}")
     if fs.get("ranked"):
         print("\nRANKED JOBS:")
