@@ -116,9 +116,11 @@ def do_search_jobs(state, run_id):
         state.jobs = logged_tool_call(
             "search_jobs",
             lambda p: search_jobs(p["target_role"], p["location"],
-                                  p["work_mode"], p["employment_type"]),
+                                  p["work_mode"], p["employment_type"],
+                                  live_only=p["live_only"], run_id=p["run_id"]),
             {"target_role": state.target_role, "location": state.location,
-             "work_mode": state.work_mode, "employment_type": state.employment_type},
+             "work_mode": state.work_mode, "employment_type": state.employment_type,
+             "live_only": state.live_only, "run_id": run_id},
             run_id, step_id, operation="search_jobs")
         finish_step(step_id, "success")
     except Exception as e:
@@ -464,4 +466,3 @@ def dispatch(action, state, run_id):
         do_generate_advice(state, run_id)
     else:
         raise NotImplementedError(f"unknown action '{action}'")
-    state.record_action(action)

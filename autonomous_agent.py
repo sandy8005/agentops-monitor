@@ -15,7 +15,7 @@ TERMINAL = {"done", "fail", "finish_no_matches", "finish_budget","finish_cancell
 def run_agent_autonomous(resume_id, target_role=None, location=None,
                          work_mode=None, employment_type=None,
                          evaluate=False, run_id=None, max_llm_calls=30,
-                         max_steps=200):
+                         max_steps=200, live_only=False):
     """
     Drive the autonomous loop. Returns the final AgentState.
     max_steps is a hard safety bound so a planner bug can never loop forever (#20).
@@ -23,7 +23,8 @@ def run_agent_autonomous(resume_id, target_role=None, location=None,
     state = AgentState(
         goal="match resume to jobs", resume_id=resume_id,
         target_role=target_role, location=location,
-        work_mode=work_mode, employment_type=employment_type, evaluate=evaluate
+        work_mode=work_mode, employment_type=employment_type, evaluate=evaluate,
+        live_only=live_only
     )
     state.max_llm_calls = max_llm_calls
 

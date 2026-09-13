@@ -226,7 +226,7 @@ def build_graph(checkpointer=None):
 
 def run_agent_graph(resume_id, target_role=None, location=None,
                     work_mode=None, employment_type=None, evaluate=False,
-                    run_id=None, max_llm_calls=30):
+                    run_id=None, max_llm_calls=30, live_only=False):
     """
     LangGraph entry point — same signature as run_agent_autonomous.
     Builds the initial flat state, invokes the graph, derives the run status
@@ -242,6 +242,7 @@ def run_agent_graph(resume_id, target_role=None, location=None,
         goal="match resume to jobs", resume_id=resume_id,
         target_role=target_role, location=location,
         work_mode=work_mode, employment_type=employment_type, evaluate=evaluate,
+        live_only=live_only,
     )
     seed.max_llm_calls = max_llm_calls
     initial = _dump(seed, run_id)
@@ -344,4 +345,3 @@ def resume_agent_graph(run_id, decision, comment=""):
 if __name__ == "__main__":
     import sys
     rid = int(sys.argv[1]) if len(sys.argv) > 1 else 1
-    run_agent_graph(resume_id=rid, target_role="engineer")

@@ -499,7 +499,8 @@ def list_runs(limit: int = Query(20, ge=1, le=100)):
 @app.post("/runs")
 def start_run(background_tasks: BackgroundTasks, resume_id: int = None,
               target_role: str = "", location: str = "", work_mode: str = "",
-              employment_type: str = "", evaluate: bool = False):
+              employment_type: str = "", evaluate: bool = False,
+              live_only: bool = False):
     if resume_id is None:
         raise HTTPException(status_code=400, detail="resume_id is required; upload or pick a resume first")
     if not target_role.strip():
@@ -522,9 +523,10 @@ def start_run(background_tasks: BackgroundTasks, resume_id: int = None,
         run_agent_autonomous,
         resume_id=resume_id, target_role=target_role, location=location,
         work_mode=work_mode, employment_type=employment_type,
-        evaluate=evaluate, run_id=run_id
+        evaluate=evaluate, run_id=run_id, live_only=live_only
     )
     return {"run_id": run_id, "resume_id": resume_id, "target_role": target_role,
+            "live_only": live_only,
             "message": f"Run {run_id} started in background."}
 
 
@@ -647,7 +649,8 @@ def get_run(run_id: int):
 @app.post("/runs/graph")
 def start_graph_run(background_tasks: BackgroundTasks, resume_id: int = None,
                     target_role: str = "", location: str = "", work_mode: str = "",
-                    employment_type: str = "", evaluate: bool = False):
+                    employment_type: str = "", evaluate: bool = False,
+                    live_only: bool = False):
     """
     Start a LangGraph run that CAN pause for human review. Runs in PARALLEL to
     /runs (which uses the hand-rolled loop) so the pause/resume flow can be proven
@@ -672,8 +675,10 @@ def start_graph_run(background_tasks: BackgroundTasks, resume_id: int = None,
                         target_role=target_role, location=location,
                         work_mode=work_mode, employment_type=employment_type)
     background_tasks.add_task(run_agent_graph, resume_id, target_role, location,
-                             work_mode, employment_type, evaluate, run_id)
-    return {"run_id": run_id, "message": f"Graph run {run_id} started."}
+                             work_mode, employment_type, evaluate, run_id,
+                             live_only=live_only)
+    return {"run_id": run_id, "live_only": live_only,
+            "message": f"Graph run {run_id} started."}
 
 
 @app.post("/runs/{run_id}/resume")

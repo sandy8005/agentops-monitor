@@ -60,22 +60,53 @@ def test_dedupe_keeps_distinct_jobs():
     assert len(_dedupe_jobs(jobs)) == 2
 
 
-# ============ 3. Location filtering (Texas != New York) ============
-# search_jobs' location filter keeps: search_location==requested OR search_location is None.
+# ============ 3. Location filtering via PER-SEARCH association ============
+# Location is no longer a permanent column on the job. A job matches a location
+# if SOME search for that location returned it — i.e. the location is in the job's
+# association set. A job with NO association (seed/csv/scraped practice data) is
+# location-agnostic and kept in mixed mode. This mirrors search_jobs' location_ok.
 
 def _location_ok(job, requested):
     loc = requested.strip().lower()
-    sl = (job.get("search_location") or "").strip().lower()
-    return not sl or sl == loc
+    assoc = job.get("assoc_locations") or set()
+    if not assoc:
+        return True                 # unassociated → location-agnostic (practice data)
+    return loc in assoc
 
 def test_location_texas_excludes_new_york_adzuna():
-    assert _location_ok({"search_location": "Texas"}, "Texas") is True
-    assert _location_ok({"search_location": "New York"}, "Texas") is False   # excluded
+    # A live job associated only with a "New York" search is excluded from a Texas search.
+    assert _location_ok({"assoc_locations": {"texas"}}, "Texas") is True
+    assert _location_ok({"assoc_locations": {"new york"}}, "Texas") is False
+
+def test_location_same_job_matches_multiple_searches():
+    # The point of the association model: ONE posting can belong to several searches
+    # and match every location those searches were for.
+    j = {"assoc_locations": {"texas", "remote"}}
+    assert _location_ok(j, "Texas") is True
+    assert _location_ok(j, "Remote") is True
+    assert _location_ok(j, "California") is False
 
 def test_location_agnostic_jobs_always_kept():
-    # seed/csv/scraped jobs (no search_location) show in every location search
-    assert _location_ok({"search_location": None}, "Texas") is True
-    assert _location_ok({"search_location": None}, "California") is True
+    # seed/csv/scraped jobs (no association) show in every location search (mixed mode)
+    assert _location_ok({"assoc_locations": set()}, "Texas") is True
+    assert _location_ok({"assoc_locations": set()}, "California") is True
+
+
+# ============ 3b. Live Mode: practice data is separated out ============
+# Live Mode reads ONLY live-sourced jobs; seed/csv/scraped never appear.
+
+def _live_only_keep(job):
+    from job_source import LIVE_SOURCES
+    return (job.get("source") or "").lower() in LIVE_SOURCES
+
+def test_live_mode_excludes_practice_sources():
+    assert _live_only_keep({"source": "seed"}) is False
+    assert _live_only_keep({"source": "csv"}) is False
+    assert _live_only_keep({"source": "scraped"}) is False
+
+def test_live_mode_keeps_live_sources():
+    assert _live_only_keep({"source": "adzuna"}) is True
+    assert _live_only_keep({"source": "live"}) is True
 
 
 # ============ 4. Work-mode filtering (onsite != remote) ============
