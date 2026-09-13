@@ -336,7 +336,8 @@ def dashboard():
           html += '<div class="step ' + (review ? 'review' : '') + '">' +
             '<strong>' + escapeHtml(s.step_name) + '</strong> [' + escapeHtml(s.status) + ']';
           if (s.match_score !== null) {
-            html += ' - Score: ' + escapeHtml(s.match_score) + ' (' + escapeHtml(s.score_decision) + ') | LLM: ' + escapeHtml(s.llm_decision);
+            var finalDec = s.final_decision || s.llm_decision || s.score_decision;
+            html += ' - <strong>' + escapeHtml(finalDec) + '</strong>' + ' <span class="call">(score ' + escapeHtml(s.match_score) + ':' + escapeHtml(s.score_decision) + ', judge:' + escapeHtml(s.llm_decision) + ')</span>';
             if (review && s.review_status) {
               html += ' <span class="reviewed">&#9679; ' + escapeHtml(s.review_status.toUpperCase());
               if (s.reviewer) html += ' by ' + escapeHtml(s.reviewer);
@@ -576,7 +577,8 @@ def get_run(run_id: int):
     cur.execute("""
         SELECT id, step_name, status, match_score, score_decision,
                llm_decision, needs_human_review, review_status, error_message,
-               retrieved_context, reviewer, review_comment, review_reason, score_breakdown
+               retrieved_context, reviewer, review_comment, review_reason, score_breakdown,
+               final_decision
         FROM steps WHERE run_id = %s ORDER BY step_order
     """, (run_id,))
     step_rows = cur.fetchall()
@@ -627,6 +629,7 @@ def get_run(run_id: int):
             "error_message": s[8], "retrieved_context": s[9],
             "reviewer": s[10], "review_comment": s[11], "review_reason": s[12],
             "score_breakdown": s[13],
+            "final_decision": s[14],
             "tool_calls": tool_calls, "llm_calls": llm_calls,
             "evaluation": evaluation
         })
@@ -757,4 +760,3 @@ def submit_review(step_id: int, decision: str, reviewer: str = "anonymous", comm
     """, (decision, datetime.now(), reviewer or "anonymous", comment, step_id))
     conn.commit()
     conn.close()
-    return {"step_id": step_id, "review_status": decision, "reviewer": reviewer or "anonymous"}
