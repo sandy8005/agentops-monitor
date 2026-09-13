@@ -370,40 +370,83 @@ def resume_agent_graph(run_id, decision, comment=""):
     """
     Resume a paused run with the human's decision. Reopens the checkpointer,
     loads the checkpoint by thread_id, and continues via Command(resume=...).
-    May pause AGAIN for the next flagged job (returns __interrupt__ again).
-    """
-    with PostgresSaver.from_conn_string(_db_uri()) as checkpointer:
-        checkpointer.setup()
-        graph = build_graph(checkpointer=checkpointer)
-        config = {"configurable": {"thread_id": str(run_id)},
-                  "recursion_limit": 100}
-        result = graph.invoke(
-            Command(resume={"decision": decision, "comment": comment}),
-            config=config)
 
-    if isinstance(result, dict) and result.get("__interrupt__"):
-        payload = _extract_interrupt_payload(result)
-        _mark_run_status(run_id, "waiting_for_human", pending_review=payload)
-        print(f"Run {run_id} PAUSED again for the next review.")
+    Error handling: the whole resume is guarded (mirrors run_agent_graph). If the
+    graph invoke or post-processing raises, the run is finalized as 'failed' with
+    the error recorded and pending_review cleared - never left dangling in
+    'running' where it could neither resume nor complete.
+
+    Cancellation: if a cancel was requested for this run (e.g. cancel_run dispatched
+    this resume with decision='Skip'), the FINAL status is FORCED to 'cancelled'
+    regardless of how the graph exited - including when the graph would otherwise
+    pause AGAIN on the next flagged job. A cancel wins over a re-pause; we do not
+    re-enter waiting_for_human.
+    """
+    from llm import is_cancel_requested
+
+    cancel_requested = False
+    try:
+        cancel_requested = is_cancel_requested(run_id)
+    except Exception:
+        cancel_requested = False
+
+    try:
+        with PostgresSaver.from_conn_string(_db_uri()) as checkpointer:
+            checkpointer.setup()
+            graph = build_graph(checkpointer=checkpointer)
+            config = {"configurable": {"thread_id": str(run_id)},
+                      "recursion_limit": 100}
+            result = graph.invoke(
+                Command(resume={"decision": decision, "comment": comment}),
+                config=config)
+
+        paused_again = isinstance(result, dict) and result.get("__interrupt__")
+
+        # --- Cancel wins over everything, including a re-pause. ---
+        if cancel_requested:
+            finish_run(run_id, "cancelled", stop_reason="cancelled by user")
+            _clear_pending_review(run_id)
+            print(f"Run {run_id} cancelled during resume.")
+            return result
+
+        # --- Not cancelled: a fresh interrupt means pause again for the next job. ---
+        if paused_again:
+            payload = _extract_interrupt_payload(result)
+            _mark_run_status(run_id, "waiting_for_human", pending_review=payload)
+            print(f"Run {run_id} PAUSED again for the next review.")
+            return result
+
+        # --- Completed after resume. ---
+        fs = result
+        if fs.get("cancelled"):
+            status = "cancelled"
+        elif fs.get("error"):
+            status = "failed"
+        elif fs.get("failed_jobs", 0) > 0:
+            status = "completed_with_errors"
+        else:
+            status = "success"
+        finish_run(run_id, status)
+        _clear_pending_review(run_id)   # resolved -> clear the review card
+        print(f"Run {run_id} resumed and finished: {status}")
+        if fs.get("ranked"):
+            print("\nRANKED JOBS:")
+            for i, r in enumerate(fs["ranked"], 1):
+                print(f"{i}. {r['title']} ({r['company']}) - "
+                      f"score {r['score']} ({r['decision']}), judge: {r['llm_decision']}")
         return result
 
-    # completed after resume
-    fs = result
-    if fs.get("cancelled"):
-        status = "cancelled"
-    elif fs.get("failed_jobs", 0) > 0:
-        status = "completed_with_errors"
-    else:
-        status = "success"
-    finish_run(run_id, status)
-    _clear_pending_review(run_id)   # resolved → clear the review card
-    print(f"Run {run_id} resumed and finished: {status}")
-    if fs.get("ranked"):
-        print("\nRANKED JOBS:")
-        for i, r in enumerate(fs["ranked"], 1):
-            print(f"{i}. {r['title']} ({r['company']}) — "
-                  f"score {r['score']} ({r['decision']}), judge: {r['llm_decision']}")
-    return result
+    except Exception as e:
+        # A cancel that was requested still wins even if the resume errored out.
+        final = "cancelled" if cancel_requested else "failed"
+        reason = "cancelled by user" if cancel_requested else f"resume failed: {e}"
+        try:
+            finish_run(run_id, final, stop_reason=reason)
+            _clear_pending_review(run_id)
+        except Exception as fin_err:
+            print(f"    (failed to finalize run {run_id} after resume error: {fin_err})")
+        print(f"Run {run_id} resume {final}: {e}")
+        return {"error": str(e), "status": final}
 
 
 if __name__ == "__main__":
