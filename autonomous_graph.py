@@ -48,6 +48,7 @@ class GraphState(TypedDict, total=False):
     work_mode: Optional[str]
     employment_type: Optional[str]
     evaluate: bool
+    live_only: bool
     # accumulated results
     resume_text: Optional[str]
     parsed_resume: Optional[dict]
@@ -68,6 +69,13 @@ class GraphState(TypedDict, total=False):
     # misc
     requirements_cache: dict
     completed_actions: list
+    # human-in-the-loop review (LangGraph interrupt) — set by node_process_job,
+    # read by the review routing/interrupt. Serialized in AgentState._FIELDS, so
+    # they must be declared here too or they'd drop across a checkpoint.
+    last_job_needs_review: bool
+    last_review_step_id: Optional[int]
+    last_review_info: Optional[dict]
+    human_decisions: dict
 
 
 # --- Adapter helpers: dict <-> AgentState, so router.py stays unchanged. ---
@@ -345,3 +353,4 @@ def resume_agent_graph(run_id, decision, comment=""):
 if __name__ == "__main__":
     import sys
     rid = int(sys.argv[1]) if len(sys.argv) > 1 else 1
+    run_agent_graph(resume_id=rid, target_role="engineer")
