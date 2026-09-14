@@ -1,94 +1,457 @@
 """
-The autonomous agent driver: plan → act → repeat until the planner says stop.
-This loop IS the agent. All intelligence lives in the planner (what to do next,
-0 LLM calls) and the tools (which spend Gemini only where judgment is needed).
-The loop itself is deliberately tiny — that's the sign the design is right.
+LangGraph orchestration of the autonomous agent — TypedDict state edition.
+
+The graph state is now a FLAT, JSON-SERIALIZABLE TypedDict (not an AgentState
+object), so it can be checkpointed reliably by a persistence backend. Each node
+uses the ADAPTER pattern: hydrate an AgentState from the dict (from_dict), run the
+existing, unchanged router tool (which mutates the object), then return the flat
+dict (to_dict) for LangGraph to merge. router.py is UNTOUCHED — all its tested
+logic (caching, judge signals, budget, cancellation checks) is reused as-is.
+
+This is the foundation for LangGraph checkpointing + human-in-the-loop interrupts.
 """
+import os
+from typing import TypedDict, Optional, List
+from langgraph.graph import StateGraph, END
+from langgraph.types import interrupt, Command
+from langgraph.checkpoint.postgres import PostgresSaver
+
 from agent_state import AgentState
-from planner import plan_next_action
-from router import dispatch
+from router import (
+    load_resume, do_parse_resume, do_search_jobs, do_process_job,
+    do_rank_jobs, do_generate_advice, apply_human_decision,
+)
 from llm import create_run, finish_run
 
-TERMINAL = {"done", "fail", "finish_no_matches", "finish_budget","finish_cancelled"}
 
-
-def run_agent_autonomous(resume_id, target_role=None, location=None,
-                         work_mode=None, employment_type=None,
-                         evaluate=False, run_id=None, max_llm_calls=30,
-                         max_steps=200, live_only=False):
+def _db_uri():
     """
-    Drive the autonomous loop. Returns the final AgentState.
-    max_steps is a hard safety bound so a planner bug can never loop forever (#20).
+    libpq keyword/value connection string (NOT a URI). This avoids URI parsing
+    entirely, so special characters in the password (@, #, :, /) are safe —
+    a URI would mis-split on them. psycopg / PostgresSaver accept this format.
     """
-    state = AgentState(
-        goal="match resume to jobs", resume_id=resume_id,
-        target_role=target_role, location=location,
-        work_mode=work_mode, employment_type=employment_type, evaluate=evaluate,
-        live_only=live_only
-    )
-    state.max_llm_calls = max_llm_calls
+    return (f"host={os.getenv('DB_HOST')} port={os.getenv('DB_PORT')} "
+            f"dbname={os.getenv('DB_NAME')} user={os.getenv('DB_USER')} "
+            f"password={os.getenv('DB_PASSWORD')}")
 
+
+# --- Flat, serializable graph state. Every field is JSON-serializable so the
+# checkpointer can persist it across a pause/resume. Mirrors AgentState's fields
+# plus run_id. ---
+class GraphState(TypedDict, total=False):
+    run_id: int
+    # identity / config
+    goal: str
+    resume_id: int
+    target_role: Optional[str]
+    location: Optional[str]
+    work_mode: Optional[str]
+    employment_type: Optional[str]
+    evaluate: bool
+    live_only: bool
+    # accumulated results
+    resume_text: Optional[str]
+    parsed_resume: Optional[dict]
+    jobs: Optional[list]
+    current_job_index: int
+    job_results: list
+    ranked: Optional[list]
+    # control flags
+    ranking_done: bool
+    advice_done: bool
+    cancelled: bool
+    done: bool
+    error: Optional[str]
+    # budget & failure accounting
+    llm_calls_made: int
+    max_llm_calls: int
+    failed_jobs: int
+    # misc
+    requirements_cache: dict
+    completed_actions: list
+    # human-in-the-loop review (LangGraph interrupt) — set by node_process_job,
+    # read by the review routing/interrupt. Serialized in AgentState._FIELDS, so
+    # they must be declared here too or they'd drop across a checkpoint.
+    last_job_needs_review: bool
+    last_review_step_id: Optional[int]
+    last_review_info: Optional[dict]
+    human_decisions: dict
+
+
+# --- Adapter helpers: dict <-> AgentState, so router.py stays unchanged. ---
+
+def _hydrate(state: GraphState) -> AgentState:
+    """Rebuild an AgentState from the flat graph-state dict."""
+    return AgentState.from_dict(state)
+
+def _dump(s: AgentState, run_id: int) -> dict:
+    """Flatten an AgentState back to a serializable dict, carrying run_id."""
+    d = s.to_dict()
+    d["run_id"] = run_id
+    return d
+
+
+# --- Nodes: hydrate -> run existing tool -> return flat dict. ---
+
+def node_load_resume(state: GraphState) -> dict:
+    s = _hydrate(state)
+    load_resume(s, state["run_id"])
+    s.record_action("load_resume")
+    return _dump(s, state["run_id"])
+
+def node_parse_resume(state: GraphState) -> dict:
+    s = _hydrate(state)
+    do_parse_resume(s, state["run_id"])
+    s.record_action("parse_resume")
+    return _dump(s, state["run_id"])
+
+def node_search_jobs(state: GraphState) -> dict:
+    s = _hydrate(state)
+    do_search_jobs(s, state["run_id"])
+    s.record_action("search_jobs")
+    return _dump(s, state["run_id"])
+
+def node_process_job(state: GraphState) -> dict:
+    s = _hydrate(state)
+    do_process_job(s, state["run_id"])
+    s.record_action("process_job")
+    return _dump(s, state["run_id"])
+
+def node_human_review(state: GraphState) -> dict:
+    """
+    A flagged job pauses here for human review. interrupt() suspends the graph
+    (state is already checkpointed) and returns control to the caller. On resume
+    via Command(resume={"decision":..., "comment":...}), interrupt() RETURNS that
+    value, and we apply it as the authoritative decision.
+    """
+    s = _hydrate(state)
+    payload = s.last_review_info or {"step_id": s.last_review_step_id}
+    # --- PAUSE HERE. Resumes with the human's decision. ---
+    human = interrupt({"type": "review_request", **payload})
+    decision = (human or {}).get("decision", "Maybe")
+    comment = (human or {}).get("comment", "")
+    apply_human_decision(s, state["run_id"], s.last_review_step_id, decision, comment)
+    # clear the flag so we don't re-review on the next loop
+    s.last_job_needs_review = False
+    s.record_action("human_review")
+    return _dump(s, state["run_id"])
+
+
+def node_rank_jobs(state: GraphState) -> dict:
+    s = _hydrate(state)
+    do_rank_jobs(s, state["run_id"])
+    s.record_action("rank_jobs")
+    return _dump(s, state["run_id"])
+
+def node_generate_advice(state: GraphState) -> dict:
+    s = _hydrate(state)
+    do_generate_advice(s, state["run_id"])
+    s.record_action("generate_advice")
+    return _dump(s, state["run_id"])
+
+
+# --- Conditional routing: PURE PYTHON reading the flat dict. Zero LLM calls. ---
+
+def route_after_start(state: GraphState) -> str:
+    if state.get("error"):
+        return "fail"
+    return "parse_resume"
+
+def route_after_parse(state: GraphState) -> str:
+    if state.get("error"):
+        return "fail"
+    return "search_jobs"
+
+def route_after_search(state: GraphState) -> str:
+    if state.get("error"):
+        return "fail"
+    if not state.get("jobs"):            # honest empty — no jobs matched
+        return "no_matches"
+    return "process_job"
+
+def route_after_process_job(state: GraphState) -> str:
+    """Per-job LOOP with human-in-the-loop: a flagged job pauses for review.
+    NO budget short-circuit — over-budget jobs still get scored and skip the
+    judge cleanly (budget gates Gemini, not work)."""
+    if state.get("cancelled"):
+        return "cancelled"
+    if state.get("last_job_needs_review"):
+        return "human_review"                 # PAUSE for a human
+    if state.get("current_job_index", 0) < len(state.get("jobs") or []):
+        return "process_job"
+    return "rank_jobs"
+
+
+def route_after_human_review(state: GraphState) -> str:
+    """After the human decides: continue the job loop, or rank if done."""
+    if state.get("cancelled"):
+        return "cancelled"
+    if state.get("current_job_index", 0) < len(state.get("jobs") or []):
+        return "process_job"
+    return "rank_jobs"
+
+def route_after_rank(state: GraphState) -> str:
+    return "generate_advice"
+
+
+def build_graph(checkpointer=None):
+    g = StateGraph(GraphState)
+
+    g.add_node("load_resume", node_load_resume)
+    g.add_node("parse_resume", node_parse_resume)
+    g.add_node("search_jobs", node_search_jobs)
+    g.add_node("process_job", node_process_job)
+    g.add_node("human_review", node_human_review)
+    g.add_node("rank_jobs", node_rank_jobs)
+    g.add_node("generate_advice", node_generate_advice)
+
+    g.set_entry_point("load_resume")
+
+    g.add_conditional_edges("load_resume", route_after_start,
+                            {"parse_resume": "parse_resume", "fail": END})
+    g.add_conditional_edges("parse_resume", route_after_parse,
+                            {"search_jobs": "search_jobs", "fail": END})
+    g.add_conditional_edges("search_jobs", route_after_search,
+                            {"process_job": "process_job", "no_matches": END, "fail": END})
+    g.add_conditional_edges("process_job", route_after_process_job,
+                            {"process_job": "process_job", "rank_jobs": "rank_jobs",
+                             "human_review": "human_review", "cancelled": END})
+    g.add_conditional_edges("human_review", route_after_human_review,
+                            {"process_job": "process_job", "rank_jobs": "rank_jobs", "cancelled": END})
+    g.add_conditional_edges("rank_jobs", route_after_rank,
+                            {"generate_advice": "generate_advice"})
+    g.add_edge("generate_advice", END)
+
+    # Compile WITH the checkpointer if provided — that's what enables state
+    # persistence (and, later, interrupt/resume). Without it, a plain graph.
+    return g.compile(checkpointer=checkpointer)
+
+
+# NOTE: the graph is no longer compiled at import. The checkpointer holds a live
+# DB connection scoped to a `with` block, so the graph is built per-run inside
+# run_agent_graph. (A ConnectionPool could keep it warm later; simple first.)
+
+
+def run_agent_graph(resume_id, target_role=None, location=None,
+                    work_mode=None, employment_type=None, evaluate=False,
+                    run_id=None, max_llm_calls=30, live_only=False):
+    """
+    LangGraph entry point — same signature as run_agent_autonomous.
+    Builds the initial flat state, invokes the graph, derives the run status
+    from the FINAL state dict, and finalizes the run.
+    """
     if run_id is None:
-        run_id = create_run("autonomous job search", resume_id=resume_id,
+        run_id = create_run("autonomous job search (langgraph)", resume_id=resume_id,
                             target_role=target_role, location=location,
                             work_mode=work_mode, employment_type=employment_type)
 
-    steps_taken = 0
+    # Build the initial flat state via AgentState (so defaults match exactly).
+    seed = AgentState(
+        goal="match resume to jobs", resume_id=resume_id,
+        target_role=target_role, location=location,
+        work_mode=work_mode, employment_type=employment_type, evaluate=evaluate,
+        live_only=live_only,
+    )
+    seed.max_llm_calls = max_llm_calls
+    initial = _dump(seed, run_id)
+
     final_status = "success"
+    final_state = initial
 
     try:
-        while not state.done:
-            # hard safety bound — a planner that never returns a terminal action
-            # still can't loop forever.
-            if steps_taken >= max_steps:
-                state.error = f"max_steps ({max_steps}) exceeded — stopping"
-                final_status = "failed"
-                break
-            steps_taken += 1
+        with PostgresSaver.from_conn_string(_db_uri()) as checkpointer:
+            checkpointer.setup()
+            graph = build_graph(checkpointer=checkpointer)
+            config = {"configurable": {"thread_id": str(run_id)},
+                      "recursion_limit": 100}
+            result = graph.invoke(initial, config=config)
 
-            action = plan_next_action(state)   # planner decides — 0 LLM calls
+        # If the graph PAUSED at an interrupt, result carries "__interrupt__".
+        if isinstance(result, dict) and result.get("__interrupt__"):
+            payload = _extract_interrupt_payload(result)
+            _mark_run_status(run_id, "waiting_for_human", pending_review=payload)
+            print(f"Run {run_id} PAUSED for human review: {payload or '(interrupt)'}")
+            return result
 
-            if action in TERMINAL:
-                if action == "fail":
-                    final_status = "failed"
-                elif action == "finish_no_matches":
-                    final_status = "no_matches"
-                elif action == "finish_cancelled":
-                    final_status = "cancelled"
-                elif action == "finish_budget":
-                    final_status = "completed_with_errors"
-                    print(f"    ⚠ LLM call budget ({state.max_llm_calls}) reached — stopping early")
-                else:  # "done"
-                    final_status = ("completed_with_errors"
-                                    if state.failed_jobs > 0 else "success")
-                # 'done' → success
-                state.done = True
-                break
-
-            dispatch(action, state, run_id)    # router executes the tool
-
-            # if a tool set an error, the planner will route to 'fail' next loop
-        # end while
-
-        if state.error and final_status == "success":
+        final_state = result
+        if final_state.get("cancelled"):
+            final_status = "cancelled"
+        elif final_state.get("error"):
+            final_status = "failed"
+        elif final_state.get("jobs") is not None and len(final_state.get("jobs")) == 0:
+            final_status = "no_matches"
+        elif final_state.get("failed_jobs", 0) > 0:
             final_status = "completed_with_errors"
-
-    finally:
+        else:
+            final_status = "success"
         finish_run(run_id, final_status)
+        _clear_pending_review(run_id)   # run completed → no outstanding review
+    except Exception as e:
+        final_status = "failed"
+        print(f"graph run failed: {e}")
+        finish_run(run_id, final_status)
+        _clear_pending_review(run_id)   # failed too → clear any stale review card
 
-    print(f"Run {run_id} finished: {final_status} "
-          f"({state.llm_calls_made} LLM calls, {steps_taken} steps)")
-    if state.ranked:
+    print(f"Run {run_id} (langgraph) finished: {final_status} "
+          f"({final_state.get('llm_calls_made', 0)} LLM calls)")
+    ranked = final_state.get("ranked")
+    if ranked:
         print("\nRANKED JOBS:")
-        for i, r in enumerate(state.ranked, 1):
+        for i, r in enumerate(ranked, 1):
             print(f"{i}. {r['title']} ({r['company']}) — "
                   f"score {r['score']} -> {r.get('final_decision') or r['decision']} "
                   f"(score:{r['decision']}, judge:{r['llm_decision']})")
+    return final_state
 
-    return state
+
+def _extract_interrupt_payload(result):
+    """
+    Pull the value dict passed to interrupt() out of a paused graph result.
+    result["__interrupt__"] is a sequence of Interrupt objects; the first one's
+    .value is exactly the dict we sent in node_human_review
+    ({"type": "review_request", "step_id":..., "job_title":..., "score":..., ...}).
+    Returns that dict, or None if it can't be read.
+    """
+    try:
+        interrupts = result.get("__interrupt__") if isinstance(result, dict) else None
+        if not interrupts:
+            return None
+        value = interrupts[0].value
+        return value if isinstance(value, dict) else {"payload": value}
+    except Exception:
+        return None
+
+
+def _mark_run_status(run_id, status, pending_review="__unset__"):
+    """
+    Set the run's status. Also manages runs.pending_review:
+      - On a pause (status == 'waiting_for_human') pass the interrupt payload dict
+        as pending_review; it's persisted (JSONB) so the dashboard shows exactly
+        what the run is paused on, and a SECOND pause REPLACES the prior payload.
+      - For any other status transition, pending_review is CLEARED (set NULL) so a
+        finished/failed/cancelled run never shows a stale review card.
+    Pass pending_review explicitly to control it; the '__unset__' sentinel means
+    "apply the default policy for this status" (write on pause, clear otherwise).
+    """
+    import json
+    from llm import get_connection
+
+    if pending_review == "__unset__":
+        # Default policy keyed off the status.
+        payload = None  # cleared for every non-waiting transition
+    else:
+        payload = pending_review
+    payload_json = json.dumps(payload) if payload is not None else None
+
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE runs SET status = %s, pending_review = %s WHERE id = %s",
+        (status, payload_json, run_id),
+    )
+    conn.commit()
+    conn.close()
+
+
+def _clear_pending_review(run_id):
+    """Clear runs.pending_review (set NULL). Called on any terminal transition so a
+    finished/failed/cancelled run never shows a stale review card. Best-effort."""
+    from llm import get_connection
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("UPDATE runs SET pending_review = NULL WHERE id = %s", (run_id,))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"    (clear pending_review failed: {e})")
+
+
+def resume_agent_graph(run_id, decision, comment=""):
+    """
+    Resume a paused run with the human's decision. Reopens the checkpointer,
+    loads the checkpoint by thread_id, and continues via Command(resume=...).
+
+    Error handling: the whole resume is guarded (mirrors run_agent_graph). If the
+    graph invoke or post-processing raises, the run is finalized as 'failed' with
+    the error recorded and pending_review cleared - never left dangling in
+    'running' where it could neither resume nor complete.
+
+    Cancellation: if a cancel was requested for this run (e.g. cancel_run dispatched
+    this resume with decision='Skip'), the FINAL status is FORCED to 'cancelled'
+    regardless of how the graph exited - including when the graph would otherwise
+    pause AGAIN on the next flagged job. A cancel wins over a re-pause; we do not
+    re-enter waiting_for_human.
+    """
+    from llm import is_cancel_requested
+
+    cancel_requested = False
+    try:
+        cancel_requested = is_cancel_requested(run_id)
+    except Exception:
+        cancel_requested = False
+
+    try:
+        with PostgresSaver.from_conn_string(_db_uri()) as checkpointer:
+            checkpointer.setup()
+            graph = build_graph(checkpointer=checkpointer)
+            config = {"configurable": {"thread_id": str(run_id)},
+                      "recursion_limit": 100}
+            result = graph.invoke(
+                Command(resume={"decision": decision, "comment": comment}),
+                config=config)
+
+        paused_again = isinstance(result, dict) and result.get("__interrupt__")
+
+        # --- Cancel wins over everything, including a re-pause. ---
+        if cancel_requested:
+            finish_run(run_id, "cancelled", stop_reason="cancelled by user")
+            _clear_pending_review(run_id)
+            print(f"Run {run_id} cancelled during resume.")
+            return result
+
+        # --- Not cancelled: a fresh interrupt means pause again for the next job. ---
+        if paused_again:
+            payload = _extract_interrupt_payload(result)
+            _mark_run_status(run_id, "waiting_for_human", pending_review=payload)
+            print(f"Run {run_id} PAUSED again for the next review.")
+            return result
+
+        # --- Completed after resume. ---
+        fs = result
+        if fs.get("cancelled"):
+            status = "cancelled"
+        elif fs.get("error"):
+            status = "failed"
+        elif fs.get("failed_jobs", 0) > 0:
+            status = "completed_with_errors"
+        else:
+            status = "success"
+        finish_run(run_id, status)
+        _clear_pending_review(run_id)   # resolved -> clear the review card
+        print(f"Run {run_id} resumed and finished: {status}")
+        if fs.get("ranked"):
+            print("\nRANKED JOBS:")
+            for i, r in enumerate(fs["ranked"], 1):
+                print(f"{i}. {r['title']} ({r['company']}) - "
+                      f"score {r['score']} -> {r.get('final_decision') or r['decision']} "
+                      f"(score:{r['decision']}, judge:{r['llm_decision']})")
+        return result
+
+    except Exception as e:
+        # A cancel that was requested still wins even if the resume errored out.
+        final = "cancelled" if cancel_requested else "failed"
+        reason = "cancelled by user" if cancel_requested else f"resume failed: {e}"
+        try:
+            finish_run(run_id, final, stop_reason=reason)
+            _clear_pending_review(run_id)
+        except Exception as fin_err:
+            print(f"    (failed to finalize run {run_id} after resume error: {fin_err})")
+        print(f"Run {run_id} resume {final}: {e}")
+        return {"error": str(e), "status": final}
 
 
 if __name__ == "__main__":
     import sys
     rid = int(sys.argv[1]) if len(sys.argv) > 1 else 1
-    run_agent_autonomous(resume_id=rid, target_role="engineer")
+    run_agent_graph(resume_id=rid, target_role="engineer")
