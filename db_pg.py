@@ -1,14 +1,3 @@
-"""
-Complete schema builder for AgentOps Monitor.
-
-Running `python db_pg.py` on a FRESH database creates every table and column the
-current code expects — ZERO migrations needed. This is the authoritative schema,
-rebuilt to match the working database exactly (all live-job, review, judge-signal,
-freshness, and cache columns included).
-
-Note: the checkpoint_* tables (LangGraph's Postgres checkpointer) are created
-automatically by PostgresSaver.setup() at first graph run — not here.
-"""
 import psycopg2
 import os
 from dotenv import load_dotenv
@@ -16,12 +5,14 @@ from dotenv import load_dotenv
 load_dotenv()
 
 conn = psycopg2.connect(
-    dbname=os.getenv("DB_NAME"), user=os.getenv("DB_USER"),
-    password=os.getenv("DB_PASSWORD"), host=os.getenv("DB_HOST"), port=os.getenv("DB_PORT")
+    dbname=os.getenv("DB_NAME"),
+    user=os.getenv("DB_USER"),
+    password=os.getenv("DB_PASSWORD"),
+    host=os.getenv("DB_HOST"),
+    port=os.getenv("DB_PORT")
 )
 cur = conn.cursor()
 
-# runs: one row per agent run. Search config + evaluation/stop tracking + paused review.
 cur.execute("""
 CREATE TABLE IF NOT EXISTS runs (
     id SERIAL PRIMARY KEY,
@@ -32,18 +23,10 @@ CREATE TABLE IF NOT EXISTS runs (
     total_tokens INTEGER DEFAULT 0,
     total_cost NUMERIC(12,6) DEFAULT 0,
     resume_id INTEGER,
-    cancel_requested BOOLEAN DEFAULT FALSE,
-    target_role TEXT,
-    location TEXT,
-    work_mode TEXT,
-    employment_type TEXT,
-    evaluation_status TEXT DEFAULT 'not_requested',
-    stop_reason TEXT,
-    pending_review JSONB
+    cancel_requested BOOLEAN DEFAULT FALSE
 )
 """)
 
-# steps: one row per conceptual stage. Includes review + judge-signal + final_decision.
 cur.execute("""
 CREATE TABLE IF NOT EXISTS steps (
     id SERIAL PRIMARY KEY,
@@ -63,17 +46,10 @@ CREATE TABLE IF NOT EXISTS steps (
     reviewed_at TIMESTAMP,
     reviewer TEXT,
     review_comment TEXT,
-    review_reason TEXT,
-    score_breakdown JSONB,
-    judge_status TEXT,
-    judge_skip_reason TEXT,
-    cache_hit BOOLEAN,
-    final_decision TEXT,
     FOREIGN KEY (run_id) REFERENCES runs(id)
 )
 """)
 
-# llm_calls: one row per HTTP attempt.
 cur.execute("""
 CREATE TABLE IF NOT EXISTS llm_calls (
     id SERIAL PRIMARY KEY,
@@ -89,16 +65,11 @@ CREATE TABLE IF NOT EXISTS llm_calls (
     created_at TIMESTAMP,
     status TEXT DEFAULT 'success',
     error_message TEXT,
-    operation_name TEXT,
-    attempt_number INTEGER DEFAULT 1,
-    retry_count INTEGER DEFAULT 0,
-    provider_request_id TEXT,
     FOREIGN KEY (run_id) REFERENCES runs(id),
     FOREIGN KEY (step_id) REFERENCES steps(id)
 )
 """)
 
-# tool_calls: one row per tool invocation.
 cur.execute("""
 CREATE TABLE IF NOT EXISTS tool_calls (
     id SERIAL PRIMARY KEY,
@@ -111,13 +82,11 @@ CREATE TABLE IF NOT EXISTS tool_calls (
     status TEXT,
     error_message TEXT,
     created_at TIMESTAMP,
-    operation_name TEXT,
     FOREIGN KEY (run_id) REFERENCES runs(id),
     FOREIGN KEY (step_id) REFERENCES steps(id)
 )
 """)
 
-# job_postings: the searchable pool. Includes live-job + freshness + apply_url columns.
 cur.execute("""
 CREATE TABLE IF NOT EXISTS job_postings (
     id SERIAL PRIMARY KEY,
@@ -126,24 +95,51 @@ CREATE TABLE IF NOT EXISTS job_postings (
     description TEXT NOT NULL,
     location TEXT,
     work_mode TEXT,
-    source TEXT DEFAULT 'seed',
-    created_at TIMESTAMP DEFAULT NOW(),
     employment_type TEXT,
+    source TEXT DEFAULT 'seed',
     external_id TEXT,
-    search_location TEXT,
+    search_location TEXT,          -- legacy; superseded by job_search_results (kept nullable)
     fetched_at TIMESTAMP,
     last_seen_at TIMESTAMP,
     posted_at TIMESTAMP,
-    apply_url TEXT
+    apply_url TEXT,
+    created_at TIMESTAMP DEFAULT NOW()
 )
 """)
-# unique index for dedup upserts (partial: only where external_id is set)
+# Live jobs dedup on external_id (partial unique: seeded rows keep NULL).
 cur.execute("""
     CREATE UNIQUE INDEX IF NOT EXISTS job_postings_external_id_uniq
     ON job_postings (external_id) WHERE external_id IS NOT NULL
 """)
 
-# resumes: stored resume document. Soft-delete via is_deleted.
+# --- Per-search association (Live Mode + many-to-many job↔search) ---
+# One row per live search performed; carries the role/location intent that used
+# to be stamped permanently onto each job as search_location.
+cur.execute("""
+CREATE TABLE IF NOT EXISTS job_searches (
+    id SERIAL PRIMARY KEY,
+    run_id INTEGER,
+    target_role TEXT,
+    location TEXT,
+    source TEXT,
+    created_at TIMESTAMP DEFAULT NOW(),
+    FOREIGN KEY (run_id) REFERENCES runs(id)
+)
+""")
+# Many-to-many between a search and the postings it returned.
+cur.execute("""
+CREATE TABLE IF NOT EXISTS job_search_results (
+    search_id INTEGER NOT NULL,
+    job_id INTEGER NOT NULL,
+    PRIMARY KEY (search_id, job_id),
+    FOREIGN KEY (search_id) REFERENCES job_searches(id) ON DELETE CASCADE,
+    FOREIGN KEY (job_id) REFERENCES job_postings(id) ON DELETE CASCADE
+)
+""")
+cur.execute("CREATE INDEX IF NOT EXISTS job_search_results_search_idx ON job_search_results (search_id)")
+cur.execute("CREATE INDEX IF NOT EXISTS job_search_results_job_idx ON job_search_results (job_id)")
+cur.execute("CREATE INDEX IF NOT EXISTS job_searches_run_idx ON job_searches (run_id)")
+
 cur.execute("""
 CREATE TABLE IF NOT EXISTS resumes (
     id SERIAL PRIMARY KEY,
@@ -153,12 +149,10 @@ CREATE TABLE IF NOT EXISTS resumes (
     location TEXT,
     work_mode TEXT,
     employment_type TEXT,
-    is_deleted BOOLEAN DEFAULT FALSE,
     created_at TIMESTAMP DEFAULT NOW()
 )
 """)
 
-# evaluations: LLM-as-judge grades for a step's decision.
 cur.execute("""
 CREATE TABLE IF NOT EXISTS evaluations (
     id SERIAL PRIMARY KEY,
@@ -176,37 +170,37 @@ CREATE TABLE IF NOT EXISTS evaluations (
 )
 """)
 
-# users: auth (bcrypt password hashes).
+# Persisted final ranked list (self-contained snapshot rows) + generated advice.
 cur.execute("""
-CREATE TABLE IF NOT EXISTS users (
+CREATE TABLE IF NOT EXISTS run_rankings (
     id SERIAL PRIMARY KEY,
-    username TEXT UNIQUE NOT NULL,
-    password_hash TEXT NOT NULL,
-    role TEXT DEFAULT 'user',
-    created_at TIMESTAMP DEFAULT NOW()
+    run_id INTEGER NOT NULL,
+    job_id INTEGER,
+    rank_position INTEGER NOT NULL,
+    title TEXT,
+    company TEXT,
+    score DOUBLE PRECISION,
+    final_decision TEXT,
+    apply_url TEXT,
+    created_at TIMESTAMP DEFAULT NOW(),
+    FOREIGN KEY (run_id) REFERENCES runs(id)
 )
 """)
+cur.execute("CREATE INDEX IF NOT EXISTS run_rankings_run_idx ON run_rankings (run_id)")
 
-# --- Autonomous-agent caches (call reduction), versioned. ---
 cur.execute("""
-CREATE TABLE IF NOT EXISTS parsed_resume_cache (
-    resume_hash TEXT PRIMARY KEY,
-    parsed_json TEXT NOT NULL,
-    cache_version TEXT,
-    created_at TIMESTAMP DEFAULT NOW()
+CREATE TABLE IF NOT EXISTS run_advice (
+    id SERIAL PRIMARY KEY,
+    run_id INTEGER NOT NULL,
+    job_id INTEGER,
+    title TEXT,
+    advice TEXT NOT NULL,
+    created_at TIMESTAMP DEFAULT NOW(),
+    FOREIGN KEY (run_id) REFERENCES runs(id)
 )
 """)
-cur.execute("""
-CREATE TABLE IF NOT EXISTS job_reqs_cache (
-    desc_hash TEXT PRIMARY KEY,
-    reqs_json TEXT NOT NULL,
-    cache_version TEXT,
-    created_at TIMESTAMP DEFAULT NOW()
-)
-""")
+cur.execute("CREATE INDEX IF NOT EXISTS run_advice_run_idx ON run_advice (run_id)")
 
 conn.commit()
 conn.close()
-print("Postgres schema ready — complete current schema (10 app tables, all columns). "
-      "Fresh install needs zero migrations. (LangGraph checkpoint_* tables auto-create "
-      "on first graph run.)")
+print("Postgres tables ready (complete schema: 11 tables)")

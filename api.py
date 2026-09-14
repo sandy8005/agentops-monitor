@@ -713,6 +713,49 @@ def resume_run(run_id: int, background_tasks: BackgroundTasks,
     return {"run_id": run_id, "resumed_with": decision}
 
 
+@app.get("/runs/{run_id}/rankings")
+def get_run_rankings(run_id: int):
+    """
+    The persisted final ranked list for a run (self-contained snapshot rows from
+    run_rankings), with any generated advice joined in from run_advice. Ordered by
+    rank_position. Returns [] if the run produced no ranking.
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT 1 FROM runs WHERE id = %s", (run_id,))
+    if not cur.fetchone():
+        conn.close()
+        raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
+
+    # advice keyed by job_id (and by title as a fallback for legacy rows)
+    cur.execute("SELECT job_id, title, advice FROM run_advice WHERE run_id = %s", (run_id,))
+    advice_by_job = {}
+    advice_by_title = {}
+    for job_id, title, advice in cur.fetchall():
+        if job_id is not None:
+            advice_by_job[job_id] = advice
+        if title:
+            advice_by_title[title] = advice
+
+    cur.execute("""
+        SELECT rank_position, job_id, title, company, score, final_decision, apply_url
+        FROM run_rankings WHERE run_id = %s ORDER BY rank_position
+    """, (run_id,))
+    rows = cur.fetchall()
+    conn.close()
+
+    rankings = []
+    for pos, job_id, title, company, score, final_decision, apply_url in rows:
+        advice = advice_by_job.get(job_id) or advice_by_title.get(title)
+        rankings.append({
+            "rank": pos, "job_id": job_id, "title": title, "company": company,
+            "score": float(score) if score is not None else None,
+            "final_decision": final_decision, "apply_url": apply_url,
+            "advice": advice,
+        })
+    return {"run_id": run_id, "rankings": rankings}
+
+
 @app.get("/reviews/pending")
 def pending_reviews():
     conn = get_connection()
