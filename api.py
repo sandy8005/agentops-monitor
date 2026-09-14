@@ -4,7 +4,6 @@ from fastapi.staticfiles import StaticFiles
 from datetime import datetime
 import psycopg2, os, tempfile
 from dotenv import load_dotenv
-from autonomous_agent import run_agent_autonomous
 from autonomous_graph import run_agent_graph, resume_agent_graph
 from llm import create_run, request_cancel
 from pdf_reader import read_resume_file
@@ -150,11 +149,15 @@ def start_run(background_tasks: BackgroundTasks, resume_id: int = None,
     run_id = create_run("job search run (dashboard)", resume_id=resume_id,
                         target_role=target_role, location=location,
                         work_mode=work_mode, employment_type=employment_type)
+    # /runs now runs on LangGraph (the graph path is the single default runner):
+    # real checkpointing + human-in-the-loop pause/resume. Positional args match
+    # run_agent_graph's signature (resume_id, target_role, location, work_mode,
+    # employment_type, evaluate, run_id, ...).
     background_tasks.add_task(
-        run_agent_autonomous,
-        resume_id=resume_id, target_role=target_role, location=location,
-        work_mode=work_mode, employment_type=employment_type,
-        evaluate=evaluate, run_id=run_id, live_only=live_only
+        run_agent_graph,
+        resume_id, target_role, location,
+        work_mode, employment_type, evaluate, run_id,
+        live_only=live_only,
     )
     return {"run_id": run_id, "resume_id": resume_id, "target_role": target_role,
             "live_only": live_only,
@@ -277,41 +280,6 @@ def get_run(run_id: int):
         "pending_review": run[12],
         "steps": steps
     }
-
-
-@app.post("/runs/graph")
-def start_graph_run(background_tasks: BackgroundTasks, resume_id: int = None,
-                    target_role: str = "", location: str = "", work_mode: str = "",
-                    employment_type: str = "", evaluate: bool = False,
-                    live_only: bool = False):
-    """
-    Start a LangGraph run that CAN pause for human review. Runs in PARALLEL to
-    /runs (which uses the hand-rolled loop) so the pause/resume flow can be proven
-    before switching the default. Once proven, /runs can point here too.
-    """
-    if resume_id is None:
-        raise HTTPException(status_code=400, detail="resume_id is required")
-    if not target_role.strip():
-        raise HTTPException(status_code=400, detail="target_role is required")
-
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT is_deleted FROM resumes WHERE id = %s", (resume_id,))
-    row = cur.fetchone()
-    conn.close()
-    if not row:
-        raise HTTPException(status_code=404, detail=f"Resume {resume_id} not found")
-    if row[0]:
-        raise HTTPException(status_code=400, detail="That resume was deleted")
-
-    run_id = create_run("job search (langgraph + review)", resume_id=resume_id,
-                        target_role=target_role, location=location,
-                        work_mode=work_mode, employment_type=employment_type)
-    background_tasks.add_task(run_agent_graph, resume_id, target_role, location,
-                             work_mode, employment_type, evaluate, run_id,
-                             live_only=live_only)
-    return {"run_id": run_id, "live_only": live_only,
-            "message": f"Graph run {run_id} started."}
 
 
 @app.post("/runs/{run_id}/resume")
