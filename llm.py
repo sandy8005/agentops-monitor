@@ -15,7 +15,7 @@ load_dotenv()
 # rule-based fallback rather than freezing the whole run.
 client = genai.Client(
     api_key=os.getenv("GEMINI_API_KEY"),
-    http_options={"timeout": 30_000},   # 30 seconds, in ms
+    http_options={"timeout": 60_000},   # 30 seconds, in ms
 )
 
 INPUT_TOKEN_RATE = 0.075 / 1_000_000
@@ -46,7 +46,7 @@ def quota_available():
     and let logged_llm_call's retry/backoff handle them, rather than aborting a run
     over a momentary blip."""
     try:
-        client.models.generate_content(model="gemini-flash-latest", contents="hi")
+        client.models.generate_content(model="gemini-3.6-flash", contents="hi")
         return True
     except Exception as e:
         msg = str(e)
@@ -65,7 +65,7 @@ def fake_llm(prompt):
 def real_llm_once(prompt):
     """Single LLM attempt — no retry. Raises on failure. Retry lives in logged_llm_call."""
     response = client.models.generate_content(
-        model="gemini-flash-latest", contents=prompt
+        model="gemini-3.6-flash", contents=prompt
     )
     usage = response.usage_metadata
     request_id = None
@@ -284,7 +284,7 @@ def _log_llm_attempt(run_id, step_id, operation, prompt, response_text,
          status, error_message, operation_name, attempt_number, retry_count, provider_request_id)
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     """, (
-        run_id, step_id, "gemini-flash-latest", prompt, response_text,
+        run_id, step_id, "gemini-3.6-flash", prompt, response_text,
         prompt_tokens, completion_tokens, latency_ms, cost, datetime.now(),
         status, error_message, operation, attempt_number, retry_count, provider_request_id
     ))
@@ -292,7 +292,7 @@ def _log_llm_attempt(run_id, step_id, operation, prompt, response_text,
     conn.close()
 
 
-def logged_llm_call(prompt, run_id, step_id, operation="llm_call", max_retries=3, budget=None):
+def logged_llm_call(prompt, run_id, step_id, operation="llm_call", max_retries=5, budget=None):
     last_error = None
     for attempt in range(1, max_retries + 1):
         # Budget enforced HERE at the true unit (one HTTP attempt); retries count.
