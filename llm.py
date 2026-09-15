@@ -320,7 +320,10 @@ def logged_llm_call(prompt, run_id, step_id, operation="llm_call", max_retries=3
         except Exception as e:
             latency_ms = int((time.time() - start) * 1000)
             last_error = e
-            transient = "503" in str(e) or "UNAVAILABLE" in str(e) or "429" in str(e)
+            # A read/connect timeout (from the client http_options timeout) IS transient —
+            # retry it with backoff like a 503, instead of hard-failing the step.
+            transient = ("503" in str(e) or "UNAVAILABLE" in str(e) or "429" in str(e)
+                         or "timeout" in str(e).lower() or "timed out" in str(e).lower())
             _log_llm_attempt(
                 run_id, step_id, operation, prompt, None,
                 0, 0, latency_ms, 0,
