@@ -9,7 +9,14 @@ import json
 
 load_dotenv()
 
-client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
+# timeout is in MILLISECONDS in google-genai's http_options. 30s means a stalled
+# Gemini call fails fast (raises) instead of hanging forever — the retry/backoff in
+# logged_llm_call then engages, and if it keeps failing the job degrades to the
+# rule-based fallback rather than freezing the whole run.
+client = genai.Client(
+    api_key=os.getenv("GEMINI_API_KEY"),
+    http_options={"timeout": 30_000},   # 30 seconds, in ms
+)
 
 INPUT_TOKEN_RATE = 0.075 / 1_000_000
 OUTPUT_TOKEN_RATE = 0.30 / 1_000_000
@@ -33,13 +40,20 @@ def get_connection():
 
 
 def quota_available():
+    """Cheap pre-check: is the LLM usable? Returns False ONLY on a definitive
+    quota/rate-limit signal (429 / RESOURCE_EXHAUSTED). Transient server issues
+    (503/UNAVAILABLE, read timeouts) are NOT quota problems — we assume available
+    and let logged_llm_call's retry/backoff handle them, rather than aborting a run
+    over a momentary blip."""
     try:
         client.models.generate_content(model="gemini-flash-latest", contents="hi")
         return True
     except Exception as e:
-        if "429" in str(e) or "RESOURCE_EXHAUSTED" in str(e):
-            return False
-        raise
+        msg = str(e)
+        if "429" in msg or "RESOURCE_EXHAUSTED" in msg:
+            return False   # real quota exhaustion
+        # 503 / UNAVAILABLE / ReadTimeout / network → transient, not a quota verdict
+        return True
 
 
 def fake_llm(prompt):
