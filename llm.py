@@ -15,7 +15,7 @@ load_dotenv()
 # rule-based fallback rather than freezing the whole run.
 client = genai.Client(
     api_key=os.getenv("GEMINI_API_KEY"),
-    http_options={"timeout": 60_000},   # 30 seconds, in ms
+    http_options={"timeout": 30_000},   # 30 seconds, in ms
 )
 
 INPUT_TOKEN_RATE = 0.075 / 1_000_000
@@ -82,15 +82,15 @@ def real_llm_once(prompt):
 
 
 def create_run(input_summary, resume_id=None, target_role=None,
-               location=None, work_mode=None, employment_type=None):
+               location=None, work_mode=None, employment_type=None, user_id=None):
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
         INSERT INTO runs (started_at, status, input_summary, resume_id,
-                          target_role, location, work_mode, employment_type)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s) RETURNING id
+                          target_role, location, work_mode, employment_type, user_id)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id
     """, (datetime.now(), "running", input_summary, resume_id,
-          target_role, location, work_mode, employment_type))
+          target_role, location, work_mode, employment_type, user_id))
     run_id = cur.fetchone()[0]
     conn.commit()
     conn.close()

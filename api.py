@@ -123,9 +123,9 @@ async def upload_resume(file: UploadFile = File(...), name: str = Form(""),
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
-        INSERT INTO resumes (name, resume_text, created_at)
-        VALUES (%s, %s, %s) RETURNING id
-    """, (name or file.filename, resume_text, datetime.now()))
+        INSERT INTO resumes (name, resume_text, created_at, user_id)
+        VALUES (%s, %s, %s, %s) RETURNING id
+    """, (name or file.filename, resume_text, datetime.now(), user["id"]))
     resume_id = cur.fetchone()[0]
     conn.commit()
     conn.close()
@@ -140,8 +140,8 @@ def list_resumes(user: dict = Depends(require_auth)):
     cur = conn.cursor()
     cur.execute("""
         SELECT id, name, length(resume_text), created_at
-        FROM resumes WHERE is_deleted = FALSE ORDER BY id DESC
-    """)
+        FROM resumes WHERE is_deleted = FALSE AND user_id = %s ORDER BY id DESC
+    """, (user["id"],))
     rows = cur.fetchall()
     conn.close()
     return [
@@ -155,14 +155,16 @@ def list_resumes(user: dict = Depends(require_auth)):
 def delete_resume(resume_id: int, user: dict = Depends(require_auth)):
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute("SELECT 1 FROM resumes WHERE id = %s", (resume_id,))
+    cur.execute("SELECT 1 FROM resumes WHERE id = %s AND user_id = %s", (resume_id, user["id"]))
     if not cur.fetchone():
         conn.close()
+        # 404 (not 403) so we don't reveal that the id exists for another owner.
         raise HTTPException(status_code=404, detail=f"Resume {resume_id} not found")
     # Soft delete: hide from the library but keep the row, so historical runs
     # that reference this resume keep an intact link. A hard DELETE would orphan
     # those runs (runs.resume_id would point at a missing row).
-    cur.execute("UPDATE resumes SET is_deleted = TRUE WHERE id = %s", (resume_id,))
+    cur.execute("UPDATE resumes SET is_deleted = TRUE WHERE id = %s AND user_id = %s",
+                (resume_id, user["id"]))
     conn.commit()
     conn.close()
     return {"resume_id": resume_id, "deleted": True}
@@ -175,8 +177,8 @@ def list_runs(limit: int = Query(20, ge=1, le=100), user: dict = Depends(require
     cur.execute("""
         SELECT id, status, started_at, total_tokens, total_cost,
                target_role, location, work_mode
-        FROM runs ORDER BY id DESC LIMIT %s
-    """, (limit,))
+        FROM runs WHERE user_id = %s ORDER BY id DESC LIMIT %s
+    """, (user["id"], limit))
     rows = cur.fetchall()
     conn.close()
     return [
@@ -200,7 +202,10 @@ def start_run(background_tasks: BackgroundTasks, resume_id: int = None,
 
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute("SELECT is_deleted FROM resumes WHERE id = %s", (resume_id,))
+    # The resume must belong to THIS user — otherwise a user could run against
+    # someone else's resume by guessing its id.
+    cur.execute("SELECT is_deleted FROM resumes WHERE id = %s AND user_id = %s",
+                (resume_id, user["id"]))
     row = cur.fetchone()
     conn.close()
     if not row:
@@ -210,7 +215,8 @@ def start_run(background_tasks: BackgroundTasks, resume_id: int = None,
 
     run_id = create_run("job search run (dashboard)", resume_id=resume_id,
                         target_role=target_role, location=location,
-                        work_mode=work_mode, employment_type=employment_type)
+                        work_mode=work_mode, employment_type=employment_type,
+                        user_id=user["id"])
     # /runs now runs on LangGraph (the graph path is the single default runner):
     # real checkpointing + human-in-the-loop pause/resume. Positional args match
     # run_agent_graph's signature (resume_id, target_role, location, work_mode,
@@ -231,7 +237,8 @@ def cancel_run(run_id: int, background_tasks: BackgroundTasks,
                user: dict = Depends(require_auth)):
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute("SELECT status FROM runs WHERE id = %s", (run_id,))
+    cur.execute("SELECT status FROM runs WHERE id = %s AND user_id = %s",
+                (run_id, user["id"]))
     row = cur.fetchone()
     conn.close()
     if not row:
@@ -263,8 +270,8 @@ def get_run(run_id: int, user: dict = Depends(require_auth)):
     cur.execute("""
         SELECT id, status, started_at, ended_at, input_summary, total_tokens, total_cost,
                resume_id, target_role, location, work_mode, employment_type, pending_review
-        FROM runs WHERE id = %s
-    """, (run_id,))
+        FROM runs WHERE id = %s AND user_id = %s
+    """, (run_id, user["id"]))
     run = cur.fetchone()
     if not run:
         conn.close()
@@ -360,15 +367,15 @@ def resume_run(run_id: int, background_tasks: BackgroundTasks,
     conn = get_connection()
     cur = conn.cursor()
     # ATOMIC compare-and-swap: flip waiting_for_human -> running ONLY if still
-    # waiting. Prevents a double-click / concurrent request from resuming the same
-    # checkpoint twice — the DB guarantees exactly one winner (rowcount == 1).
+    # waiting AND owned by this user. Prevents a double-click / concurrent request
+    # from resuming the same checkpoint twice, and blocks cross-user resume.
     cur.execute("""
         UPDATE runs SET status = 'running'
-        WHERE id = %s AND status = 'waiting_for_human'
-    """, (run_id,))
+        WHERE id = %s AND user_id = %s AND status = 'waiting_for_human'
+    """, (run_id, user["id"]))
     won = cur.rowcount == 1
     conn.commit()
-    cur.execute("SELECT status FROM runs WHERE id = %s", (run_id,))
+    cur.execute("SELECT status FROM runs WHERE id = %s AND user_id = %s", (run_id, user["id"]))
     row = cur.fetchone()
     conn.close()
     if not row:
@@ -389,7 +396,7 @@ def get_run_rankings(run_id: int, user: dict = Depends(require_auth)):
     """
     conn = get_connection()
     cur = conn.cursor()
-    cur.execute("SELECT 1 FROM runs WHERE id = %s", (run_id,))
+    cur.execute("SELECT 1 FROM runs WHERE id = %s AND user_id = %s", (run_id, user["id"]))
     if not cur.fetchone():
         conn.close()
         raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
@@ -421,3 +428,24 @@ def get_run_rankings(run_id: int, user: dict = Depends(require_auth)):
             "advice": advice,
         })
     return {"run_id": run_id, "rankings": rankings}
+
+
+@app.get("/reviews/pending")
+def pending_reviews():
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT s.id, s.run_id, s.step_name, s.match_score,
+               s.score_decision, s.llm_decision, s.review_reason
+        FROM steps s
+        WHERE s.needs_human_review = TRUE AND s.review_status IS NULL
+        ORDER BY s.id DESC
+    """)
+    rows = cur.fetchall()
+    conn.close()
+    return [
+        {"step_id": r[0], "run_id": r[1], "step_name": r[2],
+         "match_score": float(r[3]) if r[3] is not None else None,
+         "score_decision": r[4], "llm_decision": r[5], "review_reason": r[6]}
+        for r in rows
+    ]
