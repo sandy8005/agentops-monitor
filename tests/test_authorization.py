@@ -137,3 +137,67 @@ def test_start_run_rejects_someone_elses_resume():
     rid_a = _upload_resume(a)
     r = b.post(f"/runs?resume_id={rid_a}&target_role=engineer")
     assert r.status_code == 404
+
+# --- Additional coverage: unauthenticated rejection + per-endpoint splits ---
+
+def _anon_client():
+    """A client with NO session — every gated endpoint must reject it with 401."""
+    import api
+    return TestClient(api.app)
+
+
+def test_unauthenticated_requests_are_rejected():
+    """The base case: with no session, every data endpoint returns 401 (never 200,
+    never data). Authentication is required before authorization even applies."""
+    anon = _anon_client()
+    assert anon.get("/resumes").status_code == 401
+    assert anon.get("/runs").status_code == 401
+    assert anon.get("/runs/1").status_code == 401
+    assert anon.get("/runs/1/rankings").status_code == 401
+    assert anon.post("/runs?resume_id=1&target_role=x").status_code == 401
+    assert anon.post("/runs/1/cancel").status_code == 401
+    assert anon.post("/runs/1/resume?decision=Skip").status_code == 401
+    assert anon.delete("/resumes/1").status_code == 401
+    # /me (identity) is also gated.
+    assert anon.get("/me").status_code == 401
+
+
+def test_cannot_read_others_run_detail():
+    a = _fresh_logged_in_client()
+    b = _fresh_logged_in_client()
+    rid = _upload_resume(a)
+    run_id = a.post(f"/runs?resume_id={rid}&target_role=engineer").json()["run_id"]
+    assert b.get(f"/runs/{run_id}").status_code == 404
+
+
+def test_cannot_read_others_run_rankings():
+    a = _fresh_logged_in_client()
+    b = _fresh_logged_in_client()
+    rid = _upload_resume(a)
+    run_id = a.post(f"/runs?resume_id={rid}&target_role=engineer").json()["run_id"]
+    assert b.get(f"/runs/{run_id}/rankings").status_code == 404
+
+
+def test_cannot_cancel_others_run():
+    a = _fresh_logged_in_client()
+    b = _fresh_logged_in_client()
+    rid = _upload_resume(a)
+    run_id = a.post(f"/runs?resume_id={rid}&target_role=engineer").json()["run_id"]
+    assert b.post(f"/runs/{run_id}/cancel").status_code == 404
+
+
+def test_cannot_resume_others_run():
+    a = _fresh_logged_in_client()
+    b = _fresh_logged_in_client()
+    rid = _upload_resume(a)
+    run_id = a.post(f"/runs?resume_id={rid}&target_role=engineer").json()["run_id"]
+    # 404 (can't see it) — never 200/started.
+    assert b.post(f"/runs/{run_id}/resume?decision=Skip").status_code in (404, 409)
+
+
+def test_others_run_absent_from_my_run_list():
+    a = _fresh_logged_in_client()
+    b = _fresh_logged_in_client()
+    rid = _upload_resume(a)
+    run_id = a.post(f"/runs?resume_id={rid}&target_role=engineer").json()["run_id"]
+    assert run_id not in {row["id"] for row in b.get("/runs").json()}
