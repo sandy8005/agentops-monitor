@@ -157,10 +157,19 @@ def _reqs_cache_get(desc_hash):
 
 def _reqs_cache_put(desc_hash, reqs, extraction_method):
     """
-    Store a requirements row WITH provenance: the extraction_method ('llm' |
-    'rule_based') and the source_model/version it was produced under. Idempotent
-    (ON CONFLICT DO NOTHING) — first writer wins for a given key.
+    Store a requirements row WITH provenance:
+      - extraction_method : 'llm' or 'rule_based'
+      - source_model      : the MODEL NAME that produced it (e.g. 'gemini-3.6-flash')
+                            for LLM extraction, or NULL for rule_based (no model was
+                            used). Previously this incorrectly stored the composite
+                            cache_version STRING here — a bug; source_model now holds
+                            the actual model, from the single source of truth.
+    Idempotent (ON CONFLICT DO NOTHING) — first writer wins for a given key.
     """
+    from cache_version import model_version
+    # rule_based extraction used no model, so its source_model is NULL (not the
+    # LLM model), keeping provenance honest.
+    source_model = model_version() if extraction_method == "llm" else None
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
@@ -168,7 +177,7 @@ def _reqs_cache_put(desc_hash, reqs, extraction_method):
             (desc_hash, reqs_json, cache_version, extraction_method, source_model)
         VALUES (%s, %s, %s, %s, %s) ON CONFLICT (desc_hash) DO NOTHING
     """, (desc_hash, json.dumps(reqs), reqs_cache_version(),
-          extraction_method, reqs_cache_version()))
+          extraction_method, source_model))
     conn.commit()
     conn.close()
 
@@ -317,6 +326,7 @@ def do_process_job(state, run_id):
 
         state.job_results.append({
             "step_id": step_id,
+            "job_id": job.get("id"),   # stable link to job_postings.id (not title)
             "title": job["title"], "company": job["company"],
             "score": score, "decision": score_result["decision"],
             "llm_decision": llm_decision, "final_decision": final_decision,
@@ -371,18 +381,46 @@ def do_process_job(state, run_id):
 
 
 def do_rank_jobs(state, run_id):
-    """Rank scored jobs (traced). Sets ranking_done so the loop terminates."""
+    """Rank scored jobs (traced), then PERSIST the ranked list to run_rankings.
+    Sets ranking_done so the loop terminates."""
     step_id = create_step(run_id, "rank_jobs", len(state.completed_actions))
     try:
         state.ranked = logged_tool_call(
             "rank_jobs", lambda r: rank_jobs(r), state.job_results,
             run_id, step_id, operation="rank_jobs")
+        _persist_rankings(run_id, state.ranked)
         finish_step(step_id, "success")
     except Exception as e:
         fail_step(step_id, e)
         state.ranked = state.job_results
     finally:
         state.ranking_done = True   # ranking ran (even if empty) — don't loop on it
+
+
+def _persist_rankings(run_id, ranked):
+    """
+    Persist the final ranked list as self-contained snapshot rows in run_rankings
+    (1-based rank_position). Snapshot fields are stored so the ranking is readable
+    later without joining job_postings. Best-effort — a persistence failure never
+    breaks the run. Re-persisting a run replaces its previous rows.
+    """
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM run_rankings WHERE run_id = %s", (run_id,))
+        for pos, r in enumerate(ranked or [], start=1):
+            cur.execute("""
+                INSERT INTO run_rankings
+                    (run_id, job_id, rank_position, title, company, score,
+                     final_decision, apply_url)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            """, (run_id, r.get("job_id"), pos, r.get("title"), r.get("company"),
+                  r.get("score"), r.get("final_decision") or r.get("decision"),
+                  r.get("apply_url")))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"    (persist rankings failed: {e})")
 
 
 def _combined_advice(resume_text, job, requirements, missing_skills, run_id, step_id, budget=None):
@@ -415,6 +453,27 @@ RESUME EDITS:
     return logged_llm_call(prompt, run_id, step_id, operation="combined_advice", budget=budget)
 
 
+def _persist_advice(run_id, job_id, title, advice):
+    """Persist one advice text to run_advice, keyed to (run_id, job_id). Best-effort
+    — never breaks the run. Re-persisting the same (run, job) replaces the prior row."""
+    if not advice:
+        return
+    try:
+        conn = get_connection()
+        cur = conn.cursor()
+        cur.execute(
+            "DELETE FROM run_advice WHERE run_id = %s AND job_id IS NOT DISTINCT FROM %s",
+            (run_id, job_id))
+        cur.execute("""
+            INSERT INTO run_advice (run_id, job_id, title, advice)
+            VALUES (%s, %s, %s, %s)
+        """, (run_id, job_id, title, advice.strip()))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"    (persist advice failed: {e})")
+
+
 def do_generate_advice(state, run_id, top_n=2):
     """
     #10: after ranking, generate combined advice for the TOP N viable
@@ -429,7 +488,13 @@ def do_generate_advice(state, run_id, top_n=2):
             if state.budget_exceeded():
                 print("    (advice skipped - budget reached)")
                 break
-            job = next((j for j in state.jobs if j["title"] == r["title"]), None)
+            # Look up the posting by STABLE job_id, falling back to title only when
+            # job_id is missing (legacy rows).
+            job = None
+            if r.get("job_id") is not None:
+                job = next((j for j in state.jobs if j.get("id") == r["job_id"]), None)
+            if job is None:
+                job = next((j for j in state.jobs if j["title"] == r["title"]), None)
             if not job:
                 continue
             dhash = _reqs_cache_key(job["title"], job["description"])
@@ -443,6 +508,7 @@ def do_generate_advice(state, run_id, top_n=2):
             advice = _combined_advice(state.resume_text, job, requirements,
                                       sc["missing_skills"], run_id, step_id,
                                       budget=state)
+            _persist_advice(run_id, job.get("id"), job["title"], advice)
             print(f"\n  ADVICE for {r['title']}:\n{advice.strip()}\n")
         finish_step(step_id, "success")
         state.advice_done = True

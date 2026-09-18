@@ -6,6 +6,7 @@ import os
 from dotenv import load_dotenv
 from google import genai
 import json
+from settings import settings
 
 load_dotenv()
 
@@ -46,7 +47,7 @@ def quota_available():
     and let logged_llm_call's retry/backoff handle them, rather than aborting a run
     over a momentary blip."""
     try:
-        client.models.generate_content(model="gemini-3.6-flash", contents="hi")
+        client.models.generate_content(model=settings.gemini_model, contents="hi")
         return True
     except Exception as e:
         msg = str(e)
@@ -65,7 +66,7 @@ def fake_llm(prompt):
 def real_llm_once(prompt):
     """Single LLM attempt — no retry. Raises on failure. Retry lives in logged_llm_call."""
     response = client.models.generate_content(
-        model="gemini-3.6-flash", contents=prompt
+        model=settings.gemini_model, contents=prompt
     )
     usage = response.usage_metadata
     request_id = None
@@ -284,7 +285,7 @@ def _log_llm_attempt(run_id, step_id, operation, prompt, response_text,
          status, error_message, operation_name, attempt_number, retry_count, provider_request_id)
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
     """, (
-        run_id, step_id, "gemini-3.6-flash", prompt, response_text,
+        run_id, step_id, settings.gemini_model, prompt, response_text,
         prompt_tokens, completion_tokens, latency_ms, cost, datetime.now(),
         status, error_message, operation, attempt_number, retry_count, provider_request_id
     ))

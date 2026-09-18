@@ -53,6 +53,7 @@ class Settings:
 
         # --- LLM ---
         self.gemini_api_key = _get("GEMINI_API_KEY")
+        self.gemini_model = _get("GEMINI_MODEL", "gemini-3.6-flash")
 
         # --- Adzuna (optional live-jobs feed) ---
         self.adzuna_app_id = _get("ADZUNA_APP_ID")

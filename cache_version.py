@@ -8,19 +8,30 @@ stored on each row so you can query/prune by version.
 - REQS_VERSION:   bump when the requirements-extraction PROMPT changes.
 - SCHEMA_VERSION: bump when Pydantic validation rules change in a way that affects
                   what a valid parsed result looks like.
-- MODEL_VERSION:  the Gemini model string in use (keep in sync with llm.py).
+- model:          the Gemini model in use is NOT duplicated here — it comes from
+                  the single source of truth (settings.gemini_model), so the cache
+                  key's model tag can never drift from the model llm.py actually
+                  calls. Changing the model (via GEMINI_MODEL) therefore also
+                  invalidates old cache entries, which is correct: a different
+                  model can produce different output for the same input.
 """
+from settings import settings
+
 PARSER_VERSION = "1"
 REQS_VERSION = "2"   # bumped: cache key now includes TITLE + description (was desc-only)
 SCHEMA_VERSION = "1"
-MODEL_VERSION = "gemini-flash-latest"
+
+
+def model_version():
+    """The model name, from the single source of truth (settings)."""
+    return settings.gemini_model
 
 
 def parse_cache_version():
     """Composite version string for the resume-parse cache."""
-    return f"parser={PARSER_VERSION};schema={SCHEMA_VERSION};model={MODEL_VERSION}"
+    return f"parser={PARSER_VERSION};schema={SCHEMA_VERSION};model={model_version()}"
 
 
 def reqs_cache_version():
     """Composite version string for the requirements cache."""
-    return f"reqs={REQS_VERSION};schema={SCHEMA_VERSION};model={MODEL_VERSION}"
+    return f"reqs={REQS_VERSION};schema={SCHEMA_VERSION};model={model_version()}"
