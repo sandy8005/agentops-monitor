@@ -1,4 +1,6 @@
-from fastapi import (FastAPI, HTTPException, BackgroundTasks, UploadFile, File,
+from database import get_connection as _db_get_connection
+from settings import settings
+from fastapi import (FastAPI, HTTPException, UploadFile, File,
                      Form, Query, Depends, Request)
 from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -6,8 +8,8 @@ from starlette.middleware.sessions import SessionMiddleware
 from datetime import datetime
 import psycopg2, os, tempfile
 from dotenv import load_dotenv
-from autonomous_graph import run_agent_graph, resume_agent_graph
 from llm import create_run, request_cancel
+from job_queue import enqueue
 from pdf_reader import read_resume_file
 from auth import authenticate
 
@@ -20,32 +22,28 @@ MAX_UPLOAD_BYTES = 5 * 1024 * 1024
 # Signed, HttpOnly session cookie via Starlette's SessionMiddleware. The signing
 # key MUST be set (SESSION_SECRET in .env) for a public deploy; we refuse to boot
 # with a default in production so sessions can't be forged with a known key.
-_SESSION_SECRET = os.getenv("SESSION_SECRET")
+_SESSION_SECRET = settings.session_secret
 if not _SESSION_SECRET:
-    if os.getenv("ENV", "dev").lower() in ("prod", "production"):
+    if settings.is_production:
         raise RuntimeError("SESSION_SECRET must be set when ENV=production")
     _SESSION_SECRET = "dev-only-insecure-session-secret-change-me"
 app.add_middleware(
     SessionMiddleware,
     secret_key=_SESSION_SECRET,
     session_cookie="agentops_session",
-    https_only=os.getenv("ENV", "dev").lower() in ("prod", "production"),
+    https_only=settings.is_production,
     same_site="lax",
 )
 
 # Redact resume-bearing / trace fields from API responses when deploying
 # publicly. Toggle with REDACT_SENSITIVE=1 (on for public deploys, off locally).
-REDACT_SENSITIVE = os.getenv("REDACT_SENSITIVE", "0").lower() in ("1", "true", "yes")
+REDACT_SENSITIVE = settings.redact_sensitive
 _REDACTED = "[redacted]"
 
 
 def get_connection():
-    return psycopg2.connect(
-        dbname=os.getenv("DB_NAME"), user=os.getenv("DB_USER"),
-        password=os.getenv("DB_PASSWORD"), host=os.getenv("DB_HOST"), port=os.getenv("DB_PORT")
-    )
-
-
+    # Delegate to the centralized pooled connection (see database.py).
+    return _db_get_connection()
 def require_auth(request: Request):
     """
     Dependency: every gated endpoint requires a logged-in session. Returns the
@@ -191,7 +189,7 @@ def list_runs(limit: int = Query(20, ge=1, le=100), user: dict = Depends(require
 
 
 @app.post("/runs")
-def start_run(background_tasks: BackgroundTasks, resume_id: int = None,
+def start_run(resume_id: int = None,
               target_role: str = "", location: str = "", work_mode: str = "",
               employment_type: str = "", evaluate: bool = False,
               live_only: bool = False, user: dict = Depends(require_auth)):
@@ -217,24 +215,21 @@ def start_run(background_tasks: BackgroundTasks, resume_id: int = None,
                         target_role=target_role, location=location,
                         work_mode=work_mode, employment_type=employment_type,
                         user_id=user["id"])
-    # /runs now runs on LangGraph (the graph path is the single default runner):
-    # real checkpointing + human-in-the-loop pause/resume. Positional args match
-    # run_agent_graph's signature (resume_id, target_role, location, work_mode,
-    # employment_type, evaluate, run_id, ...).
-    background_tasks.add_task(
-        run_agent_graph,
-        resume_id, target_role, location,
-        work_mode, employment_type, evaluate, run_id,
-        live_only=live_only,
-    )
+    # Enqueue the run onto the durable Postgres queue and return immediately. A
+    # separate worker process (worker.py) claims and runs it, so the run survives
+    # an API restart/crash (unlike the old in-process BackgroundTasks).
+    job_id = enqueue("start_run", {
+        "resume_id": resume_id, "target_role": target_role, "location": location,
+        "work_mode": work_mode, "employment_type": employment_type,
+        "evaluate": evaluate, "run_id": run_id, "live_only": live_only,
+    }, run_id=run_id)
     return {"run_id": run_id, "resume_id": resume_id, "target_role": target_role,
-            "live_only": live_only,
-            "message": f"Run {run_id} started in background."}
+            "live_only": live_only, "job_id": job_id,
+            "message": f"Run {run_id} enqueued (job {job_id})."}
 
 
 @app.post("/runs/{run_id}/cancel")
-def cancel_run(run_id: int, background_tasks: BackgroundTasks,
-               user: dict = Depends(require_auth)):
+def cancel_run(run_id: int, user: dict = Depends(require_auth)):
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("SELECT status FROM runs WHERE id = %s AND user_id = %s",
@@ -255,7 +250,9 @@ def cancel_run(run_id: int, background_tasks: BackgroundTasks,
         # Set the flag AND resume the graph so it wakes, sees the cancel, and
         # terminates through its normal 'cancelled' routing (no orphaned checkpoint).
         request_cancel(run_id)
-        background_tasks.add_task(resume_agent_graph, run_id, "Skip", "cancelled by user")
+        enqueue("resume_run",
+                {"run_id": run_id, "decision": "Skip", "comment": "cancelled by user"},
+                run_id=run_id)
         return {"run_id": run_id, "cancel_requested": True, "resumed_to_cancel": True}
 
     raise HTTPException(status_code=400,
@@ -358,8 +355,7 @@ def get_run(run_id: int, user: dict = Depends(require_auth)):
 
 
 @app.post("/runs/{run_id}/resume")
-def resume_run(run_id: int, background_tasks: BackgroundTasks,
-               decision: str = "Maybe", comment: str = "",
+def resume_run(run_id: int, decision: str = "Maybe", comment: str = "",
                user: dict = Depends(require_auth)):
     """Resume a paused (waiting_for_human) run with the human's decision."""
     if decision not in ("Apply", "Maybe", "Skip"):
@@ -367,8 +363,8 @@ def resume_run(run_id: int, background_tasks: BackgroundTasks,
     conn = get_connection()
     cur = conn.cursor()
     # ATOMIC compare-and-swap: flip waiting_for_human -> running ONLY if still
-    # waiting AND owned by this user. Prevents a double-click / concurrent request
-    # from resuming the same checkpoint twice, and blocks cross-user resume.
+    # waiting. Prevents a double-click / concurrent request from resuming the same
+    # checkpoint twice — the DB guarantees exactly one winner (rowcount == 1).
     cur.execute("""
         UPDATE runs SET status = 'running'
         WHERE id = %s AND user_id = %s AND status = 'waiting_for_human'
@@ -383,7 +379,8 @@ def resume_run(run_id: int, background_tasks: BackgroundTasks,
     if not won:
         raise HTTPException(status_code=409,
                             detail=f"Run {run_id} is not awaiting review (already {row[0]})")
-    background_tasks.add_task(resume_agent_graph, run_id, decision, comment)
+    enqueue("resume_run", {"run_id": run_id, "decision": decision, "comment": comment},
+            run_id=run_id)
     return {"run_id": run_id, "resumed_with": decision}
 
 
@@ -428,24 +425,3 @@ def get_run_rankings(run_id: int, user: dict = Depends(require_auth)):
             "advice": advice,
         })
     return {"run_id": run_id, "rankings": rankings}
-
-
-@app.get("/reviews/pending")
-def pending_reviews():
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT s.id, s.run_id, s.step_name, s.match_score,
-               s.score_decision, s.llm_decision, s.review_reason
-        FROM steps s
-        WHERE s.needs_human_review = TRUE AND s.review_status IS NULL
-        ORDER BY s.id DESC
-    """)
-    rows = cur.fetchall()
-    conn.close()
-    return [
-        {"step_id": r[0], "run_id": r[1], "step_name": r[2],
-         "match_score": float(r[3]) if r[3] is not None else None,
-         "score_decision": r[4], "llm_decision": r[5], "review_reason": r[6]}
-        for r in rows
-    ]
