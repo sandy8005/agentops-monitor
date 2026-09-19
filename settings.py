@@ -49,7 +49,7 @@ class Settings:
         # --- environment / deploy ---
         self.env = (_get("ENV", "dev") or "dev").lower()
         self.session_secret = _get("SESSION_SECRET")
-        self.redact_sensitive = _get_bool("REDACT_SENSITIVE", False)
+        self.redact_sensitive = _get_bool("REDACT_SENSITIVE", True)
 
         # --- LLM ---
         self.gemini_api_key = _get("GEMINI_API_KEY")
