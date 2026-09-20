@@ -1,5 +1,36 @@
 var NL = String.fromCharCode(10);
     var pollTimer = null;
+    var _csrfToken = null;
+
+    // Read the CSRF token from the readable cookie (set by GET /csrf).
+    function _readCsrfCookie() {
+      var m = document.cookie.match(/(?:^|;\s*)csrf_token=([^;]+)/);
+      return m ? decodeURIComponent(m[1]) : null;
+    }
+
+    // Ensure we have a CSRF token (fetch one if missing).
+    async function ensureCsrf() {
+      _csrfToken = _readCsrfCookie();
+      if (!_csrfToken) {
+        try {
+          const r = await fetch('/csrf');
+          const j = await r.json();
+          _csrfToken = (j && j.csrf_token) || _readCsrfCookie();
+        } catch (e) { /* leave null; state-changing calls will 403 and prompt reload */ }
+      }
+      return _csrfToken;
+    }
+
+    // fetch() wrapper that attaches the CSRF header on state-changing requests.
+    async function csrfFetch(url, opts) {
+      opts = opts || {};
+      const method = (opts.method || 'GET').toUpperCase();
+      if (method !== 'GET' && method !== 'HEAD') {
+        await ensureCsrf();
+        opts.headers = Object.assign({}, opts.headers, { 'X-CSRF-Token': _csrfToken || '' });
+      }
+      return fetch(url, opts);
+    }
 
     function escapeHtml(s) {
       return String(s == null ? '' : s)
@@ -24,7 +55,7 @@ var NL = String.fromCharCode(10);
       fd.append('name', document.getElementById('resumeName').value.trim());
 
       try {
-        const up = await fetch('/upload', { method: 'POST', body: fd });
+        const up = await csrfFetch('/upload', { method: 'POST', body: fd });
         if (!up.ok) { const e = await up.json(); throw new Error(e.detail || 'upload failed'); }
         const upData = await up.json();
         msg.textContent = 'Stored resume #' + upData.resume_id + ' (' + upData.chars + ' chars). Set search options below and run it.';
@@ -90,7 +121,7 @@ var NL = String.fromCharCode(10);
                  '&employment_type=' + encodeURIComponent(emp) +
                  '&evaluate=' + doEval;
       try {
-        const run = await fetch('/runs' + qs, { method: 'POST' });
+        const run = await csrfFetch('/runs' + qs, { method: 'POST' });
         if (!run.ok) { const e = await run.json(); throw new Error(e.detail || 'run failed'); }
         const runData = await run.json();
         setTimeout(function() { loadRuns(); loadDetail(runData.run_id); }, 1500);
@@ -100,7 +131,7 @@ var NL = String.fromCharCode(10);
     async function cancelRun(id) {
       if (!confirm('Cancel run #' + id + '?')) return;
       try {
-        const res = await fetch('/runs/' + id + '/cancel', { method: 'POST' });
+        const res = await csrfFetch('/runs/' + id + '/cancel', { method: 'POST' });
         if (!res.ok) { const e = await res.json(); throw new Error(e.detail || 'cancel failed'); }
       } catch (err) { alert('Error: ' + err.message); }
     }
@@ -108,7 +139,7 @@ var NL = String.fromCharCode(10);
     async function deleteResume(id) {
       if (!confirm('Delete resume #' + id + '?')) return;
       try {
-        const res = await fetch('/resumes/' + id, { method: 'DELETE' });
+        const res = await csrfFetch('/resumes/' + id, { method: 'DELETE' });
         if (!res.ok) { const e = await res.json(); throw new Error(e.detail || 'delete failed'); }
         loadResumes();
       } catch (err) { alert('Error: ' + err.message); }
@@ -276,7 +307,7 @@ var NL = String.fromCharCode(10);
       const comment = el ? el.value : '';
       const qs = '?decision=' + decision + '&comment=' + encodeURIComponent(comment);
       try {
-        const res = await fetch('/runs/' + runId + '/resume' + qs, { method: 'POST' });
+        const res = await csrfFetch('/runs/' + runId + '/resume' + qs, { method: 'POST' });
         if (!res.ok) { const e = await res.json(); throw new Error(e.detail || 'resume failed'); }
         setTimeout(function() { loadRuns(); renderGraphReviews(); }, 1200);
       } catch (err) { alert('Error: ' + err.message); }
@@ -311,7 +342,7 @@ var NL = String.fromCharCode(10);
       fd.append('username', u);
       fd.append('password', p);
       try {
-        const res = await fetch('/login', { method: 'POST', body: fd });
+        const res = await csrfFetch('/login', { method: 'POST', body: fd });
         if (!res.ok) { const e = await res.json(); throw new Error(e.detail || 'login failed'); }
         const user = await res.json();
         showApp(user);
@@ -321,12 +352,13 @@ var NL = String.fromCharCode(10);
     }
 
     async function doLogout() {
-      try { await fetch('/logout', { method: 'POST' }); } catch (e) {}
+      try { await csrfFetch('/logout', { method: 'POST' }); } catch (e) {}
       if (_reviewTimer) { clearInterval(_reviewTimer); _reviewTimer = null; }
       showLogin('Signed out.');
     }
 
     async function initApp() {
+      await ensureCsrf();   // get a CSRF token before any state-changing request
       try {
         const res = await fetch('/me');
         if (res.status === 401) { showLogin(); return; }

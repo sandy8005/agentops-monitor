@@ -50,6 +50,10 @@ class Settings:
         self.env = (_get("ENV", "dev") or "dev").lower()
         self.session_secret = _get("SESSION_SECRET")
         self.redact_sensitive = _get_bool("REDACT_SENSITIVE", True)
+        self.session_max_age = int(_get("SESSION_MAX_AGE", str(8 * 60 * 60)))
+        # Rate limits (requests per window) — see api.py. Overridable via env.
+        self.rate_limit_login = _get("RATE_LIMIT_LOGIN", "5/minute")
+        self.rate_limit_runs = _get("RATE_LIMIT_RUNS", "20/minute")
 
         # --- LLM ---
         self.gemini_api_key = _get("GEMINI_API_KEY")

@@ -2,7 +2,7 @@ from database import get_connection as _db_get_connection
 from settings import settings
 from fastapi import (FastAPI, HTTPException, UploadFile, File,
                      Form, Query, Depends, Request)
-from fastapi.responses import HTMLResponse, FileResponse
+from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.sessions import SessionMiddleware
 from datetime import datetime
@@ -12,9 +12,26 @@ from llm import create_run, request_cancel
 from job_queue import enqueue
 from pdf_reader import read_resume_file
 from auth import authenticate
+from csrf import issue_token, set_csrf_cookie, require_csrf
+
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
 
 load_dotenv()
 app = FastAPI(title="AgentOps Monitor")
+
+# --- Rate limiting ----------------------------------------------------------
+# Per-client-IP limits (in-memory) to blunt login brute-force and enqueue abuse.
+# Configurable via settings (RATE_LIMIT_LOGIN / RATE_LIMIT_RUNS).
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+
+
+@app.exception_handler(RateLimitExceeded)
+def _rate_limit_handler(request: Request, exc: RateLimitExceeded):
+    return JSONResponse(status_code=429,
+                        content={"detail": "Too many requests — slow down."})
 
 MAX_UPLOAD_BYTES = 5 * 1024 * 1024
 
@@ -22,6 +39,9 @@ MAX_UPLOAD_BYTES = 5 * 1024 * 1024
 # Signed, HttpOnly session cookie via Starlette's SessionMiddleware. The signing
 # key MUST be set (SESSION_SECRET in .env) for a public deploy; we refuse to boot
 # with a default in production so sessions can't be forged with a known key.
+# max_age gives the session a lifetime (refreshed per response = idle timeout);
+# same_site='strict' + https_only(prod) + HttpOnly harden the cookie against CSRF
+# and interception.
 _SESSION_SECRET = settings.session_secret
 if not _SESSION_SECRET:
     if settings.is_production:
@@ -32,7 +52,8 @@ app.add_middleware(
     secret_key=_SESSION_SECRET,
     session_cookie="agentops_session",
     https_only=settings.is_production,
-    same_site="lax",
+    same_site="strict",
+    max_age=settings.session_max_age,
 )
 
 # Redact resume-bearing / trace fields from API responses when deploying
@@ -70,9 +91,21 @@ def dashboard():
     return FileResponse(os.path.join(_STATIC_DIR, "index.html"))
 
 
+@app.get("/csrf")
+def get_csrf(request: Request):
+    """Issue a CSRF token (readable cookie). The frontend calls this on load and
+    echoes the value in the X-CSRF-Token header on state-changing requests."""
+    token = issue_token()
+    resp = JSONResponse({"csrf_token": token})
+    set_csrf_cookie(resp, token, secure=settings.is_production)
+    return resp
+
+
 @app.post("/login")
+@limiter.limit(settings.rate_limit_login)
 def login(request: Request, username: str = Form(...), password: str = Form(...)):
-    """Verify credentials via auth.authenticate and start a signed session."""
+    """Verify credentials via auth.authenticate and start a signed session.
+    Rate-limited per IP to blunt brute-force."""
     user = authenticate(username, password)
     if not user:
         raise HTTPException(status_code=401, detail="Invalid username or password")
@@ -96,7 +129,8 @@ def whoami(user: dict = Depends(require_auth)):
 
 @app.post("/upload")
 async def upload_resume(file: UploadFile = File(...), name: str = Form(""),
-                        user: dict = Depends(require_auth)):
+                        user: dict = Depends(require_auth),
+                        _csrf: None = Depends(require_csrf)):
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Please upload a PDF file")
 
@@ -150,7 +184,8 @@ def list_resumes(user: dict = Depends(require_auth)):
 
 
 @app.delete("/resumes/{resume_id}")
-def delete_resume(resume_id: int, user: dict = Depends(require_auth)):
+def delete_resume(resume_id: int, user: dict = Depends(require_auth),
+                  _csrf: None = Depends(require_csrf)):
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("SELECT 1 FROM resumes WHERE id = %s AND user_id = %s", (resume_id, user["id"]))
@@ -189,10 +224,12 @@ def list_runs(limit: int = Query(20, ge=1, le=100), user: dict = Depends(require
 
 
 @app.post("/runs")
-def start_run(resume_id: int = None,
+@limiter.limit(settings.rate_limit_runs)
+def start_run(request: Request, resume_id: int = None,
               target_role: str = "", location: str = "", work_mode: str = "",
               employment_type: str = "", evaluate: bool = False,
-              live_only: bool = False, user: dict = Depends(require_auth)):
+              live_only: bool = False, user: dict = Depends(require_auth),
+              _csrf: None = Depends(require_csrf)):
     if resume_id is None:
         raise HTTPException(status_code=400, detail="resume_id is required; upload or pick a resume first")
     if not target_role.strip():
@@ -229,7 +266,8 @@ def start_run(resume_id: int = None,
 
 
 @app.post("/runs/{run_id}/cancel")
-def cancel_run(run_id: int, user: dict = Depends(require_auth)):
+def cancel_run(run_id: int, user: dict = Depends(require_auth),
+               _csrf: None = Depends(require_csrf)):
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("SELECT status FROM runs WHERE id = %s AND user_id = %s",
@@ -356,7 +394,8 @@ def get_run(run_id: int, user: dict = Depends(require_auth)):
 
 @app.post("/runs/{run_id}/resume")
 def resume_run(run_id: int, decision: str = "Maybe", comment: str = "",
-               user: dict = Depends(require_auth)):
+               user: dict = Depends(require_auth),
+               _csrf: None = Depends(require_csrf)):
     """Resume a paused (waiting_for_human) run with the human's decision."""
     if decision not in ("Apply", "Maybe", "Skip"):
         raise HTTPException(status_code=400, detail="decision must be Apply, Maybe, or Skip")
