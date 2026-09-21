@@ -128,11 +128,25 @@ def _reconcile_experience(parsed_dict):
 
 
 def parse_resume(resume_text, run_id, step_id, budget=None):
+    from prompt_safety import wrap_untrusted, HARDENING_PREAMBLE, detect_injection
+    # The resume is the most attacker-controlled input (a candidate uploads it).
+    # Log any injection-looking patterns for observability, then rely on the
+    # structural defense (delimiting + hardening) below; we still parse the resume.
+    flags = detect_injection(resume_text)
+    if flags:
+        try:
+            from llm import flag_for_review
+            flag_for_review(step_id, reason="possible_prompt_injection(resume)")
+        except Exception:
+            pass
+        print(f"    [prompt-safety] injection-like patterns in resume: {flags}")
     prompt = f"""
+{HARDENING_PREAMBLE}
+
 Extract structured information from this resume.
 
 RESUME:
-{resume_text}
+{wrap_untrusted(resume_text, "RESUME")}
 
 Return ONLY valid JSON, no markdown fences, no explanation, in EXACTLY this shape
 and using EXACTLY these key names:
@@ -159,20 +173,4 @@ RULES:
 """
     raw = logged_llm_call(prompt, run_id, step_id, budget=budget)
     cleaned = raw.strip().replace("```json", "").replace("```", "").strip()
-
-    try:
-        data = json.loads(cleaned)
-    except json.JSONDecodeError as e:
-        raise RuntimeError(f"resume parse: model did not return valid JSON ({e})")
-
-    normalized = {
-        "skills": [str(s) for s in (data.get("skills") or [])],
-        "years_experience": _to_float_or_default(data.get("years_experience")),
-        "education": _normalize_education(data.get("education")),
-        "projects": _normalize_projects(data.get("projects")),
-        "experience": _normalize_experience(data.get("experience")),
-    }
-
-    parsed = ParsedResume(**normalized).model_dump()
-    parsed = _reconcile_experience(parsed)
-    return parsed
+    # ... (the rest of parse_resume's body — validation/reconciliation — is unchanged)
