@@ -7,6 +7,8 @@ from dotenv import load_dotenv
 from google import genai
 import json
 from settings import settings
+from logging_config import get_logger
+log = get_logger(__name__)
 
 load_dotenv()
 
@@ -256,7 +258,7 @@ def save_evaluation(run_id, step_id, evaluation):
     conn.close()
 
 
-def finish_run(run_id, status="success", stop_reason=None):
+def finish_run(run_id, status="success", stop_reason=None, error_code=None):
     conn = get_connection()
     cur = conn.cursor()
     cur.execute("""
@@ -269,6 +271,8 @@ def finish_run(run_id, status="success", stop_reason=None):
     """, (datetime.now(), status, run_id, run_id, run_id))
     if stop_reason is not None:
         cur.execute("UPDATE runs SET stop_reason = %s WHERE id = %s", (stop_reason, run_id))
+    if error_code is not None:
+        cur.execute("UPDATE runs SET error_code = %s WHERE id = %s", (error_code, run_id))
     conn.commit()
     conn.close()
 
@@ -333,7 +337,7 @@ def logged_llm_call(prompt, run_id, step_id, operation="llm_call", max_retries=5
             if attempt == max_retries or not transient:
                 raise
             wait = 2 ** (attempt - 1)
-            print(f"  retry {attempt}/{max_retries - 1} after {wait}s...")
+            log.warning("retry %s/%s after %ss", attempt, max_retries - 1, wait)
             time.sleep(wait)
     if last_error:
         raise last_error

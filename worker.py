@@ -23,6 +23,9 @@ import traceback
 
 import job_queue
 from autonomous_graph import run_agent_graph, resume_agent_graph
+from logging_config import get_logger
+
+log = get_logger("worker")
 
 POLL_INTERVAL = 2.0        # seconds to sleep when the queue is empty
 HEARTBEAT_INTERVAL = 30.0  # seconds between heartbeats during a running job
@@ -67,26 +70,26 @@ def _process(job):
     try:
         _run_job(job)
         job_queue.mark_done(job["id"])
-        print(f"  job {job['id']} ({job['kind']}, run {job['run_id']}) done")
+        log.info("job %s (%s) done", job["id"], job["kind"], extra={"run_id": job["run_id"]})
     except Exception as e:
         traceback.print_exc()
         requeued = job_queue.mark_failed(
             job["id"], e, job["attempts"], job["max_attempts"])
         state = "requeued for retry" if requeued else "FAILED (out of attempts)"
-        print(f"  job {job['id']} ({job['kind']}) errored: {e} — {state}")
+        log.error("job %s (%s) errored: %s — %s", job["id"], job["kind"], e, state, extra={"run_id": job["run_id"]})
     finally:
         stop.set()
 
 
 def main():
-    print(f"Worker {job_queue.WORKER_ID} starting.")
+    log.info("worker %s starting", job_queue.WORKER_ID)
     # Startup orphan recovery: a previous worker may have died mid-job.
     try:
         n = job_queue.reclaim_orphans()
         if n:
-            print(f"  reclaimed {n} orphaned job(s) on startup")
+            log.info("reclaimed %s orphaned job(s) on startup", n)
     except Exception as e:
-        print(f"  orphan recovery failed on startup: {e}")
+        log.warning("orphan recovery failed on startup: %s", e)
 
     last_sweep = time.time()
     while True:
@@ -103,15 +106,14 @@ def main():
             if job is None:
                 time.sleep(POLL_INTERVAL)
                 continue
-            print(f"Claimed job {job['id']}: {job['kind']} (run {job['run_id']}, "
-                  f"attempt {job['attempts']}/{job['max_attempts']})")
+            log.info("claimed job %s: %s (attempt %s/%s)", job["id"], job["kind"], job["attempts"], job["max_attempts"], extra={"run_id": job["run_id"]})
             _process(job)
         except KeyboardInterrupt:
-            print("\nWorker stopping (Ctrl+C).")
+            log.info("worker stopping (Ctrl+C)")
             break
         except Exception as e:
             # A failure in the loop itself (e.g. DB blip) — log and keep going.
-            print(f"  worker loop error: {e}")
+            log.error("worker loop error: %s", e)
             time.sleep(POLL_INTERVAL)
 
 

@@ -18,12 +18,13 @@ from scorer import calculate_match_score
 from ranker import rank_jobs
 from schemas import JobDecision
 from cache_version import parse_cache_version, reqs_cache_version
+from logging_config import get_logger
 from llm import (
     create_step, finish_step, fail_step, logged_llm_call, logged_tool_call,
     record_score, record_context, flag_for_review, get_connection,
     is_cancel_requested, record_judge_signals
 )
-
+log = get_logger(__name__)
 
 def _hash(text):
     """Stable hash for cache keys (#12) — detects when resume/job text changed."""

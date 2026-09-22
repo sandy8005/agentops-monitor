@@ -9,7 +9,8 @@ that's the honest limit of what this source provides.
 """
 import requests
 import hashlib
-
+from logging_config import get_logger
+log = get_logger(__name__)
 REMOTIVE_API = "https://remotive.com/api/remote-jobs"
 
 

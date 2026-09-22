@@ -2,6 +2,9 @@ import psycopg2, os
 import re
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
+
+from logging_config import get_logger
+log = get_logger(__name__)
 load_dotenv()
 
 # Generic role words too common to distinguish a role on their own.

@@ -10,7 +10,6 @@ logic (caching, judge signals, budget, cancellation checks) is reused as-is.
 
 This is the foundation for LangGraph checkpointing + human-in-the-loop interrupts.
 """
-import os
 from typing import TypedDict, Optional, List
 from langgraph.graph import StateGraph, END
 from langgraph.types import interrupt, Command
@@ -22,17 +21,34 @@ from router import (
     do_rank_jobs, do_generate_advice, apply_human_decision,
 )
 from llm import create_run, finish_run
+from logging_config import get_logger
+from error_codes import ErrorCode, classify_exception
+
+log = get_logger(__name__)
+
+
+def _stage_error_code(error_text):
+    """Map a state.error string (set by a router stage) to an ErrorCode."""
+    t = (error_text or "").lower()
+    if t.startswith("parse") or "parse failed" in t:
+        return ErrorCode.PARSE_FAILED
+    if t.startswith("search") or "search failed" in t:
+        return ErrorCode.SEARCH_FAILED
+    return classify_exception(error_text)
 
 
 def _db_uri():
     """
-    libpq keyword/value connection string (NOT a URI). This avoids URI parsing
-    entirely, so special characters in the password (@, #, :, /) are safe —
-    a URI would mis-split on them. psycopg / PostgresSaver accept this format.
+    libpq keyword/value connection string (NOT a URI) for the LangGraph Postgres
+    checkpointer. Built from the centralized settings (the single source of DB
+    config) rather than reading os.getenv here. Keyword/value form avoids URI
+    parsing, so special characters in the password (@, #, :, /) are safe.
     """
-    return (f"host={os.getenv('DB_HOST')} port={os.getenv('DB_PORT')} "
-            f"dbname={os.getenv('DB_NAME')} user={os.getenv('DB_USER')} "
-            f"password={os.getenv('DB_PASSWORD')}")
+    from settings import settings
+    p = settings.db_kwargs()
+    return (f"host={p['host']} port={p['port']} "
+            f"dbname={p['dbname']} user={p['user']} "
+            f"password={p['password']}")
 
 
 # --- Flat, serializable graph state. Every field is JSON-serializable so the
@@ -270,30 +286,36 @@ def run_agent_graph(resume_id, target_role=None, location=None,
         if isinstance(result, dict) and result.get("__interrupt__"):
             payload = _extract_interrupt_payload(result)
             _mark_run_status(run_id, "waiting_for_human", pending_review=payload)
-            print(f"Run {run_id} PAUSED for human review: {payload or '(interrupt)'}")
+            log.info("run PAUSED for human review: %s", payload or "(interrupt)", extra={"run_id": run_id})
             return result
 
         final_state = result
+        error_code = None
         if final_state.get("cancelled"):
             final_status = "cancelled"
+            error_code = ErrorCode.CANCELLED
         elif final_state.get("error"):
             final_status = "failed"
+            error_code = _stage_error_code(final_state.get("error"))
         elif final_state.get("jobs") is not None and len(final_state.get("jobs")) == 0:
             final_status = "no_matches"
+            error_code = ErrorCode.NO_MATCHES
         elif final_state.get("failed_jobs", 0) > 0:
             final_status = "completed_with_errors"
+            # partial failure — leave error_code NULL (run still produced results)
         else:
             final_status = "success"
-        finish_run(run_id, final_status)
+        finish_run(run_id, final_status, error_code=error_code)
         _clear_pending_review(run_id)   # run completed → no outstanding review
     except Exception as e:
         final_status = "failed"
-        print(f"graph run failed: {e}")
-        finish_run(run_id, final_status)
+        log.error("graph run failed: %s", e, extra={"run_id": run_id})
+        finish_run(run_id, final_status, stop_reason=str(e),
+                   error_code=classify_exception(e))
         _clear_pending_review(run_id)   # failed too → clear any stale review card
 
-    print(f"Run {run_id} (langgraph) finished: {final_status} "
-          f"({final_state.get('llm_calls_made', 0)} LLM calls)")
+    log.info("run finished: %s (%s LLM calls)", final_status,
+             final_state.get("llm_calls_made", 0), extra={"run_id": run_id})
     ranked = final_state.get("ranked")
     if ranked:
         print("\nRANKED JOBS:")
@@ -364,7 +386,7 @@ def _clear_pending_review(run_id):
         conn.commit()
         conn.close()
     except Exception as e:
-        print(f"    (clear pending_review failed: {e})")
+        log.warning("clear pending_review failed: %s", e, extra={"run_id": run_id})
 
 
 def resume_agent_graph(run_id, decision, comment=""):
@@ -405,16 +427,16 @@ def resume_agent_graph(run_id, decision, comment=""):
 
         # --- Cancel wins over everything, including a re-pause. ---
         if cancel_requested:
-            finish_run(run_id, "cancelled", stop_reason="cancelled by user")
+            finish_run(run_id, "cancelled", stop_reason="cancelled by user", error_code=ErrorCode.CANCELLED)
             _clear_pending_review(run_id)
-            print(f"Run {run_id} cancelled during resume.")
+            log.info("run cancelled during resume", extra={"run_id": run_id})
             return result
 
         # --- Not cancelled: a fresh interrupt means pause again for the next job. ---
         if paused_again:
             payload = _extract_interrupt_payload(result)
             _mark_run_status(run_id, "waiting_for_human", pending_review=payload)
-            print(f"Run {run_id} PAUSED again for the next review.")
+            log.info("run PAUSED again for next review", extra={"run_id": run_id})
             return result
 
         # --- Completed after resume. ---
@@ -427,15 +449,16 @@ def resume_agent_graph(run_id, decision, comment=""):
             status = "completed_with_errors"
         else:
             status = "success"
-        finish_run(run_id, status)
+        finish_run(run_id, status,
+                   error_code=(ErrorCode.INTERNAL if status == 'failed' else None))
         _clear_pending_review(run_id)   # resolved -> clear the review card
-        print(f"Run {run_id} resumed and finished: {status}")
+        log.info("run resumed and finished: %s", status, extra={"run_id": run_id})
         if fs.get("ranked"):
             print("\nRANKED JOBS:")
             for i, r in enumerate(fs["ranked"], 1):
                 print(f"{i}. {r['title']} ({r['company']}) - "
                       f"score {r['score']} -> {r.get('final_decision') or r['decision']} "
-                      f"(score:{r['decision']}, judge:{r['llm_decision']})")
+                  f"(score:{r['decision']}, judge:{r['llm_decision']})")
         return result
 
     except Exception as e:
@@ -443,11 +466,12 @@ def resume_agent_graph(run_id, decision, comment=""):
         final = "cancelled" if cancel_requested else "failed"
         reason = "cancelled by user" if cancel_requested else f"resume failed: {e}"
         try:
-            finish_run(run_id, final, stop_reason=reason)
+            finish_run(run_id, final, stop_reason=reason,
+                       error_code=(ErrorCode.CANCELLED if final=='cancelled' else classify_exception(e)))
             _clear_pending_review(run_id)
         except Exception as fin_err:
-            print(f"    (failed to finalize run {run_id} after resume error: {fin_err})")
-        print(f"Run {run_id} resume {final}: {e}")
+            log.error("failed to finalize run after resume error: %s", fin_err, extra={"run_id": run_id})
+        log.error("run resume %s: %s", final, e, extra={"run_id": run_id})
         return {"error": str(e), "status": final}
 
 

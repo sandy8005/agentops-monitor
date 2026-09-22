@@ -11,7 +11,8 @@ import hashlib
 import requests
 from datetime import datetime
 from dotenv import load_dotenv
-
+from logging_config import get_logger
+log = get_logger(__name__)
 load_dotenv()
 
 ADZUNA_APP_ID = os.getenv("ADZUNA_APP_ID")
