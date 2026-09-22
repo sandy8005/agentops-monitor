@@ -1,15 +1,32 @@
 import json
 from llm import logged_llm_call
 from schemas import JobRequirements
+from prompt_safety import wrap_untrusted, HARDENING_PREAMBLE, detect_injection
 
 
 def extract_requirements(job, run_id, step_id, budget=None):
+    # A job posting is untrusted input (a poisoned listing can carry injected
+    # instructions aimed at hijacking this extraction). Log any injection-looking
+    # patterns for observability, then rely on the structural defense (hardening
+    # preamble + fenced/labelled data) below — we still extract the requirements.
+    flags = detect_injection(f"{job.get('title', '')}\n{job.get('description', '')}")
+    if flags:
+        try:
+            from llm import flag_for_review
+            flag_for_review(step_id, reason="possible_prompt_injection(job)")
+        except Exception:
+            pass
+        print(f"    [prompt-safety] injection-like patterns in job posting: {flags}")
+
     prompt = f"""
+{HARDENING_PREAMBLE}
+
 Extract structured requirements from this job posting.
 
-JOB TITLE: {job['title']}
+JOB TITLE:
+{wrap_untrusted(job['title'], "JOB_TITLE")}
 JOB DESCRIPTION:
-{job['description']}
+{wrap_untrusted(job['description'], "JOB_DESCRIPTION")}
 
 RULES for skills:
 - Each skill must be a SINGLE atomic technology, tool, or language (e.g. "Python", "Docker", "Kubernetes", "React").

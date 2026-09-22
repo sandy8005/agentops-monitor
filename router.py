@@ -18,6 +18,7 @@ from scorer import calculate_match_score
 from ranker import rank_jobs
 from schemas import JobDecision
 from cache_version import parse_cache_version, reqs_cache_version
+from prompt_safety import wrap_untrusted, HARDENING_PREAMBLE
 from logging_config import get_logger
 from llm import (
     create_step, finish_step, fail_step, logged_llm_call, logged_tool_call,
@@ -430,17 +431,19 @@ def _combined_advice(resume_text, job, requirements, missing_skills, run_id, ste
     advice, instead of two separate calls. Used only for top viable jobs.
     """
     prompt = f"""
+{HARDENING_PREAMBLE}
+
 You are a career advisor. For the job below, give the candidate BOTH:
 1. APPLICATION STRATEGY - how to position themselves for this specific role.
 2. RESUME EDITS - concrete, numbered edits to better match this job.
 
 CANDIDATE RESUME:
-{resume_text[:3000]}
+{wrap_untrusted(resume_text[:3000], "RESUME")}
 
-JOB: {job['title']} at {job.get('company','')}
-REQUIRED SKILLS: {requirements.get('required_skills', [])}
-PREFERRED SKILLS: {requirements.get('preferred_skills', [])}
-SKILLS THE RESUME IS MISSING: {missing_skills}
+JOB: {wrap_untrusted(job['title'], "JOB_TITLE")} at {wrap_untrusted(job.get('company',''), "COMPANY")}
+REQUIRED SKILLS: {wrap_untrusted(requirements.get('required_skills', []), "REQUIRED_SKILLS")}
+PREFERRED SKILLS: {wrap_untrusted(requirements.get('preferred_skills', []), "PREFERRED_SKILLS")}
+SKILLS THE RESUME IS MISSING: {wrap_untrusted(missing_skills, "MISSING_SKILLS")}
 
 Respond in exactly this format:
 STRATEGY:

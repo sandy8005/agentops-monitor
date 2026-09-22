@@ -14,26 +14,34 @@ Keep this module small and focused on those two.
 import json
 
 from schemas import JobDecision
+from prompt_safety import wrap_untrusted, HARDENING_PREAMBLE
 
 
 def build_prompt(resume_text, parsed, job, overlap, requirements):
+    # Everything interpolated below is derived from untrusted input: the parsed
+    # resume fields (candidate-uploaded), the job posting (title/company), and the
+    # requirements (LLM-extracted from the untrusted description). This is the
+    # LIVE job-judge prompt that decides Apply/Maybe/Skip, so each attacker-
+    # controllable value is fenced and the hardening preamble is prepended.
     prompt = f"""
+{HARDENING_PREAMBLE}
+
 You are a hiring assistant. Compare the candidate below against the job posting.
 
-CANDIDATE SKILLS: {parsed['skills']}
-YEARS OF EXPERIENCE: {parsed['years_experience']}
-EDUCATION: {[e['degree'] for e in parsed['education']]}
-PROJECTS: {[{'name': p['name'], 'tech': p['tech']} for p in parsed['projects']]}
+CANDIDATE SKILLS: {wrap_untrusted(parsed['skills'], "CANDIDATE_SKILLS")}
+YEARS OF EXPERIENCE: {wrap_untrusted(parsed['years_experience'], "YEARS_EXPERIENCE")}
+EDUCATION: {wrap_untrusted([e['degree'] for e in parsed['education']], "EDUCATION")}
+PROJECTS: {wrap_untrusted([{'name': p['name'], 'tech': p['tech']} for p in parsed['projects']], "PROJECTS")}
 
-JOB TITLE: {job['title']}
-COMPANY: {job['company']}
-REQUIRED SKILLS: {requirements['required_skills']}
-REQUIRED (ANY OF EACH GROUP): {requirements['required_any_of']}
-PREFERRED SKILLS: {requirements['preferred_skills']}
-MINIMUM YEARS EXPERIENCE: {requirements['min_years_experience']}
+JOB TITLE: {wrap_untrusted(job['title'], "JOB_TITLE")}
+COMPANY: {wrap_untrusted(job['company'], "COMPANY")}
+REQUIRED SKILLS: {wrap_untrusted(requirements['required_skills'], "REQUIRED_SKILLS")}
+REQUIRED (ANY OF EACH GROUP): {wrap_untrusted(requirements['required_any_of'], "REQUIRED_ANY_OF")}
+PREFERRED SKILLS: {wrap_untrusted(requirements['preferred_skills'], "PREFERRED_SKILLS")}
+MINIMUM YEARS EXPERIENCE: {wrap_untrusted(requirements['min_years_experience'], "MIN_YEARS_EXPERIENCE")}
 
-A keyword check found these required skills mentioned in the resume: {overlap['matched_in_resume']}
-And these NOT mentioned at all: {overlap['missing_from_resume']}
+A keyword check found these required skills mentioned in the resume: {wrap_untrusted(overlap['matched_in_resume'], "MATCHED_SKILLS")}
+And these NOT mentioned at all: {wrap_untrusted(overlap['missing_from_resume'], "MISSING_SKILLS")}
 
 IMPORTANT — the keyword check only confirms whether a term APPEARS in the resume
 text. It does NOT confirm real or deep experience. A skill listed in a flat

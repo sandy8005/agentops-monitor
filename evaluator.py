@@ -1,21 +1,38 @@
 import json
 from llm import logged_llm_call
 from schemas import Evaluation
+from prompt_safety import wrap_untrusted, HARDENING_PREAMBLE, detect_injection
 
 
 def evaluate_decision(resume_text, job, agent_response, run_id, step_id, budget=None):
+    # The evaluator is the component that is supposed to CATCH hallucinations and
+    # quality problems, so it must not itself be hijacked. Its inputs are
+    # untrusted: resume_text (candidate-uploaded) and the job posting. Log any
+    # injection-looking patterns, then fence every untrusted block below.
+    flags = detect_injection(f"{resume_text}\n{job.get('title', '')}\n{job.get('description', '')}")
+    if flags:
+        try:
+            from llm import flag_for_review
+            flag_for_review(step_id, reason="possible_prompt_injection(evaluator_input)")
+        except Exception:
+            pass
+        print(f"    [prompt-safety] injection-like patterns in evaluator input: {flags}")
+
     prompt = f"""
+{HARDENING_PREAMBLE}
+
 You are an evaluation judge. Grade the AI agent's job recommendation below.
 
 CANDIDATE RESUME:
-{resume_text}
+{wrap_untrusted(resume_text, "RESUME")}
 
-JOB TITLE: {job['title']}
+JOB TITLE:
+{wrap_untrusted(job['title'], "JOB_TITLE")}
 JOB DESCRIPTION:
-{job['description']}
+{wrap_untrusted(job['description'], "JOB_DESCRIPTION")}
 
 THE AGENT'S RECOMMENDATION:
-{agent_response}
+{wrap_untrusted(agent_response, "AGENT_RECOMMENDATION")}
 
 Evaluate the recommendation on these criteria:
 - relevance_score (0-10): Does the recommendation directly address THIS candidate and THIS job?
