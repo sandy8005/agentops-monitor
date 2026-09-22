@@ -62,7 +62,7 @@ def fetch_adzuna_jobs(role, location=None, limit=10):
     Never raises into the agent — failures are returned as status, not exceptions.
     """
     if not ADZUNA_APP_ID or not ADZUNA_APP_KEY:
-        print("    Adzuna keys missing (ADZUNA_APP_ID / ADZUNA_APP_KEY in .env) — skipping")
+        log.warning("Adzuna keys missing (ADZUNA_APP_ID / ADZUNA_APP_KEY in .env) — skipping")
         return ([], "missing_keys", "ADZUNA_APP_ID / ADZUNA_APP_KEY not set")
 
     url = f"https://api.adzuna.com/v1/api/jobs/{ADZUNA_COUNTRY}/search/1"
@@ -82,21 +82,21 @@ def fetch_adzuna_jobs(role, location=None, limit=10):
     except requests.exceptions.RequestException as e:
         # DNS / connection refused / timeout — request never got an HTTP response.
         msg = f"network error: {e}"
-        print(f"    Adzuna fetch failed ({msg}) — continuing with existing pool")
+        log.warning("Adzuna fetch failed (%s) — continuing with existing pool", msg)
         return ([], "network_error", msg)
 
     # Classify by HTTP status BEFORE trying to parse the body.
     if resp.status_code in (401, 403):
         msg = f"auth error: HTTP {resp.status_code}"
-        print(f"    Adzuna {msg} — check ADZUNA_APP_ID / ADZUNA_APP_KEY")
+        log.warning("Adzuna %s — check ADZUNA_APP_ID / ADZUNA_APP_KEY", msg)
         return ([], "auth_error", msg)
     if resp.status_code == 429:
         msg = "rate limited: HTTP 429"
-        print(f"    Adzuna {msg} — quota exhausted, try later")
+        log.warning("Adzuna %s — quota exhausted, try later", msg)
         return ([], "rate_limited", msg)
     if not resp.ok:
         msg = f"http error: HTTP {resp.status_code}"
-        print(f"    Adzuna {msg} — continuing with existing pool")
+        log.warning("Adzuna %s — continuing with existing pool", msg)
         return ([], "http_error", msg)
 
     try:
@@ -104,7 +104,7 @@ def fetch_adzuna_jobs(role, location=None, limit=10):
     except ValueError as e:
         # 2xx but unparseable body — treat as an HTTP-level problem, not "empty".
         msg = f"http error: bad JSON ({e})"
-        print(f"    Adzuna {msg} — continuing with existing pool")
+        log.warning("Adzuna %s — continuing with existing pool", msg)
         return ([], "http_error", msg)
 
     out = []
@@ -231,7 +231,7 @@ def _log_adzuna_call(run_id, step_id, role, location, latency_ms,
         conn.close()
     except Exception as log_err:
         # Never let trace-logging break the run.
-        print(f"    (adzuna trace log failed: {log_err})")
+        log.warning("adzuna trace log failed: %s", log_err)
 
 
 def fetch_and_upsert_adzuna(role, location=None, limit=10, run_id=None, step_id=None):
@@ -278,8 +278,7 @@ def fetch_and_upsert_adzuna(role, location=None, limit=10, run_id=None, step_id=
                      fetched, inserted, skipped, status, error_message)
 
     if fetched:
-        print(f"    adzuna: fetched {fetched}, added {inserted} new, {skipped} already "
-              f"known ({latency_ms}ms)")
+        log.info("adzuna: fetched %s, added %s new, %s already known (%sms)", fetched, inserted, skipped, latency_ms)
     return (inserted, skipped)
 
 

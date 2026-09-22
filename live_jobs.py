@@ -65,7 +65,7 @@ def fetch_live_jobs(role, location=None, limit=10):
         resp.raise_for_status()
         raw_jobs = resp.json().get("jobs", [])[:limit]
     except Exception as e:
-        print(f"    live fetch failed ({e}) — continuing with existing pool")
+        log.warning("live fetch failed (%s) — continuing with existing pool", e)
         return []
 
     out = []
@@ -127,7 +127,7 @@ def fetch_and_upsert(role, location=None, limit=10):
     jobs = fetch_live_jobs(role, location, limit)
     inserted, skipped = upsert_live_jobs(jobs)
     if jobs:
-        print(f"    live: fetched {len(jobs)}, added {inserted} new, {skipped} already known")
+        log.info("live: fetched %d, added %d new, %d already known", len(jobs), inserted, skipped)
     return (inserted, skipped)
 
 

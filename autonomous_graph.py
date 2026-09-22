@@ -322,11 +322,9 @@ def run_agent_graph(resume_id, target_role=None, location=None,
              final_state.get("llm_calls_made", 0), extra={"run_id": run_id})
     ranked = final_state.get("ranked")
     if ranked:
-        print("\nRANKED JOBS:")
+        log.info("ranked jobs:", extra={"run_id": run_id})
         for i, r in enumerate(ranked, 1):
-            print(f"{i}. {r['title']} ({r['company']}) — "
-                  f"score {r['score']} -> {r.get('final_decision') or r['decision']} "
-                  f"(score:{r['decision']}, judge:{r['llm_decision']})")
+            log.info("  %d. %s (%s) — score %s -> %s (score:%s, judge:%s)", i, r['title'], r['company'], r['score'], r.get('final_decision') or r['decision'], r['decision'], r['llm_decision'], extra={"run_id": run_id})
     return final_state
 
 
@@ -483,11 +481,9 @@ def resume_agent_graph(run_id, decision, comment=""):
         _clear_pending_review(run_id)   # resolved -> clear the review card
         log.info("run resumed and finished: %s", status, extra={"run_id": run_id})
         if fs.get("ranked"):
-            print("\nRANKED JOBS:")
+            log.info("ranked jobs:", extra={"run_id": run_id})
             for i, r in enumerate(fs["ranked"], 1):
-                print(f"{i}. {r['title']} ({r['company']}) - "
-                      f"score {r['score']} -> {r.get('final_decision') or r['decision']} "
-                  f"(score:{r['decision']}, judge:{r['llm_decision']})")
+                log.info("  %d. %s (%s) — score %s -> %s (score:%s, judge:%s)", i, r['title'], r['company'], r['score'], r.get('final_decision') or r['decision'], r['decision'], r['llm_decision'], extra={"run_id": run_id})
         return result
 
     except Exception as e:

@@ -19,7 +19,6 @@ claim the same job.
 """
 import time
 import threading
-import traceback
 
 import job_queue
 from autonomous_graph import run_agent_graph, resume_agent_graph
@@ -140,11 +139,10 @@ def _process(job):
             else:
                 outcome, code = SUCCESS, None
         except Exception as e:
-            traceback.print_exc()
             code = classify_exception(e)
             outcome = RETRYABLE_FAILURE if code in RETRYABLE_ERROR_CODES else TERMINAL_FAILURE
-            log.error("job %s (%s) raised: %s (code=%s)", job["id"], job["kind"], e, code,
-                      extra={"run_id": job["run_id"]})
+            log.exception("job %s (%s) raised (code=%s)", job["id"], job["kind"], code,
+                          extra={"run_id": job["run_id"]})
 
         # Record the outcome — only if we still hold the lease.
         if lost_lease.is_set():

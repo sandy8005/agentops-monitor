@@ -389,8 +389,8 @@ def search_jobs(target_role=None, location=None, work_mode=None,
 
     # --- results handling: honest empty result, never manufactured jobs ---
     if len(filtered) == 0:
-        print(f"  (no jobs matched '{target_role}' with the given filters)")
+        log.info("no jobs matched '%s' with the given filters", target_role)
         return []
 
-    print(f"  ({len(filtered)} of {len(all_jobs)} job(s) matched your criteria)")
+    log.info("%d of %d job(s) matched your criteria", len(filtered), len(all_jobs))
     return filtered

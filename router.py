@@ -88,7 +88,7 @@ def do_parse_resume(state, run_id):
         if cached is not None:
             state.parsed_resume = cached
             finish_step(step_id, "success")
-            print("    (parsed resume served from cache — 0 LLM calls)")
+            log.info("parsed resume served from cache — 0 LLM calls", extra={"step_id": step_id})
             return
         parsed = parse_resume(state.resume_text, run_id, step_id, budget=state)
         _parse_cache_put(rhash, parsed)
@@ -115,7 +115,7 @@ def do_search_jobs(state, run_id):
             fetch_and_upsert_adzuna(state.target_role, state.location,
                                     run_id=run_id, step_id=step_id)
         except Exception as live_err:
-            print(f"    adzuna fetch skipped ({live_err}) — using existing pool")
+            log.warning("adzuna fetch skipped (%s) — using existing pool", live_err)
 
         state.jobs = logged_tool_call(
             "search_jobs",
@@ -250,16 +250,15 @@ def do_process_job(state, run_id):
                 except Exception as extract_err:
                     from rule_requirements import extract_requirements_rule_based
                     requirements = extract_requirements_rule_based(job)
-                    print(f"    requirements via rules (LLM failed: {extract_err}) — 0 LLM calls")
+                    log.warning("requirements via rules (LLM failed: %s) — 0 LLM calls", extract_err)
             else:
                 from rule_requirements import extract_requirements_rule_based
                 requirements = extract_requirements_rule_based(job)
-                print(f"    requirements via rules (budget spent) — 0 LLM calls")
+                log.info("requirements via rules (budget spent) — 0 LLM calls")
             _reqs_cache_put(dhash, requirements, extraction_method)
         else:
             method = (provenance or {}).get("extraction_method") or "unknown"
-            print(f"    (requirements for '{job['title']}' served from cache "
-                  f"[{method}] — 0 LLM calls)")
+            log.info("requirements for '%s' served from cache [%s] — 0 LLM calls", job['title'], method)
 
         # 2. deterministic score — traced (0 LLM calls), runs FIRST (#4)
         user_input = {
@@ -304,7 +303,7 @@ def do_process_job(state, run_id):
             except Exception as judge_err:
                 judge_skip_reason = "judge_unavailable"
                 llm_decision = "skipped (judge_unavailable)"
-                print(f"    judge unavailable for '{job['title']}' ({judge_err}) — keeping score")
+                log.warning("judge unavailable for '%s' (%s) — keeping score", job['title'], judge_err)
 
         needs_review = record_score(step_id, score, score_result["decision"],
                                     llm_decision, breakdown=score_result["breakdown"])
@@ -365,17 +364,16 @@ def do_process_job(state, run_id):
                     reason = ("hallucination" if eval_result["hallucination_detected"]
                               else "low_evaluation_scores")
                     flag_for_review(step_id, reason=reason)
-                print(f"    eval: rel={rel} faith={faith} complete={comp} "
-                      f"halluc={eval_result['hallucination_detected']}")
+                log.info("eval: rel=%s faith=%s complete=%s halluc=%s", rel, faith, comp, eval_result['hallucination_detected'])
             except Exception as eval_err:
                 flag_for_review(step_id, reason="evaluation_failed")
-                print(f"    evaluation requested but failed: {eval_err}")
+                log.warning("evaluation requested but failed: %s", eval_err)
 
         finish_step(step_id, "success")
     except Exception as e:
         state.failed_jobs += 1   # count it so the run can report completed_with_errors
         fail_step(step_id, e)
-        print(f"    job '{job['title']}' failed: {e}")
+        log.exception("job '%s' failed", job['title'], extra={"step_id": step_id})
     finally:
         # ALWAYS advance to the next job, success or failure. finally runs no
         # matter what — a failing job is skipped, never retried forever.
@@ -422,7 +420,7 @@ def _persist_rankings(run_id, ranked):
         conn.commit()
         conn.close()
     except Exception as e:
-        print(f"    (persist rankings failed: {e})")
+        log.exception("persist rankings failed", extra={"run_id": run_id})
 
 
 def _combined_advice(resume_text, job, requirements, missing_skills, run_id, step_id, budget=None):
@@ -475,7 +473,7 @@ def _persist_advice(run_id, job_id, title, advice):
         conn.commit()
         conn.close()
     except Exception as e:
-        print(f"    (persist advice failed: {e})")
+        log.exception("persist advice failed", extra={"run_id": run_id})
 
 
 def do_generate_advice(state, run_id, top_n=2):
@@ -490,7 +488,7 @@ def do_generate_advice(state, run_id, top_n=2):
                   if r.get("final_decision", r.get("decision")) in ("Apply", "Maybe")][:top_n]
         for r in viable:
             if state.budget_exceeded():
-                print("    (advice skipped - budget reached)")
+                log.info("advice skipped — budget reached")
                 break
             # Look up the posting by STABLE job_id, falling back to title only when
             # job_id is missing (legacy rows).
@@ -513,7 +511,7 @@ def do_generate_advice(state, run_id, top_n=2):
                                       sc["missing_skills"], run_id, step_id,
                                       budget=state)
             _persist_advice(run_id, job.get("id"), job["title"], advice)
-            print(f"\n  ADVICE for {r['title']}:\n{advice.strip()}\n")
+            log.info("advice for %s:\n%s", r['title'], advice.strip())
         finish_step(step_id, "success")
         state.advice_done = True
     except Exception as e:
