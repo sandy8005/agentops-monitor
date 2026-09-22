@@ -1,6 +1,49 @@
-.env
+# --- Python bytecode / caches ---
 __pycache__/
-*.db
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# --- Virtual environments ---
 venv/
-SANDEEP_BARIGE_Resume.pdf
+.venv/
+env/
+ENV/
+
+# --- Secrets / local config ---
+.env
+.env.*
+!.env.example
+
+# --- Legacy SQLite artifacts (project is Postgres-only) ---
+*.db
+*.sqlite
+*.sqlite3
+agentops.db
+
+# --- Local dev/test utilities (throwaway scripts, not part of the app) ---
+clear_cache.py
+finish_stuck.py
+check_gemini.py
+check_run.py
+check_cols.py
+reset_pw.py
+force_paused_run.py
+
+# --- Uploaded resumes / local data ---
 *.pdf
+uploads/
+
+# --- OS / editor ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+
+# --- Build / dist ---
+build/
+dist/
+*.egg-info/
