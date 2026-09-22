@@ -304,7 +304,8 @@ def get_run(run_id: int, user: dict = Depends(require_auth)):
 
     cur.execute("""
         SELECT id, status, started_at, ended_at, input_summary, total_tokens, total_cost,
-               resume_id, target_role, location, work_mode, employment_type, pending_review
+               resume_id, target_role, location, work_mode, employment_type, pending_review,
+               stop_reason, error_code
         FROM runs WHERE id = %s AND user_id = %s
     """, (run_id, user["id"]))
     run = cur.fetchone()
@@ -388,6 +389,7 @@ def get_run(run_id: int, user: dict = Depends(require_auth)):
         "resume_id": run[7], "target_role": run[8], "location": run[9],
         "work_mode": run[10], "employment_type": run[11],
         "pending_review": run[12],
+        "stop_reason": run[13], "error_code": run[14],
         "steps": steps
     }
 
