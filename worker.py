@@ -55,13 +55,29 @@ def _run_job(job):
 
 
 def _process(job):
-    """Run one job under a heartbeat, updating the queue on success/failure."""
+    """Run one job under a heartbeat, updating the queue on success/failure.
+
+    All queue mutations are guarded by the per-claim lease token: if orphan recovery
+    reclaimed this job and another worker took it, our heartbeat/mark_done/mark_failed
+    match zero rows and we stop touching the record — the owning worker is now
+    authoritative. (This bounds the queue-record damage; it does not undo agent side
+    effects this worker may already have written before losing the lease.)"""
     stop = threading.Event()
+    lost_lease = threading.Event()
+    lease = job["lease_token"]
 
     def _beat():
         while not stop.wait(HEARTBEAT_INTERVAL):
             try:
-                job_queue.heartbeat(job["id"])
+                if not job_queue.heartbeat(job["id"], lease):
+                    # We no longer own this job — reclaimed as an orphan and taken by
+                    # another worker. Stop heart-beating and flag it; from here on we
+                    # must not mutate the queue record.
+                    lost_lease.set()
+                    log.warning("job %s lease lost — another worker owns it now; "
+                                "this worker will stop touching the queue record",
+                                job["id"], extra={"run_id": job["run_id"]})
+                    return
             except Exception:
                 pass  # heartbeat failure shouldn't kill the job
 
@@ -69,14 +85,23 @@ def _process(job):
     beat.start()
     try:
         _run_job(job)
-        job_queue.mark_done(job["id"])
-        log.info("job %s (%s) done", job["id"], job["kind"], extra={"run_id": job["run_id"]})
+        if lost_lease.is_set() or not job_queue.mark_done(job["id"], lease):
+            log.warning("job %s finished but its lease was lost — NOT marking done "
+                        "(another worker owns it)", job["id"], extra={"run_id": job["run_id"]})
+        else:
+            log.info("job %s (%s) done", job["id"], job["kind"], extra={"run_id": job["run_id"]})
     except Exception as e:
         traceback.print_exc()
-        requeued = job_queue.mark_failed(
-            job["id"], e, job["attempts"], job["max_attempts"])
-        state = "requeued for retry" if requeued else "FAILED (out of attempts)"
-        log.error("job %s (%s) errored: %s — %s", job["id"], job["kind"], e, state, extra={"run_id": job["run_id"]})
+        if lost_lease.is_set():
+            log.error("job %s (%s) errored AFTER losing its lease — leaving it to the "
+                      "owning worker: %s", job["id"], job["kind"], e, extra={"run_id": job["run_id"]})
+        else:
+            outcome = job_queue.mark_failed(
+                job["id"], e, job["attempts"], job["max_attempts"], lease)
+            state = {"requeued": "requeued for retry",
+                     "failed": "FAILED (out of attempts)",
+                     "lost": "lease lost — left to owning worker"}.get(outcome, outcome)
+            log.error("job %s (%s) errored: %s — %s", job["id"], job["kind"], e, state, extra={"run_id": job["run_id"]})
     finally:
         stop.set()
 
