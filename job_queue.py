@@ -37,6 +37,19 @@ ORPHAN_AFTER = timedelta(minutes=15)
 
 WORKER_ID = f"{socket.gethostname()}:{os.getpid()}"
 
+# Retry backoff: a requeued (retryable) job waits base * 2**(attempts-1) seconds,
+# capped, before it can be claimed again — so a persistently-failing job doesn't
+# spin fail -> queued -> claim -> fail with no pause.
+RETRY_BASE_DELAY = 10    # seconds
+RETRY_MAX_DELAY = 300    # seconds (5 minutes)
+
+
+def _retry_delay(attempts):
+    """Seconds to wait before the NEXT attempt. `attempts` is how many have already
+    been made (>=1): 1 -> 10s, 2 -> 20s, 3 -> 40s, ... capped at RETRY_MAX_DELAY."""
+    delay = RETRY_BASE_DELAY * (2 ** max(0, attempts - 1))
+    return min(delay, RETRY_MAX_DELAY)
+
 
 # ---------------------------------------------------------------- enqueue -----
 
@@ -88,6 +101,7 @@ def claim_next(worker_id=WORKER_ID):
             SELECT id, kind, payload, run_id, attempts, max_attempts
             FROM job_queue
             WHERE status = 'queued'
+              AND (available_at IS NULL OR available_at <= NOW())
             ORDER BY enqueued_at
             FOR UPDATE SKIP LOCKED
             LIMIT 1
@@ -158,11 +172,16 @@ def mark_done(job_id, lease_token):
     return owned
 
 
-def mark_failed(job_id, error, attempts, max_attempts, lease_token):
+def mark_failed(job_id, error, attempts, max_attempts, lease_token, terminal=False):
     """
-    Fail a job — only if this worker still holds the lease. If it still has attempts
-    left, put it BACK to 'queued' for retry (clearing the lease so the next claim
-    gets a fresh one); otherwise mark it permanently 'failed'. Records the error.
+    Record a job failure — only if this worker still holds the lease.
+
+    terminal=False (a RETRYABLE failure): if attempts remain, put the job BACK to
+      'queued' for retry — clearing the lease and setting available_at to NOW() + an
+      exponential backoff so it isn't re-claimed immediately; out of attempts it
+      becomes 'failed'.
+    terminal=True (a TERMINAL failure — bad input, parse failure, budget spent, ...):
+      mark it 'failed' straight away, no retry, regardless of remaining attempts.
 
     Returns one of: "requeued", "failed", or "lost" (the lease was lost, so another
     worker already owns the job and we changed nothing — the caller must not retry
@@ -170,13 +189,15 @@ def mark_failed(job_id, error, attempts, max_attempts, lease_token):
     """
     conn = get_connection()
     cur = conn.cursor()
-    if attempts < max_attempts:
+    if not terminal and attempts < max_attempts:
+        available_at = datetime.now() + timedelta(seconds=_retry_delay(attempts))
         cur.execute("""
             UPDATE job_queue
             SET status = 'queued', last_error = %s, claimed_at = NULL,
-                heartbeat_at = NULL, worker_id = NULL, lease_token = NULL
+                heartbeat_at = NULL, worker_id = NULL, lease_token = NULL,
+                available_at = %s
             WHERE id = %s AND status = 'running' AND lease_token = %s
-        """, (str(error)[:2000], job_id, lease_token))
+        """, (str(error)[:2000], available_at, job_id, lease_token))
         outcome = "requeued" if cur.rowcount == 1 else "lost"
     else:
         cur.execute("""
@@ -206,7 +227,7 @@ def reclaim_orphans():
     cur.execute("""
         UPDATE job_queue
         SET status = 'queued', claimed_at = NULL, heartbeat_at = NULL, worker_id = NULL,
-            lease_token = NULL,
+            lease_token = NULL, available_at = NULL,
             last_error = COALESCE(last_error, '') || ' [reclaimed orphan]'
         WHERE status = 'running'
           AND attempts < max_attempts

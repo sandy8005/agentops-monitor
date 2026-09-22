@@ -23,6 +23,8 @@ import traceback
 
 import job_queue
 from autonomous_graph import run_agent_graph, resume_agent_graph
+from error_codes import classify_exception
+from database import get_connection
 from logging_config import get_logger
 
 log = get_logger("worker")
@@ -30,6 +32,49 @@ log = get_logger("worker")
 POLL_INTERVAL = 2.0        # seconds to sleep when the queue is empty
 HEARTBEAT_INTERVAL = 30.0  # seconds between heartbeats during a running job
 ORPHAN_SWEEP_INTERVAL = 60.0  # seconds between orphan-recovery sweeps
+
+# --- Worker outcome contract -------------------------------------------------
+# The queue outcome is decided by the RUN'S recorded status/error_code, NOT by
+# "did _run_job raise". Both graph entrypoints catch their own exceptions and
+# finalize the run (finish_run / waiting_for_human) before returning normally, so a
+# normal return can still mean the run failed — inspecting the run row is the only
+# reliable signal.
+SUCCESS = "success"
+RETRYABLE_FAILURE = "retryable_failure"
+TERMINAL_FAILURE = "terminal_failure"
+
+# Failures worth retrying: transient / infrastructure codes. Everything else (bad
+# input, parse failure, budget spent, cancelled) is terminal — retrying won't help.
+RETRYABLE_ERROR_CODES = {"llm_unavailable", "llm_quota_exhausted"}
+
+
+def _run_outcome(run_id):
+    """
+    Map a finished job to a queue outcome by reading the RUN'S authoritative status
+    and error_code from the DB. This is the worker contract — SUCCESS /
+    RETRYABLE_FAILURE / TERMINAL_FAILURE — rather than "did the call raise".
+
+    A paused run (waiting_for_human) means THIS job finished its work; the run
+    continues later via a separate resume_run job, so it counts as job success.
+    """
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT status, error_code FROM runs WHERE id = %s", (run_id,))
+    row = cur.fetchone()
+    conn.close()
+    if not row:
+        return TERMINAL_FAILURE, None   # run vanished — nothing to retry into
+    status, error_code = row
+    if status in ("success", "no_matches", "completed_with_errors",
+                  "cancelled", "waiting_for_human"):
+        return SUCCESS, error_code
+    if status == "failed":
+        if error_code in RETRYABLE_ERROR_CODES:
+            return RETRYABLE_FAILURE, error_code
+        return TERMINAL_FAILURE, error_code
+    # 'running'/'queued'/unknown: the graph didn't finalize (shouldn't happen on a
+    # normal return). Treat as retryable so the job isn't silently marked done.
+    return RETRYABLE_FAILURE, error_code
 
 
 def _run_job(job):
@@ -55,13 +100,18 @@ def _run_job(job):
 
 
 def _process(job):
-    """Run one job under a heartbeat, updating the queue on success/failure.
+    """Run one job under a heartbeat, then record its outcome on the queue.
 
-    All queue mutations are guarded by the per-claim lease token: if orphan recovery
-    reclaimed this job and another worker took it, our heartbeat/mark_done/mark_failed
-    match zero rows and we stop touching the record — the owning worker is now
-    authoritative. (This bounds the queue-record damage; it does not undo agent side
-    effects this worker may already have written before losing the lease.)"""
+    Two-part contract:
+      1. Outcome is SUCCESS / RETRYABLE_FAILURE / TERMINAL_FAILURE, decided by the
+         run's recorded status (see _run_outcome) — not by whether _run_job raised,
+         since the graph catches its own errors and finalizes the run before
+         returning. A raised exception is itself a failure, classified by its code.
+      2. Every queue mutation is lease-guarded: if orphan recovery reclaimed this
+         job and another worker took it, our heartbeat/mark_* match zero rows and we
+         stop touching the record. (Bounds queue-record damage; does not undo agent
+         side effects already written before the lease was lost.)
+    """
     stop = threading.Event()
     lost_lease = threading.Event()
     lease = job["lease_token"]
@@ -70,9 +120,6 @@ def _process(job):
         while not stop.wait(HEARTBEAT_INTERVAL):
             try:
                 if not job_queue.heartbeat(job["id"], lease):
-                    # We no longer own this job — reclaimed as an orphan and taken by
-                    # another worker. Stop heart-beating and flag it; from here on we
-                    # must not mutate the queue record.
                     lost_lease.set()
                     log.warning("job %s lease lost — another worker owns it now; "
                                 "this worker will stop touching the queue record",
@@ -84,24 +131,38 @@ def _process(job):
     beat = threading.Thread(target=_beat, daemon=True)
     beat.start()
     try:
-        _run_job(job)
-        if lost_lease.is_set() or not job_queue.mark_done(job["id"], lease):
-            log.warning("job %s finished but its lease was lost — NOT marking done "
-                        "(another worker owns it)", job["id"], extra={"run_id": job["run_id"]})
-        else:
-            log.info("job %s (%s) done", job["id"], job["kind"], extra={"run_id": job["run_id"]})
-    except Exception as e:
-        traceback.print_exc()
+        # Decide the outcome. A raised exception is classified by its error code; a
+        # normal return is classified from the run's finalized status.
+        try:
+            _run_job(job)
+            if job.get("run_id") is not None:
+                outcome, code = _run_outcome(job["run_id"])
+            else:
+                outcome, code = SUCCESS, None
+        except Exception as e:
+            traceback.print_exc()
+            code = classify_exception(e)
+            outcome = RETRYABLE_FAILURE if code in RETRYABLE_ERROR_CODES else TERMINAL_FAILURE
+            log.error("job %s (%s) raised: %s (code=%s)", job["id"], job["kind"], e, code,
+                      extra={"run_id": job["run_id"]})
+
+        # Record the outcome — only if we still hold the lease.
         if lost_lease.is_set():
-            log.error("job %s (%s) errored AFTER losing its lease — leaving it to the "
-                      "owning worker: %s", job["id"], job["kind"], e, extra={"run_id": job["run_id"]})
+            log.warning("job %s: lease lost — NOT recording outcome '%s' (another worker owns it)",
+                        job["id"], outcome, extra={"run_id": job["run_id"]})
+        elif outcome == SUCCESS:
+            if job_queue.mark_done(job["id"], lease):
+                log.info("job %s (%s) done", job["id"], job["kind"], extra={"run_id": job["run_id"]})
+            else:
+                log.warning("job %s finished but lease was lost — NOT marking done",
+                            job["id"], extra={"run_id": job["run_id"]})
         else:
-            outcome = job_queue.mark_failed(
-                job["id"], e, job["attempts"], job["max_attempts"], lease)
-            state = {"requeued": "requeued for retry",
-                     "failed": "FAILED (out of attempts)",
-                     "lost": "lease lost — left to owning worker"}.get(outcome, outcome)
-            log.error("job %s (%s) errored: %s — %s", job["id"], job["kind"], e, state, extra={"run_id": job["run_id"]})
+            terminal = (outcome == TERMINAL_FAILURE)
+            res = job_queue.mark_failed(job["id"], code or outcome, job["attempts"],
+                                        job["max_attempts"], lease, terminal=terminal)
+            log.error("job %s (%s) failed [%s, code=%s] — %s",
+                      job["id"], job["kind"], "terminal" if terminal else "retryable",
+                      code, res, extra={"run_id": job["run_id"]})
     finally:
         stop.set()
 
