@@ -1,0 +1,11 @@
+# AgentOps Monitor — development & test dependencies.
+# Installs everything in requirements.txt plus the test-only packages, so that
+# tests actually RUN instead of silently SKIPping on a missing import.
+#   python -m venv venv && pip install -r requirements-dev.txt
+
+-r requirements.txt
+
+pytest==9.1.1
+httpx==0.28.1                     # REQUIRED by Starlette/FastAPI TestClient (tests/test_authorization.py)
+reportlab==4.4.10                 # builds real PDFs for the resume-upload auth tests — without it,
+                                  # pytest.importorskip("reportlab") SKIPS those authorization tests
