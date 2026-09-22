@@ -89,12 +89,9 @@ def fetch_live_jobs(role, location=None, limit=10):
 
 
 def _get_connection():
-    import psycopg2, os
-    from dotenv import load_dotenv
-    load_dotenv()
-    return psycopg2.connect(
-        dbname=os.getenv("DB_NAME"), user=os.getenv("DB_USER"),
-        password=os.getenv("DB_PASSWORD"), host=os.getenv("DB_HOST"), port=os.getenv("DB_PORT"))
+    # Draw from the shared pool (database.py) rather than opening a fresh socket.
+    from database import get_connection
+    return get_connection()
 
 
 def upsert_live_jobs(jobs):

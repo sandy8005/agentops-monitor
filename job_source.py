@@ -1,4 +1,5 @@
-import psycopg2, os
+import os
+from database import get_connection
 import re
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
@@ -14,13 +15,6 @@ GENERIC_ROLE_WORDS = {
     "junior", "staff", "principal", "associate", "intern", "assistant",
     "of", "the", "and", "or", "a", "an", "i", "ii", "iii"
 }
-
-
-def get_connection():
-    return psycopg2.connect(
-        dbname=os.getenv("DB_NAME"), user=os.getenv("DB_USER"),
-        password=os.getenv("DB_PASSWORD"), host=os.getenv("DB_HOST"), port=os.getenv("DB_PORT")
-    )
 
 
 STALE_AFTER_DAYS = 14   # jobs not seen in this many days drop out of search

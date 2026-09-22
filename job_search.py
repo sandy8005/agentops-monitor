@@ -15,14 +15,8 @@ creates a search row (run_id NULL) so associations remain queryable, and it neve
 raises into the agent.
 """
 import os
-import psycopg2
+from database import get_connection as _get_connection
 from datetime import datetime
-
-
-def _get_connection():
-    return psycopg2.connect(
-        dbname=os.getenv("DB_NAME"), user=os.getenv("DB_USER"),
-        password=os.getenv("DB_PASSWORD"), host=os.getenv("DB_HOST"), port=os.getenv("DB_PORT"))
 
 
 def create_search(run_id, target_role, location, source, conn=None):

@@ -1,7 +1,7 @@
 import time
 import random
 from datetime import datetime
-import psycopg2
+from database import get_connection
 import os
 from dotenv import load_dotenv
 from google import genai
@@ -32,14 +32,9 @@ class BudgetExceeded(Exception):
 
 
 
-def get_connection():
-    return psycopg2.connect(
-        dbname=os.getenv("DB_NAME"),
-        user=os.getenv("DB_USER"),
-        password=os.getenv("DB_PASSWORD"),
-        host=os.getenv("DB_HOST"),
-        port=os.getenv("DB_PORT")
-    )
+# get_connection is imported (pooled) from database at the top of this module, so
+# every `from llm import get_connection` (router.py, autonomous_graph.py, ...) now
+# draws from the shared ThreadedConnectionPool instead of opening a fresh socket.
 
 
 def quota_available():
