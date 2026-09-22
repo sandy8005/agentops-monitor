@@ -2,22 +2,16 @@ var NL = String.fromCharCode(10);
     var pollTimer = null;
     var _csrfToken = null;
 
-    // Read the CSRF token from the readable cookie (set by GET /csrf).
-    function _readCsrfCookie() {
-      var m = document.cookie.match(/(?:^|;\s*)csrf_token=([^;]+)/);
-      return m ? decodeURIComponent(m[1]) : null;
-    }
-
-    // Ensure we have a CSRF token (fetch one if missing).
+    // The CSRF token is bound to the session and returned by GET /csrf in the JSON
+    // body (there is no readable cookie). Fetch once and cache; it's cleared on
+    // logout so the next session gets a fresh token.
     async function ensureCsrf() {
-      _csrfToken = _readCsrfCookie();
-      if (!_csrfToken) {
-        try {
-          const r = await fetch('/csrf');
-          const j = await r.json();
-          _csrfToken = (j && j.csrf_token) || _readCsrfCookie();
-        } catch (e) { /* leave null; state-changing calls will 403 and prompt reload */ }
-      }
+      if (_csrfToken) return _csrfToken;
+      try {
+        const r = await fetch('/csrf');
+        const j = await r.json();
+        _csrfToken = (j && j.csrf_token) || null;
+      } catch (e) { /* leave null; state-changing calls will 403 and prompt reload */ }
       return _csrfToken;
     }
 
@@ -353,6 +347,7 @@ var NL = String.fromCharCode(10);
 
     async function doLogout() {
       try { await csrfFetch('/logout', { method: 'POST' }); } catch (e) {}
+      _csrfToken = null;   // drop the old session's token; next session fetches a fresh one
       if (_reviewTimer) { clearInterval(_reviewTimer); _reviewTimer = null; }
       showLogin('Signed out.');
     }

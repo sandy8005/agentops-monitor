@@ -45,26 +45,12 @@ def _fresh_logged_in_client():
     c = TestClient(api.app)
     r = c.post("/login", data={"username": uname, "password": pw})
     assert r.status_code == 200, r.text
+    # CSRF is session-bound: fetch this session's token and attach it as a default
+    # header so every state-changing request carries it. Without this, the POST/DELETE
+    # calls below would 403 on CSRF and never exercise AUTHORIZATION.
+    token = c.get("/csrf").json()["csrf_token"]
+    c.headers.update({"X-CSRF-Token": token})
     return c
-
-
-def _make_pdf_bytes(text="Python SQL Django engineer resume with real content"):
-    """Build a valid, text-bearing PDF with reportlab so pypdf can extract text.
-    Skips the whole module if reportlab isn't installed."""
-    pytest.importorskip("reportlab", reason="reportlab needed to build a test PDF")
-    from reportlab.pdfgen import canvas
-    from reportlab.lib.pagesizes import letter
-    import io
-    buf = io.BytesIO()
-    c = canvas.Canvas(buf, pagesize=letter)
-    y = 720
-    for line in [text, "Skills: Python, SQL, Django, AWS", "Experience: 5 years",
-                 "Projects: agentops monitor", "Education: BS Computer Science"]:
-        c.drawString(72, y, line)
-        y -= 24
-    c.showPage()
-    c.save()
-    return buf.getvalue()
 
 
 def _make_pdf_bytes(text="Python SQL Django engineer resume with real content"):
@@ -94,6 +80,17 @@ def _upload_resume(c):
         pytest.skip("resume text extraction unavailable in this environment")
     assert r.status_code == 200, r.text
     return r.json()["resume_id"]
+
+
+def test_csrf_required_on_state_change():
+    """A logged-in client that omits the CSRF token is rejected with 403 on a
+    state-changing request — proving the ownership tests pass because of the token the
+    helper attaches, not because CSRF protection is off. (require_auth runs first, so
+    this 403 is specifically the CSRF check, not a 401.)"""
+    c = _fresh_logged_in_client()
+    c.headers.pop("X-CSRF-Token", None)   # drop what the helper attached
+    r = c.post("/runs?resume_id=1&target_role=engineer")
+    assert r.status_code == 403, r.text
 
 
 def test_user_cannot_list_others_resumes():

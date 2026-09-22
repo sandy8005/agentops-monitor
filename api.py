@@ -11,7 +11,7 @@ from llm import create_run, create_run_tx, request_cancel
 from job_queue import enqueue, enqueue_tx
 from pdf_reader import read_resume_file
 from auth import authenticate
-from csrf import issue_token, set_csrf_cookie, require_csrf
+from csrf import get_or_create_token, require_csrf
 
 from slowapi import Limiter
 from slowapi.util import get_remote_address
@@ -91,12 +91,10 @@ def dashboard():
 
 @app.get("/csrf")
 def get_csrf(request: Request):
-    """Issue a CSRF token (readable cookie). The frontend calls this on load and
-    echoes the value in the X-CSRF-Token header on state-changing requests."""
-    token = issue_token()
-    resp = JSONResponse({"csrf_token": token})
-    set_csrf_cookie(resp, token, secure=settings.is_production)
-    return resp
+    """Return the session-bound CSRF token (minting one into the session if needed).
+    The frontend reads it from this JSON body and echoes it in the X-CSRF-Token
+    header on state-changing requests; require_csrf checks it against the session."""
+    return {"csrf_token": get_or_create_token(request)}
 
 
 @app.post("/login")
