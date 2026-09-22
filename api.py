@@ -7,7 +7,6 @@ from fastapi.staticfiles import StaticFiles
 from starlette.middleware.sessions import SessionMiddleware
 from datetime import datetime
 import psycopg2, os, tempfile
-from dotenv import load_dotenv
 from llm import create_run, create_run_tx, request_cancel
 from job_queue import enqueue, enqueue_tx
 from pdf_reader import read_resume_file
@@ -18,7 +17,6 @@ from slowapi import Limiter
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 
-load_dotenv()
 app = FastAPI(title="AgentOps Monitor")
 
 # --- Rate limiting ----------------------------------------------------------

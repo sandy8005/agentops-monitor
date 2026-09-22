@@ -1,12 +1,9 @@
-import os
 from database import get_connection
 import re
 from datetime import datetime, timedelta
-from dotenv import load_dotenv
 
 from logging_config import get_logger
 log = get_logger(__name__)
-load_dotenv()
 
 # Generic role words too common to distinguish a role on their own.
 GENERIC_ROLE_WORDS = {

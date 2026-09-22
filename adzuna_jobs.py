@@ -6,18 +6,16 @@ role (`what`) and location (`where`), so "AI Engineer" in "Texas" returns actual
 AI Engineer jobs in Texas. Free tier; requires ADZUNA_APP_ID + ADZUNA_APP_KEY
 in .env. Same fetch → normalize → dedup → upsert shape as live_jobs.py.
 """
-import os
 import hashlib
 import requests
 from datetime import datetime
-from dotenv import load_dotenv
+from settings import settings
 from logging_config import get_logger
 log = get_logger(__name__)
-load_dotenv()
 
-ADZUNA_APP_ID = os.getenv("ADZUNA_APP_ID")
-ADZUNA_APP_KEY = os.getenv("ADZUNA_APP_KEY")
-ADZUNA_COUNTRY = os.getenv("ADZUNA_COUNTRY", "us")   # us, gb, au, etc.
+ADZUNA_APP_ID = settings.adzuna_app_id
+ADZUNA_APP_KEY = settings.adzuna_app_key
+ADZUNA_COUNTRY = settings.adzuna_country   # us, gb, au, etc.
 
 
 def _external_id(job):

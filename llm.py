@@ -2,22 +2,18 @@ import time
 import random
 from datetime import datetime
 from database import get_connection
-import os
-from dotenv import load_dotenv
 from google import genai
 import json
 from settings import settings
 from logging_config import get_logger
 log = get_logger(__name__)
 
-load_dotenv()
-
 # timeout is in MILLISECONDS in google-genai's http_options. 30s means a stalled
 # Gemini call fails fast (raises) instead of hanging forever — the retry/backoff in
 # logged_llm_call then engages, and if it keeps failing the job degrades to the
 # rule-based fallback rather than freezing the whole run.
 client = genai.Client(
-    api_key=os.getenv("GEMINI_API_KEY"),
+    api_key=settings.gemini_api_key,
     http_options={"timeout": 30_000},   # 30 seconds, in ms
 )
 

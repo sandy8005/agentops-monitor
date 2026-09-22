@@ -1,10 +1,6 @@
-import os
 from database import get_connection
 from datetime import datetime
-from dotenv import load_dotenv
 import bcrypt
-
-load_dotenv()
 
 
 def hash_password(plain):
