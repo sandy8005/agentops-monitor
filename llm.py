@@ -84,20 +84,37 @@ def real_llm_once(prompt):
     }
 
 
-def create_run(input_summary, resume_id=None, target_role=None,
-               location=None, work_mode=None, employment_type=None, user_id=None):
-    conn = get_connection()
-    cur = conn.cursor()
+def create_run_tx(cur, input_summary, resume_id=None, target_role=None,
+                  location=None, work_mode=None, employment_type=None, user_id=None):
+    """
+    Transactional create_run: INSERT the run on the CALLER'S cursor and return its
+    id WITHOUT committing. Lets the API create the run and enqueue its worker job in
+    ONE transaction (both commit or both roll back), so a run is never left
+    'running' with no queue job. The caller owns commit / rollback / close.
+    """
     cur.execute("""
         INSERT INTO runs (started_at, status, input_summary, resume_id,
                           target_role, location, work_mode, employment_type, user_id)
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id
     """, (datetime.now(), "running", input_summary, resume_id,
           target_role, location, work_mode, employment_type, user_id))
-    run_id = cur.fetchone()[0]
-    conn.commit()
-    conn.close()
-    return run_id
+    return cur.fetchone()[0]
+
+
+def create_run(input_summary, resume_id=None, target_role=None,
+               location=None, work_mode=None, employment_type=None, user_id=None):
+    """Create a run in its OWN transaction (thin wrapper over create_run_tx)."""
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        run_id = create_run_tx(cur, input_summary, resume_id=resume_id,
+                               target_role=target_role, location=location,
+                               work_mode=work_mode, employment_type=employment_type,
+                               user_id=user_id)
+        conn.commit()
+        return run_id
+    finally:
+        conn.close()
 
 
 def create_step(run_id, step_name, step_order):

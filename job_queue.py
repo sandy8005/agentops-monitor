@@ -30,19 +30,34 @@ WORKER_ID = f"{socket.gethostname()}:{os.getpid()}"
 
 # ---------------------------------------------------------------- enqueue -----
 
-def enqueue(kind, payload, run_id=None, max_attempts=3):
-    """Add a job to the queue and return its id. Called by the API; returns
-    immediately so the request doesn't block on the work."""
-    conn = get_connection()
-    cur = conn.cursor()
+def enqueue_tx(cur, kind, payload, run_id=None, max_attempts=3):
+    """
+    Transactional enqueue: INSERT the job on the CALLER'S cursor and return its id
+    WITHOUT committing. This lets the API write the run (create it, or flip its
+    status) and the queue row in ONE transaction, so they commit or roll back
+    together — a run is never left 'running'/'waiting_for_human' with no queue job.
+    The caller owns the transaction (commit / rollback / close).
+    """
     cur.execute("""
         INSERT INTO job_queue (kind, payload, run_id, status, max_attempts, enqueued_at)
         VALUES (%s, %s, %s, 'queued', %s, %s) RETURNING id
     """, (kind, json.dumps(payload), run_id, max_attempts, datetime.now()))
-    job_id = cur.fetchone()[0]
-    conn.commit()
-    conn.close()
-    return job_id
+    return cur.fetchone()[0]
+
+
+def enqueue(kind, payload, run_id=None, max_attempts=3):
+    """Add a job to the queue in its OWN transaction and return its id — a thin
+    wrapper over enqueue_tx() for callers that aren't already inside a transaction
+    (e.g. the cancel path). API paths that must be atomic with a run write should
+    call enqueue_tx() on their own connection instead, not this."""
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        job_id = enqueue_tx(cur, kind, payload, run_id=run_id, max_attempts=max_attempts)
+        conn.commit()
+        return job_id
+    finally:
+        conn.close()
 
 
 # ------------------------------------------------------------------ claim -----

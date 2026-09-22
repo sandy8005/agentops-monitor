@@ -8,8 +8,8 @@ from starlette.middleware.sessions import SessionMiddleware
 from datetime import datetime
 import psycopg2, os, tempfile
 from dotenv import load_dotenv
-from llm import create_run, request_cancel
-from job_queue import enqueue
+from llm import create_run, create_run_tx, request_cancel
+from job_queue import enqueue, enqueue_tx
 from pdf_reader import read_resume_file
 from auth import authenticate
 from csrf import issue_token, set_csrf_cookie, require_csrf
@@ -236,30 +236,42 @@ def start_run(request: Request, resume_id: int = None,
         raise HTTPException(status_code=400, detail="target_role is required for a search")
 
     conn = get_connection()
-    cur = conn.cursor()
-    # The resume must belong to THIS user — otherwise a user could run against
-    # someone else's resume by guessing its id.
-    cur.execute("SELECT is_deleted FROM resumes WHERE id = %s AND user_id = %s",
-                (resume_id, user["id"]))
-    row = cur.fetchone()
-    conn.close()
-    if not row:
-        raise HTTPException(status_code=404, detail=f"Resume {resume_id} not found")
-    if row[0]:
-        raise HTTPException(status_code=400, detail="That resume was deleted; upload it again to run new searches")
+    try:
+        cur = conn.cursor()
+        # The resume must belong to THIS user — otherwise a user could run against
+        # someone else's resume by guessing its id. Checked in the SAME transaction
+        # that creates the run and enqueues its job.
+        cur.execute("SELECT is_deleted FROM resumes WHERE id = %s AND user_id = %s",
+                    (resume_id, user["id"]))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail=f"Resume {resume_id} not found")
+        if row[0]:
+            raise HTTPException(status_code=400, detail="That resume was deleted; upload it again to run new searches")
 
-    run_id = create_run("job search run (dashboard)", resume_id=resume_id,
-                        target_role=target_role, location=location,
-                        work_mode=work_mode, employment_type=employment_type,
-                        user_id=user["id"])
-    # Enqueue the run onto the durable Postgres queue and return immediately. A
-    # separate worker process (worker.py) claims and runs it, so the run survives
-    # an API restart/crash (unlike the old in-process BackgroundTasks).
-    job_id = enqueue("start_run", {
-        "resume_id": resume_id, "target_role": target_role, "location": location,
-        "work_mode": work_mode, "employment_type": employment_type,
-        "evaluate": evaluate, "run_id": run_id, "live_only": live_only,
-    }, run_id=run_id)
+        # ATOMIC: create the run AND enqueue its worker job in ONE transaction, so
+        # they commit or roll back together. Previously create_run() and enqueue()
+        # committed on separate connections: if enqueue failed, the run was left
+        # 'running' with no queue job and could sit forever. Now a failure rolls the
+        # run back too, so there is nothing orphaned to recover.
+        run_id = create_run_tx(cur, "job search run (dashboard)", resume_id=resume_id,
+                               target_role=target_role, location=location,
+                               work_mode=work_mode, employment_type=employment_type,
+                               user_id=user["id"])
+        job_id = enqueue_tx(cur, "start_run", {
+            "resume_id": resume_id, "target_role": target_role, "location": location,
+            "work_mode": work_mode, "employment_type": employment_type,
+            "evaluate": evaluate, "run_id": run_id, "live_only": live_only,
+        }, run_id=run_id)
+        conn.commit()
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to start run: {e}")
+    finally:
+        conn.close()
     return {"run_id": run_id, "resume_id": resume_id, "target_role": target_role,
             "live_only": live_only, "job_id": job_id,
             "message": f"Run {run_id} enqueued (job {job_id})."}
@@ -402,26 +414,39 @@ def resume_run(run_id: int, decision: str = "Maybe", comment: str = "",
     if decision not in ("Apply", "Maybe", "Skip"):
         raise HTTPException(status_code=400, detail="decision must be Apply, Maybe, or Skip")
     conn = get_connection()
-    cur = conn.cursor()
-    # ATOMIC compare-and-swap: flip waiting_for_human -> running ONLY if still
-    # waiting. Prevents a double-click / concurrent request from resuming the same
-    # checkpoint twice — the DB guarantees exactly one winner (rowcount == 1).
-    cur.execute("""
-        UPDATE runs SET status = 'running'
-        WHERE id = %s AND user_id = %s AND status = 'waiting_for_human'
-    """, (run_id, user["id"]))
-    won = cur.rowcount == 1
-    conn.commit()
-    cur.execute("SELECT status FROM runs WHERE id = %s AND user_id = %s", (run_id, user["id"]))
-    row = cur.fetchone()
-    conn.close()
-    if not row:
-        raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
-    if not won:
-        raise HTTPException(status_code=409,
-                            detail=f"Run {run_id} is not awaiting review (already {row[0]})")
-    enqueue("resume_run", {"run_id": run_id, "decision": decision, "comment": comment},
-            run_id=run_id)
+    try:
+        cur = conn.cursor()
+        # Lock the run row for the duration of this transaction. A concurrent
+        # resume / double-click serializes behind this lock, so exactly one request
+        # flips the run — the equivalent of the old rowcount compare-and-swap, but
+        # now the flip and the enqueue live in the SAME transaction.
+        cur.execute("SELECT status FROM runs WHERE id = %s AND user_id = %s FOR UPDATE",
+                    (run_id, user["id"]))
+        row = cur.fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
+        if row[0] != "waiting_for_human":
+            raise HTTPException(status_code=409,
+                                detail=f"Run {run_id} is not awaiting review (already {row[0]})")
+
+        # ATOMIC: flip waiting_for_human -> running AND enqueue the resume job
+        # together. Previously the flip was committed BEFORE enqueue on a separate
+        # connection: if enqueue failed, the run was stuck 'running' with no queue
+        # job and a retry hit 409 — lost work. Now an enqueue failure rolls the flip
+        # back, so the run stays 'waiting_for_human' and the user can retry.
+        cur.execute("UPDATE runs SET status = 'running' WHERE id = %s", (run_id,))
+        enqueue_tx(cur, "resume_run",
+                   {"run_id": run_id, "decision": decision, "comment": comment},
+                   run_id=run_id)
+        conn.commit()
+    except HTTPException:
+        conn.rollback()
+        raise
+    except Exception as e:
+        conn.rollback()
+        raise HTTPException(status_code=500, detail=f"Failed to resume run: {e}")
+    finally:
+        conn.close()
     return {"run_id": run_id, "resumed_with": decision}
 
 
