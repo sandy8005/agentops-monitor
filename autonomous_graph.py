@@ -275,6 +275,10 @@ def run_agent_graph(resume_id, target_role=None, location=None,
     final_state = initial
 
     try:
+        # Execution begins now — the worker has claimed this job. Leave 'queued'
+        # and enter 'running', stamping started_at on this first transition so
+        # latency reflects real execution, not time spent waiting in the queue.
+        _mark_run_running(run_id)
         with PostgresSaver.from_conn_string(_db_uri()) as checkpointer:
             checkpointer.setup()
             graph = build_graph(checkpointer=checkpointer)
@@ -342,6 +346,27 @@ def _extract_interrupt_payload(result):
         return value if isinstance(value, dict) else {"payload": value}
     except Exception:
         return None
+
+
+def _mark_run_running(run_id):
+    """
+    Flip the run to 'running' at the moment execution actually begins — i.e. when
+    the worker has claimed the job and is about to invoke the graph. started_at is
+    stamped on the FIRST such transition via COALESCE, so a resumed run keeps its
+    true start time rather than being reset. This is the counterpart to create_run()
+    inserting 'queued' with a NULL started_at: together they ensure queue-wait time
+    is never counted as execution/latency.
+    """
+    from llm import get_connection
+    conn = get_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE runs SET status = 'running', started_at = COALESCE(started_at, NOW()) "
+        "WHERE id = %s",
+        (run_id,),
+    )
+    conn.commit()
+    conn.close()
 
 
 def _mark_run_status(run_id, status, pending_review="__unset__"):
@@ -414,6 +439,10 @@ def resume_agent_graph(run_id, decision, comment=""):
         cancel_requested = False
 
     try:
+        # Execution resumes now — the worker claimed the resume job. Move queued ->
+        # running (started_at is preserved via COALESCE, since this run already
+        # started earlier before it paused).
+        _mark_run_running(run_id)
         with PostgresSaver.from_conn_string(_db_uri()) as checkpointer:
             checkpointer.setup()
             graph = build_graph(checkpointer=checkpointer)

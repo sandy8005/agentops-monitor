@@ -290,8 +290,10 @@ def cancel_run(run_id: int, user: dict = Depends(require_auth),
         raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
     status = row[0]
 
-    if status == "running":
-        # Cooperative cancel: the running loop checks is_cancel_requested between jobs.
+    if status in ("running", "queued"):
+        # Cooperative cancel. 'running': the loop checks is_cancel_requested between
+        # jobs. 'queued': not claimed yet — set the flag now so that when a worker
+        # picks the job up and begins the run, it sees the cancel and stops early.
         request_cancel(run_id)
         return {"run_id": run_id, "cancel_requested": True}
 
@@ -429,12 +431,13 @@ def resume_run(run_id: int, decision: str = "Maybe", comment: str = "",
             raise HTTPException(status_code=409,
                                 detail=f"Run {run_id} is not awaiting review (already {row[0]})")
 
-        # ATOMIC: flip waiting_for_human -> running AND enqueue the resume job
-        # together. Previously the flip was committed BEFORE enqueue on a separate
-        # connection: if enqueue failed, the run was stuck 'running' with no queue
-        # job and a retry hit 409 — lost work. Now an enqueue failure rolls the flip
-        # back, so the run stays 'waiting_for_human' and the user can retry.
-        cur.execute("UPDATE runs SET status = 'running' WHERE id = %s", (run_id,))
+        # ATOMIC: move waiting_for_human -> queued AND enqueue the resume job
+        # together. The run goes back to 'queued' (not straight to 'running') because
+        # it is only waiting in the queue until a worker claims the resume job and
+        # actually resumes execution — _mark_run_running flips it to 'running' then.
+        # If the enqueue fails, this status change rolls back, so the run stays
+        # 'waiting_for_human' and the user can retry — no lost work.
+        cur.execute("UPDATE runs SET status = 'queued' WHERE id = %s", (run_id,))
         enqueue_tx(cur, "resume_run",
                    {"run_id": run_id, "decision": decision, "comment": comment},
                    run_id=run_id)

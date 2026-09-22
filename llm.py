@@ -92,11 +92,15 @@ def create_run_tx(cur, input_summary, resume_id=None, target_role=None,
     ONE transaction (both commit or both roll back), so a run is never left
     'running' with no queue job. The caller owns commit / rollback / close.
     """
+    # A new run is 'queued', NOT 'running': at creation it is only waiting in
+    # job_queue for a worker to claim it. started_at is left NULL and is stamped
+    # only when the worker actually begins executing (see _mark_run_running in
+    # autonomous_graph), so queue-wait time is never counted as execution latency.
     cur.execute("""
         INSERT INTO runs (started_at, status, input_summary, resume_id,
                           target_role, location, work_mode, employment_type, user_id)
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id
-    """, (datetime.now(), "running", input_summary, resume_id,
+    """, (None, "queued", input_summary, resume_id,
           target_role, location, work_mode, employment_type, user_id))
     return cur.fetchone()[0]
 
