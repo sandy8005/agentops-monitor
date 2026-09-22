@@ -22,7 +22,7 @@ import threading
 
 import job_queue
 from autonomous_graph import run_agent_graph, resume_agent_graph
-from error_codes import classify_exception
+from error_codes import ErrorCode, classify_exception
 from database import get_connection
 from logging_config import get_logger
 
@@ -44,7 +44,7 @@ TERMINAL_FAILURE = "terminal_failure"
 
 # Failures worth retrying: transient / infrastructure codes. Everything else (bad
 # input, parse failure, budget spent, cancelled) is terminal — retrying won't help.
-RETRYABLE_ERROR_CODES = {"llm_unavailable", "llm_quota_exhausted"}
+RETRYABLE_ERROR_CODES = {ErrorCode.LLM_UNAVAILABLE, ErrorCode.LLM_QUOTA_EXHAUSTED}
 
 
 def _run_outcome(run_id):

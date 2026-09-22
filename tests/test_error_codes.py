@@ -28,5 +28,5 @@ def test_unknown_maps_to_internal():
 def test_all_codes_are_stable_strings():
     for c in ALL_CODES:
         assert isinstance(c, str) and c
-    # NONE is the success sentinel (no error)
-    assert ErrorCode.NONE is None
+    # "No error" is represented by None / SQL NULL, not an ErrorCode member.
+    assert not hasattr(ErrorCode, "NONE")
