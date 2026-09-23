@@ -65,7 +65,12 @@ def _parse_cache_get(resume_hash):
     cur.execute("SELECT parsed_json FROM parsed_resume_cache WHERE resume_hash = %s", (resume_hash,))
     row = cur.fetchone()
     conn.close()
-    return json.loads(row[0]) if row else None
+    if not row:
+        return None
+    val = json.loads(row[0])
+    # Ignore a poisoned/legacy entry (e.g. a `null` written before parse_resume was
+    # hardened) so it's re-parsed instead of flowing downstream as None.
+    return val if isinstance(val, dict) else None
 
 
 def _parse_cache_put(resume_hash, parsed):
@@ -91,6 +96,12 @@ def do_parse_resume(state, run_id):
             log.info("parsed resume served from cache — 0 LLM calls", extra={"step_id": step_id})
             return
         parsed = parse_resume(state.resume_text, run_id, step_id, budget=state)
+        # A parse that yields no usable dict must NOT flow downstream as
+        # parsed_resume=None — it would crash scoring/judging on None["..."]. Treat it
+        # as a parse failure so route_after_parse ends the run cleanly, and never
+        # cache a non-dict (which would poison the parse cache).
+        if not isinstance(parsed, dict):
+            raise ValueError("resume parse returned no usable data")
         _parse_cache_put(rhash, parsed)
         state.parsed_resume = parsed
         finish_step(step_id, "success")

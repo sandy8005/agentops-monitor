@@ -15,9 +15,11 @@ def calculate_match_score(parsed_resume, requirements, resume_text, job=None, us
     resume_text_lower = resume_text.lower()
     resume_tokens = set(re.findall(r"[a-z0-9\+\#\.]+", resume_text_lower))
 
-    project_tech = [t.lower() for p in parsed_resume["projects"] for t in p["tech"]]
+    parsed_resume = parsed_resume or {}
+    projects = parsed_resume.get("projects") or []
+    project_tech = [t.lower() for p in projects if isinstance(p, dict) for t in (p.get("tech") or [])]
     project_tech_set = set(project_tech)
-    candidate_years = parsed_resume["years_experience"]
+    candidate_years = parsed_resume.get("years_experience") or 0
 
     required = [s.lower() for s in requirements["required_skills"]]
     any_of_groups = [[s.lower() for s in group]
