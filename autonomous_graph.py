@@ -28,13 +28,26 @@ log = get_logger(__name__)
 
 
 def _stage_error_code(error_text):
-    """Map a state.error string (set by a router stage) to an ErrorCode."""
+    """
+    Map a state.error string (set by a router stage) to an ErrorCode.
+
+    Transient LLM/infra failures (503, quota, timeout) are classified FIRST, before
+    the stage-specific codes. A parse or search that failed *because Gemini was down*
+    is a retryable infrastructure problem, not a terminal "unparseable resume" — so
+    it must map to LLM_UNAVAILABLE / LLM_QUOTA_EXHAUSTED (which the worker retries
+    with backoff) rather than PARSE_FAILED / SEARCH_FAILED (terminal). Otherwise a
+    temporary provider spike permanently fails every run. Only a genuine,
+    non-transient stage failure falls through to the terminal stage code.
+    """
+    code = classify_exception(error_text)
+    if code in (ErrorCode.LLM_UNAVAILABLE, ErrorCode.LLM_QUOTA_EXHAUSTED):
+        return code
     t = (error_text or "").lower()
     if t.startswith("parse") or "parse failed" in t:
         return ErrorCode.PARSE_FAILED
     if t.startswith("search") or "search failed" in t:
         return ErrorCode.SEARCH_FAILED
-    return classify_exception(error_text)
+    return code
 
 
 def _db_uri():
