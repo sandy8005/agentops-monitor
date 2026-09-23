@@ -369,15 +369,13 @@ def _mark_run_running(run_id):
     is never counted as execution/latency.
     """
     from llm import get_connection
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute(
-        "UPDATE runs SET status = 'running', started_at = COALESCE(started_at, NOW()) "
-        "WHERE id = %s",
-        (run_id,),
-    )
-    conn.commit()
-    conn.close()
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE runs SET status = 'running', started_at = COALESCE(started_at, NOW()) "
+            "WHERE id = %s",
+            (run_id,),
+        )
 
 
 def _mark_run_status(run_id, status, pending_review="__unset__"):
@@ -401,14 +399,12 @@ def _mark_run_status(run_id, status, pending_review="__unset__"):
         payload = pending_review
     payload_json = json.dumps(payload) if payload is not None else None
 
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute(
-        "UPDATE runs SET status = %s, pending_review = %s WHERE id = %s",
-        (status, payload_json, run_id),
-    )
-    conn.commit()
-    conn.close()
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "UPDATE runs SET status = %s, pending_review = %s WHERE id = %s",
+            (status, payload_json, run_id),
+        )
 
 
 def _clear_pending_review(run_id):

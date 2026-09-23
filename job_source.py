@@ -270,127 +270,126 @@ def search_jobs(target_role=None, location=None, work_mode=None,
     that location returned it. Practice jobs (no association) stay location-agnostic
     in mixed mode.
     """
-    conn = get_connection()
-    cur = conn.cursor()
-    # Pull provenance (source) and, via the association join, the set of locations
-    # any search has ever returned this posting for. search_location is no longer
-    # read for filtering (kept only until a later migration drops it).
-    cur.execute("""
-        SELECT p.id, p.title, p.company, p.description, p.location, p.work_mode,
-               p.employment_type, p.source, p.external_id, p.last_seen_at,
-               COALESCE(
-                   ARRAY_AGG(DISTINCT lower(s.location))
-                   FILTER (WHERE s.location IS NOT NULL),
-                   '{}'
-               ) AS assoc_locations
-        FROM job_postings p
-        LEFT JOIN job_search_results r ON r.job_id = p.id
-        LEFT JOIN job_searches s ON s.id = r.search_id
-        GROUP BY p.id
-        ORDER BY p.id
-    """)
-    rows = cur.fetchall()
-
-    # For Live Mode scoped to a single run, which postings did THIS run fetch?
-    run_job_ids = set()
-    if live_only and run_id is not None:
+    with get_connection() as conn:
+        cur = conn.cursor()
+        # Pull provenance (source) and, via the association join, the set of locations
+        # any search has ever returned this posting for. search_location is no longer
+        # read for filtering (kept only until a later migration drops it).
         cur.execute("""
-            SELECT DISTINCT r.job_id
-            FROM job_search_results r
-            JOIN job_searches s ON s.id = r.search_id
-            WHERE s.run_id = %s
-        """, (run_id,))
-        run_job_ids = {row[0] for row in cur.fetchall()}
-    conn.close()
+            SELECT p.id, p.title, p.company, p.description, p.location, p.work_mode,
+                   p.employment_type, p.source, p.external_id, p.last_seen_at,
+                   COALESCE(
+                       ARRAY_AGG(DISTINCT lower(s.location))
+                       FILTER (WHERE s.location IS NOT NULL),
+                       '{}'
+                   ) AS assoc_locations
+            FROM job_postings p
+            LEFT JOIN job_search_results r ON r.job_id = p.id
+            LEFT JOIN job_searches s ON s.id = r.search_id
+            GROUP BY p.id
+            ORDER BY p.id
+        """)
+        rows = cur.fetchall()
 
-    all_jobs = [
-        {"id": r[0], "title": r[1], "company": r[2], "description": r[3],
-         "location": r[4], "work_mode": r[5], "employment_type": r[6], "source": r[7],
-         "external_id": r[8], "last_seen_at": r[9],
-         "assoc_locations": set(r[10] or [])}
-        for r in rows
-    ]
+        # For Live Mode scoped to a single run, which postings did THIS run fetch?
+        run_job_ids = set()
+        if live_only and run_id is not None:
+            cur.execute("""
+                SELECT DISTINCT r.job_id
+                FROM job_search_results r
+                JOIN job_searches s ON s.id = r.search_id
+                WHERE s.run_id = %s
+            """, (run_id,))
+            run_job_ids = {row[0] for row in cur.fetchall()}
 
-    # --- source separation: Live Mode excludes all practice data ---
-    if live_only:
-        all_jobs = [j for j in all_jobs if (j.get("source") or "").lower() in LIVE_SOURCES]
-        # When a run_id is given, restrict to postings THIS run actually fetched.
-        if run_id is not None:
-            all_jobs = [j for j in all_jobs if j["id"] in run_job_ids]
+        all_jobs = [
+            {"id": r[0], "title": r[1], "company": r[2], "description": r[3],
+             "location": r[4], "work_mode": r[5], "employment_type": r[6], "source": r[7],
+             "external_id": r[8], "last_seen_at": r[9],
+             "assoc_locations": set(r[10] or [])}
+            for r in rows
+        ]
 
-    # --- freshness filter: drop jobs not seen recently ---
-    # Jobs with no last_seen_at (seed/csv/scraped — not time-based) are always fresh.
-    cutoff = datetime.now() - timedelta(days=STALE_AFTER_DAYS)
-    def _is_fresh(job):
-        ls = job.get("last_seen_at")
-        return ls is None or ls >= cutoff
-    all_jobs = [j for j in all_jobs if _is_fresh(j)]
+        # --- source separation: Live Mode excludes all practice data ---
+        if live_only:
+            all_jobs = [j for j in all_jobs if (j.get("source") or "").lower() in LIVE_SOURCES]
+            # When a run_id is given, restrict to postings THIS run actually fetched.
+            if run_id is not None:
+                all_jobs = [j for j in all_jobs if j["id"] in run_job_ids]
 
-    if not target_role:
-        return all_jobs
+        # --- freshness filter: drop jobs not seen recently ---
+        # Jobs with no last_seen_at (seed/csv/scraped — not time-based) are always fresh.
+        cutoff = datetime.now() - timedelta(days=STALE_AFTER_DAYS)
+        def _is_fresh(job):
+            ls = job.get("last_seen_at")
+            return ls is None or ls >= cutoff
+        all_jobs = [j for j in all_jobs if _is_fresh(j)]
 
-    # --- role filter: whole-word specializing-term match ---
-    role_matches = _role_matcher(target_role)
-    filtered = [j for j in all_jobs if role_matches(j)]
+        if not target_role:
+            return all_jobs
 
-    # --- location filter (via PER-SEARCH association, not a permanent column) ---
-    # A job matches the requested location if SOME search for that location
-    # returned it (its assoc_locations contains the request). A job with no
-    # association at all (seed/csv/scraped practice data) is location-agnostic and
-    # kept — but only in mixed mode; in Live Mode there is no practice data and
-    # every live job carries the association from the search that fetched it.
-    if location and location.strip():
-        loc = location.strip().lower()
+        # --- role filter: whole-word specializing-term match ---
+        role_matches = _role_matcher(target_role)
+        filtered = [j for j in all_jobs if role_matches(j)]
 
-        def location_ok(job):
-            assoc = job.get("assoc_locations") or set()
-            if not assoc:
-                return True          # unassociated → location-agnostic (practice data)
-            return loc in assoc      # matched by at least one search for this location
+        # --- location filter (via PER-SEARCH association, not a permanent column) ---
+        # A job matches the requested location if SOME search for that location
+        # returned it (its assoc_locations contains the request). A job with no
+        # association at all (seed/csv/scraped practice data) is location-agnostic and
+        # kept — but only in mixed mode; in Live Mode there is no practice data and
+        # every live job carries the association from the search that fetched it.
+        if location and location.strip():
+            loc = location.strip().lower()
 
-        filtered = [j for j in filtered if location_ok(j)]
+            def location_ok(job):
+                assoc = job.get("assoc_locations") or set()
+                if not assoc:
+                    return True          # unassociated → location-agnostic (practice data)
+                return loc in assoc      # matched by at least one search for this location
 
-    # --- work_mode filter (compatibility, not "remote is always OK") ---
-    # A job matches if: its mode is unknown (soft — don't exclude), OR equals the
-    # request, OR hybrid is involved (partial match either way). A remote job is
-    # correctly EXCLUDED from an onsite request (and vice versa).
-    if work_mode:
-        wm = work_mode.lower().strip()
+            filtered = [j for j in filtered if location_ok(j)]
 
-        def mode_ok(job):
-            jm = (job.get("work_mode") or "").lower().strip()
-            jl = (job.get("location") or "").lower()
-            if not jm and "remote" in jl:
-                jm = "remote"
-            if not jm:
-                return True          # unknown mode → don't exclude (soft filter)
-            if wm == jm:
-                return True          # exact match
-            if "hybrid" in (wm, jm):
-                return True          # hybrid is a partial match either direction
-            return False             # clear conflict (e.g. remote job, onsite request)
+        # --- work_mode filter (compatibility, not "remote is always OK") ---
+        # A job matches if: its mode is unknown (soft — don't exclude), OR equals the
+        # request, OR hybrid is involved (partial match either way). A remote job is
+        # correctly EXCLUDED from an onsite request (and vice versa).
+        if work_mode:
+            wm = work_mode.lower().strip()
 
-        filtered = [j for j in filtered if mode_ok(j)]
+            def mode_ok(job):
+                jm = (job.get("work_mode") or "").lower().strip()
+                jl = (job.get("location") or "").lower()
+                if not jm and "remote" in jl:
+                    jm = "remote"
+                if not jm:
+                    return True          # unknown mode → don't exclude (soft filter)
+                if wm == jm:
+                    return True          # exact match
+                if "hybrid" in (wm, jm):
+                    return True          # hybrid is a partial match either direction
+                return False             # clear conflict (e.g. remote job, onsite request)
 
-    # --- employment_type filter (SOFT: keep unknown-type, exclude known mismatch) ---
-    if employment_type:
-        et = employment_type.lower().strip()
+            filtered = [j for j in filtered if mode_ok(j)]
 
-        def type_ok(job):
-            jt = (job.get("employment_type") or "").lower().strip()
-            if not jt:
-                return True
-            return jt == et
+        # --- employment_type filter (SOFT: keep unknown-type, exclude known mismatch) ---
+        if employment_type:
+            et = employment_type.lower().strip()
 
-        filtered = [j for j in filtered if type_ok(j)]
+            def type_ok(job):
+                jt = (job.get("employment_type") or "").lower().strip()
+                if not jt:
+                    return True
+                return jt == et
 
-    # Collapse same-posting duplicates that entered via multiple sources.
-    filtered = _dedupe_jobs(filtered)
+            filtered = [j for j in filtered if type_ok(j)]
 
-    # --- results handling: honest empty result, never manufactured jobs ---
-    if len(filtered) == 0:
-        log.info("no jobs matched '%s' with the given filters", target_role)
-        return []
+        # Collapse same-posting duplicates that entered via multiple sources.
+        filtered = _dedupe_jobs(filtered)
 
-    log.info("%d of %d job(s) matched your criteria", len(filtered), len(all_jobs))
-    return filtered
+        # --- results handling: honest empty result, never manufactured jobs ---
+        if len(filtered) == 0:
+            log.info("no jobs matched '%s' with the given filters", target_role)
+            return []
+
+        log.info("%d of %d job(s) matched your criteria", len(filtered), len(all_jobs))
+        return filtered

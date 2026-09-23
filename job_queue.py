@@ -142,16 +142,14 @@ def heartbeat(job_id, lease_token):
     Guarded by the lease: returns True if this worker STILL owns the job, False if
     it has lost the lease (reclaimed as an orphan and taken by another worker). A
     False return is the worker's signal to stop touching the queue record."""
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("""
-        UPDATE job_queue SET heartbeat_at = %s
-        WHERE id = %s AND status = 'running' AND lease_token = %s
-    """, (datetime.now(), job_id, lease_token))
-    owned = cur.rowcount == 1
-    conn.commit()
-    conn.close()
-    return owned
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE job_queue SET heartbeat_at = %s
+            WHERE id = %s AND status = 'running' AND lease_token = %s
+        """, (datetime.now(), job_id, lease_token))
+        owned = cur.rowcount == 1
+        return owned
 
 
 # ------------------------------------------------------- complete / fail -----
@@ -160,16 +158,14 @@ def mark_done(job_id, lease_token):
     """Mark the job done — only if this worker still holds the lease. Returns True
     if it did (and the row was updated), False if the lease was lost (another worker
     owns the job now, so we must NOT mark it done)."""
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("""
-        UPDATE job_queue SET status = 'done', finished_at = %s
-        WHERE id = %s AND status = 'running' AND lease_token = %s
-    """, (datetime.now(), job_id, lease_token))
-    owned = cur.rowcount == 1
-    conn.commit()
-    conn.close()
-    return owned
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE job_queue SET status = 'done', finished_at = %s
+            WHERE id = %s AND status = 'running' AND lease_token = %s
+        """, (datetime.now(), job_id, lease_token))
+        owned = cur.rowcount == 1
+        return owned
 
 
 def mark_failed(job_id, error, attempts, max_attempts, lease_token, terminal=False):
@@ -187,28 +183,26 @@ def mark_failed(job_id, error, attempts, max_attempts, lease_token, terminal=Fal
     worker already owns the job and we changed nothing — the caller must not retry
     or fail it itself).
     """
-    conn = get_connection()
-    cur = conn.cursor()
-    if not terminal and attempts < max_attempts:
-        available_at = datetime.now() + timedelta(seconds=_retry_delay(attempts))
-        cur.execute("""
-            UPDATE job_queue
-            SET status = 'queued', last_error = %s, claimed_at = NULL,
-                heartbeat_at = NULL, worker_id = NULL, lease_token = NULL,
-                available_at = %s
-            WHERE id = %s AND status = 'running' AND lease_token = %s
-        """, (str(error)[:2000], available_at, job_id, lease_token))
-        outcome = "requeued" if cur.rowcount == 1 else "lost"
-    else:
-        cur.execute("""
-            UPDATE job_queue
-            SET status = 'failed', last_error = %s, finished_at = %s, lease_token = NULL
-            WHERE id = %s AND status = 'running' AND lease_token = %s
-        """, (str(error)[:2000], datetime.now(), job_id, lease_token))
-        outcome = "failed" if cur.rowcount == 1 else "lost"
-    conn.commit()
-    conn.close()
-    return outcome
+    with get_connection() as conn:
+        cur = conn.cursor()
+        if not terminal and attempts < max_attempts:
+            available_at = datetime.now() + timedelta(seconds=_retry_delay(attempts))
+            cur.execute("""
+                UPDATE job_queue
+                SET status = 'queued', last_error = %s, claimed_at = NULL,
+                    heartbeat_at = NULL, worker_id = NULL, lease_token = NULL,
+                    available_at = %s
+                WHERE id = %s AND status = 'running' AND lease_token = %s
+            """, (str(error)[:2000], available_at, job_id, lease_token))
+            outcome = "requeued" if cur.rowcount == 1 else "lost"
+        else:
+            cur.execute("""
+                UPDATE job_queue
+                SET status = 'failed', last_error = %s, finished_at = %s, lease_token = NULL
+                WHERE id = %s AND status = 'running' AND lease_token = %s
+            """, (str(error)[:2000], datetime.now(), job_id, lease_token))
+            outcome = "failed" if cur.rowcount == 1 else "lost"
+        return outcome
 
 
 # ------------------------------------------------------- orphan recovery -----
@@ -221,29 +215,27 @@ def reclaim_orphans():
     number reclaimed.
     """
     cutoff = datetime.now() - ORPHAN_AFTER
-    conn = get_connection()
-    cur = conn.cursor()
-    # Requeue orphans that still have attempts left.
-    cur.execute("""
-        UPDATE job_queue
-        SET status = 'queued', claimed_at = NULL, heartbeat_at = NULL, worker_id = NULL,
-            lease_token = NULL, available_at = NULL,
-            last_error = COALESCE(last_error, '') || ' [reclaimed orphan]'
-        WHERE status = 'running'
-          AND attempts < max_attempts
-          AND (heartbeat_at IS NULL OR heartbeat_at < %s)
-    """, (cutoff,))
-    requeued = cur.rowcount
-    # Fail orphans that are out of attempts.
-    cur.execute("""
-        UPDATE job_queue
-        SET status = 'failed', finished_at = %s, lease_token = NULL,
-            last_error = COALESCE(last_error, '') || ' [orphan, out of attempts]'
-        WHERE status = 'running'
-          AND attempts >= max_attempts
-          AND (heartbeat_at IS NULL OR heartbeat_at < %s)
-    """, (datetime.now(), cutoff))
-    failed = cur.rowcount
-    conn.commit()
-    conn.close()
-    return requeued + failed
+    with get_connection() as conn:
+        cur = conn.cursor()
+        # Requeue orphans that still have attempts left.
+        cur.execute("""
+            UPDATE job_queue
+            SET status = 'queued', claimed_at = NULL, heartbeat_at = NULL, worker_id = NULL,
+                lease_token = NULL, available_at = NULL,
+                last_error = COALESCE(last_error, '') || ' [reclaimed orphan]'
+            WHERE status = 'running'
+              AND attempts < max_attempts
+              AND (heartbeat_at IS NULL OR heartbeat_at < %s)
+        """, (cutoff,))
+        requeued = cur.rowcount
+        # Fail orphans that are out of attempts.
+        cur.execute("""
+            UPDATE job_queue
+            SET status = 'failed', finished_at = %s, lease_token = NULL,
+                last_error = COALESCE(last_error, '') || ' [orphan, out of attempts]'
+            WHERE status = 'running'
+              AND attempts >= max_attempts
+              AND (heartbeat_at IS NULL OR heartbeat_at < %s)
+        """, (datetime.now(), cutoff))
+        failed = cur.rowcount
+        return requeued + failed

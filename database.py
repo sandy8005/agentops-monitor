@@ -104,13 +104,24 @@ class _PooledConnection:
 
     def __exit__(self, exc_type, exc, tb):
         # On error, roll back so a broken transaction isn't returned to the pool
-        # in a dirty state; then always return the connection.
+        # in a dirty state. On SUCCESS, commit — otherwise close() below would see a
+        # non-IDLE transaction and roll it back, silently losing the writes made in
+        # the `with` block. Either way, always return the connection to the pool.
         try:
             if exc_type is not None:
                 try:
                     self._conn.rollback()
                 except Exception:
                     pass
+            else:
+                try:
+                    self._conn.commit()
+                except Exception:
+                    try:
+                        self._conn.rollback()
+                    except Exception:
+                        pass
+                    raise
         finally:
             self.close()
         return False

@@ -114,34 +114,28 @@ def create_run(input_summary, resume_id=None, target_role=None,
 
 
 def create_step(run_id, step_name, step_order):
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO steps (run_id, step_name, step_order, started_at, status)
-        VALUES (%s, %s, %s, %s, %s) RETURNING id
-    """, (run_id, step_name, step_order, datetime.now(), "running"))
-    step_id = cur.fetchone()[0]
-    conn.commit()
-    conn.close()
-    return step_id
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO steps (run_id, step_name, step_order, started_at, status)
+            VALUES (%s, %s, %s, %s, %s) RETURNING id
+        """, (run_id, step_name, step_order, datetime.now(), "running"))
+        step_id = cur.fetchone()[0]
+        return step_id
 
 
 def finish_step(step_id, status="success"):
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("UPDATE steps SET ended_at = %s, status = %s WHERE id = %s",
-                (datetime.now(), status, step_id))
-    conn.commit()
-    conn.close()
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("UPDATE steps SET ended_at = %s, status = %s WHERE id = %s",
+                    (datetime.now(), status, step_id))
 
 
 def fail_step(step_id, error_message):
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("UPDATE steps SET ended_at = %s, status = %s, error_message = %s WHERE id = %s",
-                (datetime.now(), "failed", str(error_message), step_id))
-    conn.commit()
-    conn.close()
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("UPDATE steps SET ended_at = %s, status = %s, error_message = %s WHERE id = %s",
+                    (datetime.now(), "failed", str(error_message), step_id))
 
 
 def record_score(step_id, match_score, score_decision, llm_decision, breakdown=None):
@@ -157,118 +151,107 @@ def record_score(step_id, match_score, score_decision, llm_decision, breakdown=N
     # flagged as score_disagreement. Other review triggers still fire independently.
     real_llm_decisions = {"Apply", "Maybe", "Skip"}
     has_real_judgment = llm_decision in real_llm_decisions
-    needs_review = has_real_judgment and (score_decision != llm_decision)
+    score_disagreement = has_real_judgment and (score_decision != llm_decision)
     breakdown_json = json.dumps(breakdown) if breakdown else None
     conn = get_connection()
-    cur = conn.cursor()
-    if needs_review:
+    try:
+        cur = conn.cursor()
+        # Record the score fields ONLY. Crucially, do NOT touch needs_human_review
+        # here: the review flag is ADDITIVE and owned by flag_for_review(). Blindly
+        # writing needs_human_review = FALSE (the old behaviour) would erase a review
+        # already raised for another reason on this same step — e.g. a
+        # possible_prompt_injection flag set during requirements extraction — silently
+        # un-pausing a run that should be reviewed.
         cur.execute("""
             UPDATE steps SET match_score = %s, score_decision = %s, llm_decision = %s,
-                score_breakdown = %s,
-                needs_human_review = TRUE, review_reason = 'score_disagreement'
+                score_breakdown = %s
             WHERE id = %s
         """, (match_score, score_decision, llm_decision, breakdown_json, step_id))
-    else:
-        cur.execute("""
-            UPDATE steps SET match_score = %s, score_decision = %s, llm_decision = %s,
-                score_breakdown = %s,
-                needs_human_review = FALSE
-            WHERE id = %s
-        """, (match_score, score_decision, llm_decision, breakdown_json, step_id))
-    conn.commit()
-    conn.close()
-    return needs_review
+        conn.commit()
+    finally:
+        conn.close()
+    # Score disagreement is one review trigger among several — raise it ADDITIVELY
+    # (flag_for_review never clears an existing flag and appends the reason), the
+    # same way injection / hallucination / evaluation-failure triggers do.
+    if score_disagreement:
+        flag_for_review(step_id, reason="score_disagreement")
+    return score_disagreement
 
 
 def flag_for_review(step_id, reason="unspecified"):
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT review_reason FROM steps WHERE id = %s", (step_id,))
-    row = cur.fetchone()
-    existing = row[0] if row and row[0] else ""
-    if existing:
-        reasons = [r.strip() for r in existing.split(";")]
-        new_reason = existing if reason in reasons else existing + "; " + reason
-    else:
-        new_reason = reason
-    cur.execute("UPDATE steps SET needs_human_review = TRUE, review_reason = %s WHERE id = %s",
-                (new_reason, step_id))
-    conn.commit()
-    conn.close()
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT review_reason FROM steps WHERE id = %s", (step_id,))
+        row = cur.fetchone()
+        existing = row[0] if row and row[0] else ""
+        if existing:
+            reasons = [r.strip() for r in existing.split(";")]
+            new_reason = existing if reason in reasons else existing + "; " + reason
+        else:
+            new_reason = reason
+        cur.execute("UPDATE steps SET needs_human_review = TRUE, review_reason = %s WHERE id = %s",
+                    (new_reason, step_id))
 
 
 def record_context(step_id, context):
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("UPDATE steps SET retrieved_context = %s WHERE id = %s",
-                (json.dumps(context, default=str), step_id))
-    conn.commit()
-    conn.close()
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("UPDATE steps SET retrieved_context = %s WHERE id = %s",
+                    (json.dumps(context, default=str), step_id))
 
 
 def record_judge_signals(step_id, judge_status, judge_skip_reason=None, cache_hit=None):
     """Structured AgentOps signals per job step (queryable columns)."""
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("""
-        UPDATE steps SET judge_status = %s, judge_skip_reason = %s, cache_hit = %s
-        WHERE id = %s
-    """, (judge_status, judge_skip_reason, cache_hit, step_id))
-    conn.commit()
-    conn.close()
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE steps SET judge_status = %s, judge_skip_reason = %s, cache_hit = %s
+            WHERE id = %s
+        """, (judge_status, judge_skip_reason, cache_hit, step_id))
 
 
 def set_stop_reason(run_id, reason):
     """Record WHY a run ended (queryable)."""
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("UPDATE runs SET stop_reason = %s WHERE id = %s", (reason, run_id))
-    conn.commit()
-    conn.close()
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("UPDATE runs SET stop_reason = %s WHERE id = %s", (reason, run_id))
 
 
 def set_evaluation_status(run_id, status):
     """Record whether LLM-as-judge evaluation ran for this run."""
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("UPDATE runs SET evaluation_status = %s WHERE id = %s", (status, run_id))
-    conn.commit()
-    conn.close()
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("UPDATE runs SET evaluation_status = %s WHERE id = %s", (status, run_id))
 
 
 def is_cancel_requested(run_id):
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT cancel_requested FROM runs WHERE id = %s", (run_id,))
-    row = cur.fetchone()
-    conn.close()
-    return bool(row and row[0])
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT cancel_requested FROM runs WHERE id = %s", (run_id,))
+        row = cur.fetchone()
+        return bool(row and row[0])
 
 
 def request_cancel(run_id):
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("UPDATE runs SET cancel_requested = TRUE WHERE id = %s", (run_id,))
-    conn.commit()
-    conn.close()
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("UPDATE runs SET cancel_requested = TRUE WHERE id = %s", (run_id,))
 
 
 def save_evaluation(run_id, step_id, evaluation):
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO evaluations
-        (run_id, step_id, relevance_score, faithfulness_score, completeness_score,
-         hallucination_detected, hallucinated_claims, notes, created_at)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-    """, (
-        run_id, step_id,
-        evaluation["relevance_score"], evaluation["faithfulness_score"],
-        evaluation["completeness_score"], evaluation["hallucination_detected"],
-        json.dumps(evaluation["hallucinated_claims"]), evaluation["notes"], datetime.now()
-    ))
-    conn.commit()
-    conn.close()
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO evaluations
+            (run_id, step_id, relevance_score, faithfulness_score, completeness_score,
+             hallucination_detected, hallucinated_claims, notes, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """, (
+            run_id, step_id,
+            evaluation["relevance_score"], evaluation["faithfulness_score"],
+            evaluation["completeness_score"], evaluation["hallucination_detected"],
+            json.dumps(evaluation["hallucinated_claims"]), evaluation["notes"], datetime.now()
+        ))
 
 
 def finish_run(run_id, status="success", stop_reason=None, error_code=None):
@@ -278,42 +261,38 @@ def finish_run(run_id, status="success", stop_reason=None, error_code=None):
     on an earlier attempt and then succeeded on retry doesn't keep a stale error_code /
     stop_reason from the failed try.
     """
-    conn = get_connection()
-    cur = conn.cursor()
-    # ErrorCode is a str-Enum; store its plain value. (psycopg2 would adapt it to the
-    # same string, but be explicit so the stored vocabulary is unambiguous.)
-    error_code_val = error_code.value if isinstance(error_code, ErrorCode) else error_code
-    cur.execute("""
-        UPDATE runs SET ended_at = %s, status = %s,
-            stop_reason = %s, error_code = %s,
-            total_tokens = (SELECT COALESCE(SUM(prompt_tokens + completion_tokens), 0)
-                            FROM llm_calls WHERE run_id = %s),
-            total_cost = (SELECT COALESCE(SUM(cost_usd), 0)
-                          FROM llm_calls WHERE run_id = %s)
-        WHERE id = %s
-    """, (datetime.now(), status, stop_reason, error_code_val, run_id, run_id, run_id))
-    conn.commit()
-    conn.close()
+    with get_connection() as conn:
+        cur = conn.cursor()
+        # ErrorCode is a str-Enum; store its plain value. (psycopg2 would adapt it to the
+        # same string, but be explicit so the stored vocabulary is unambiguous.)
+        error_code_val = error_code.value if isinstance(error_code, ErrorCode) else error_code
+        cur.execute("""
+            UPDATE runs SET ended_at = %s, status = %s,
+                stop_reason = %s, error_code = %s,
+                total_tokens = (SELECT COALESCE(SUM(prompt_tokens + completion_tokens), 0)
+                                FROM llm_calls WHERE run_id = %s),
+                total_cost = (SELECT COALESCE(SUM(cost_usd), 0)
+                              FROM llm_calls WHERE run_id = %s)
+            WHERE id = %s
+        """, (datetime.now(), status, stop_reason, error_code_val, run_id, run_id, run_id))
 
 
 def _log_llm_attempt(run_id, step_id, operation, prompt, response_text,
                      prompt_tokens, completion_tokens, latency_ms, cost,
                      status, error_message, attempt_number, retry_count, provider_request_id):
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO llm_calls
-        (run_id, step_id, model, prompt, response,
-         prompt_tokens, completion_tokens, latency_ms, cost_usd, created_at,
-         status, error_message, operation_name, attempt_number, retry_count, provider_request_id)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-    """, (
-        run_id, step_id, settings.gemini_model, prompt, response_text,
-        prompt_tokens, completion_tokens, latency_ms, cost, datetime.now(),
-        status, error_message, operation, attempt_number, retry_count, provider_request_id
-    ))
-    conn.commit()
-    conn.close()
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO llm_calls
+            (run_id, step_id, model, prompt, response,
+             prompt_tokens, completion_tokens, latency_ms, cost_usd, created_at,
+             status, error_message, operation_name, attempt_number, retry_count, provider_request_id)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        """, (
+            run_id, step_id, settings.gemini_model, prompt, response_text,
+            prompt_tokens, completion_tokens, latency_ms, cost, datetime.now(),
+            status, error_message, operation, attempt_number, retry_count, provider_request_id
+        ))
 
 
 def logged_llm_call(prompt, run_id, step_id, operation="llm_call", max_retries=5, budget=None):

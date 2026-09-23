@@ -47,41 +47,37 @@ def _reqs_cache_key(title, description):
 
 def load_resume(state, run_id):
     """Load the resume document from DB (0 LLM calls)."""
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT resume_text FROM resumes WHERE id = %s", (state.resume_id,))
-    row = cur.fetchone()
-    conn.close()
-    if not row or not row[0]:
-        state.error = f"resume {state.resume_id} not found or empty"
-        return
-    state.resume_text = row[0]
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT resume_text FROM resumes WHERE id = %s", (state.resume_id,))
+        row = cur.fetchone()
+        if not row or not row[0]:
+            state.error = f"resume {state.resume_id} not found or empty"
+            return
+        state.resume_text = row[0]
 
 
 def _parse_cache_get(resume_hash):
     """Look up a previously parsed resume by hash (#1, #12). 0 LLM calls on hit."""
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT parsed_json FROM parsed_resume_cache WHERE resume_hash = %s", (resume_hash,))
-    row = cur.fetchone()
-    conn.close()
-    if not row:
-        return None
-    val = json.loads(row[0])
-    # Ignore a poisoned/legacy entry (e.g. a `null` written before parse_resume was
-    # hardened) so it's re-parsed instead of flowing downstream as None.
-    return val if isinstance(val, dict) else None
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT parsed_json FROM parsed_resume_cache WHERE resume_hash = %s", (resume_hash,))
+        row = cur.fetchone()
+        if not row:
+            return None
+        val = json.loads(row[0])
+        # Ignore a poisoned/legacy entry (e.g. a `null` written before parse_resume was
+        # hardened) so it's re-parsed instead of flowing downstream as None.
+        return val if isinstance(val, dict) else None
 
 
 def _parse_cache_put(resume_hash, parsed):
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO parsed_resume_cache (resume_hash, parsed_json, cache_version)
-        VALUES (%s, %s, %s) ON CONFLICT (resume_hash) DO NOTHING
-    """, (resume_hash, json.dumps(parsed), parse_cache_version()))
-    conn.commit()
-    conn.close()
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO parsed_resume_cache (resume_hash, parsed_json, cache_version)
+            VALUES (%s, %s, %s) ON CONFLICT (resume_hash) DO NOTHING
+        """, (resume_hash, json.dumps(parsed), parse_cache_version()))
 
 
 def do_parse_resume(state, run_id):
@@ -154,18 +150,17 @@ def _reqs_cache_get(desc_hash):
     {"extraction_method":..., "source_model":...} describing how the cached row was
     produced, so callers can trace/trust it without re-extracting.
     """
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("""
-        SELECT reqs_json, extraction_method, source_model
-        FROM job_reqs_cache WHERE desc_hash = %s
-    """, (desc_hash,))
-    row = cur.fetchone()
-    conn.close()
-    if not row:
-        return (None, None)
-    provenance = {"extraction_method": row[1], "source_model": row[2]}
-    return (json.loads(row[0]), provenance)
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT reqs_json, extraction_method, source_model
+            FROM job_reqs_cache WHERE desc_hash = %s
+        """, (desc_hash,))
+        row = cur.fetchone()
+        if not row:
+            return (None, None)
+        provenance = {"extraction_method": row[1], "source_model": row[2]}
+        return (json.loads(row[0]), provenance)
 
 
 def _reqs_cache_put(desc_hash, reqs, extraction_method):
@@ -183,16 +178,14 @@ def _reqs_cache_put(desc_hash, reqs, extraction_method):
     # rule_based extraction used no model, so its source_model is NULL (not the
     # LLM model), keeping provenance honest.
     source_model = model_version() if extraction_method == "llm" else None
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO job_reqs_cache
-            (desc_hash, reqs_json, cache_version, extraction_method, source_model)
-        VALUES (%s, %s, %s, %s, %s) ON CONFLICT (desc_hash) DO NOTHING
-    """, (desc_hash, json.dumps(reqs), reqs_cache_version(),
-          extraction_method, source_model))
-    conn.commit()
-    conn.close()
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO job_reqs_cache
+                (desc_hash, reqs_json, cache_version, extraction_method, source_model)
+            VALUES (%s, %s, %s, %s, %s) ON CONFLICT (desc_hash) DO NOTHING
+        """, (desc_hash, json.dumps(reqs), reqs_cache_version(),
+              extraction_method, source_model))
 
 
 _REAL_DECISIONS = {"Apply", "Maybe", "Skip"}
@@ -213,17 +206,32 @@ def _compute_final_decision(score_decision, llm_decision, human_decision=None):
 
 
 def _store_final_decision(step_id, final_decision):
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("UPDATE steps SET final_decision = %s WHERE id = %s",
-                (final_decision, step_id))
-    conn.commit()
-    conn.close()
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("UPDATE steps SET final_decision = %s WHERE id = %s",
+                    (final_decision, step_id))
 
 
 def _parse_decision(raw):
     cleaned = raw.strip().replace("```json", "").replace("```", "").strip()
     return JobDecision(**json.loads(cleaned)).decision.value
+
+
+def _step_needs_review(step_id):
+    """
+    True if the step is flagged for human review for ANY reason (the additive
+    needs_human_review flag). This is the source of truth for whether the run pauses
+    — score disagreement, prompt injection, hallucination, and evaluation failure all
+    set it via flag_for_review, and record_score never clears it.
+    """
+    conn = get_connection()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT needs_human_review FROM steps WHERE id = %s", (step_id,))
+        row = cur.fetchone()
+        return bool(row and row[0])
+    finally:
+        conn.close()
 
 
 def do_process_job(state, run_id):
@@ -536,16 +544,14 @@ def apply_human_decision(state, run_id, step_id, decision, comment=""):
     AUTHORITATIVE outcome, preserving the agent's original decisions in the
     trace (audit). Called after a LangGraph resume.
     """
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("""
-        UPDATE steps
-        SET review_status = %s, reviewed_at = %s, reviewer = %s, review_comment = %s,
-            final_decision = %s
-        WHERE id = %s
-    """, (decision, __import__("datetime").datetime.now(), "human", comment, decision, step_id))
-    conn.commit()
-    conn.close()
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE steps
+            SET review_status = %s, reviewed_at = %s, reviewer = %s, review_comment = %s,
+                final_decision = %s
+            WHERE id = %s
+        """, (decision, __import__("datetime").datetime.now(), "human", comment, decision, step_id))
     state.human_decisions[str(step_id)] = {"decision": decision, "comment": comment}
 
     # Make the human decision authoritative in the in-memory results too, so
