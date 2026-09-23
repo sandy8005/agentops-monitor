@@ -47,6 +47,30 @@ TERMINAL_FAILURE = "terminal_failure"
 RETRYABLE_ERROR_CODES = {ErrorCode.LLM_UNAVAILABLE, ErrorCode.LLM_QUOTA_EXHAUSTED}
 
 
+def _mark_run_retrying(run_id):
+    """During retry backoff, show the run as 'retrying' (not 'failed') so the monitor
+    and users don't see a 'failed' run that's actually about to run again. Keeps the
+    last attempt's error_code/stop_reason. No-op if the run is already terminal."""
+    with get_connection() as conn:
+        conn.cursor().execute(
+            "UPDATE runs SET status='retrying' "
+            "WHERE id=%s AND status IN ('queued','running','failed')", (run_id,))
+
+
+def _finalize_run_failed_if_active(run_id, error_code):
+    """Finalize a run as 'failed' if it is still in an active (non-terminal) state.
+    Covers the case where _run_job raised BEFORE the graph could finalize the run
+    (malformed queue payload, dispatch-level error): the queue job is terminally
+    failed but the run would otherwise linger in queued/running/retrying. Conditional
+    on the current status, so it never overwrites a run the graph already finalized."""
+    with get_connection() as conn:
+        conn.cursor().execute(
+            "UPDATE runs SET status='failed', ended_at=NOW(), error_code=%s, "
+            "stop_reason=COALESCE(stop_reason, 'job failed before the run was finalized') "
+            "WHERE id=%s AND status IN ('queued','running','retrying')",
+            (str(error_code) if error_code else None, run_id))
+
+
 def _run_outcome(run_id):
     """
     Map a finished job to a queue outcome by reading the RUN'S authoritative status
@@ -161,6 +185,18 @@ def _process(job):
             log.error("job %s (%s) failed [%s, code=%s] — %s",
                       job["id"], job["kind"], "terminal" if terminal else "retryable",
                       code, res, extra={"run_id": job["run_id"]})
+            # Keep the RUN's status consistent with the QUEUE outcome.
+            if job.get("run_id") is not None:
+                if res == "requeued":
+                    # Will retry after backoff — show 'retrying', not the graph's
+                    # 'failed', while keeping the last attempt's error_code.
+                    _mark_run_retrying(job["run_id"])
+                elif res == "failed":
+                    # Terminal/exhausted — make sure the run is finalized too (it may
+                    # still be queued/running if _run_job raised before the graph
+                    # could finalize). No-op if already terminal.
+                    _finalize_run_failed_if_active(job["run_id"], code)
+                # res == "lost": another worker owns it now — don't touch the run.
     finally:
         stop.set()
 

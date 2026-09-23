@@ -99,7 +99,8 @@ def get_csrf(request: Request):
 
 @app.post("/login")
 @limiter.limit(settings.rate_limit_login)
-def login(request: Request, username: str = Form(...), password: str = Form(...)):
+def login(request: Request, username: str = Form(...), password: str = Form(...),
+          _csrf: None = Depends(require_csrf)):
     """Verify credentials via auth.authenticate and start a signed session.
     Rate-limited per IP to blunt brute-force."""
     user = authenticate(username, password)
@@ -283,11 +284,11 @@ def cancel_run(run_id: int, user: dict = Depends(require_auth),
             raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
         status = row[0]
 
-        if status in ("running", "queued"):
+        if status in ("running", "queued", "retrying"):
             # Cooperative cancel. 'running': the loop checks is_cancel_requested between
-            # jobs. 'queued': not claimed yet — run_agent_graph checks the flag BEFORE
-            # any parse/search/LLM work, so no agent work is wasted. Set the flag in
-            # THIS locked transaction (not a separate connection).
+            # jobs. 'queued'/'retrying': not executing right now — run_agent_graph checks
+            # the flag BEFORE any parse/search/LLM work, so no agent work is wasted. Set
+            # the flag in THIS locked transaction (not a separate connection).
             cur.execute("UPDATE runs SET cancel_requested = TRUE WHERE id = %s", (run_id,))
             return {"run_id": run_id, "cancel_requested": True}
 

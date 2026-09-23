@@ -51,6 +51,12 @@ class Settings:
         self.session_secret = _get("SESSION_SECRET")
         self.redact_sensitive = _get_bool("REDACT_SENSITIVE", True)
         self.session_max_age = int(_get("SESSION_MAX_AGE", str(8 * 60 * 60)))
+
+        # DB connection pool bounds. Each PROCESS (api, worker) gets its own pool, so
+        # total connections = processes * DB_POOL_MAX — size accordingly for Postgres'
+        # max_connections when running multiple api/worker processes.
+        self.db_pool_min = int(_get("DB_POOL_MIN", "1"))
+        self.db_pool_max = int(_get("DB_POOL_MAX", "20"))
         # Rate limits (requests per window) — see api.py. Overridable via env.
         self.rate_limit_login = _get("RATE_LIMIT_LOGIN", "5/minute")
         self.rate_limit_runs = _get("RATE_LIMIT_RUNS", "20/minute")

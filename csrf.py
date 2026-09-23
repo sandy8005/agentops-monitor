@@ -28,9 +28,12 @@ from fastapi import Request, HTTPException
 CSRF_HEADER = "x-csrf-token"
 SESSION_KEY = "csrf_token"
 _SAFE_METHODS = {"GET", "HEAD", "OPTIONS"}
-# POST /login is the only state-changing path allowed without a token: it runs before
-# a session/token exists, and is guarded by rate limiting instead.
-_EXEMPT_PATHS = {"/login"}
+# No state-changing path is exempt. /login is protected too: the frontend fetches a
+# token (GET /csrf, which mints one into the anonymous session) BEFORE logging in and
+# echoes it on the login POST, so login-CSRF (an attacker logging a victim into their
+# own account) is rejected. Rate limiting is not a substitute. GET /csrf is a safe
+# method, so it needs no entry here.
+_EXEMPT_PATHS = set()
 
 
 def issue_token():

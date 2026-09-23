@@ -43,13 +43,14 @@ def _fresh_logged_in_client():
     pw = "pw_" + uuid.uuid4().hex[:8]
     create_user(uname, pw, role="user")
     c = TestClient(api.app)
-    r = c.post("/login", data={"username": uname, "password": pw})
-    assert r.status_code == 200, r.text
-    # CSRF is session-bound: fetch this session's token and attach it as a default
-    # header so every state-changing request carries it. Without this, the POST/DELETE
-    # calls below would 403 on CSRF and never exercise AUTHORIZATION.
+    # Fetch the session-bound CSRF token FIRST (like the frontend's ensureCsrf before
+    # login) and attach it, so the login POST itself carries the token — /login is no
+    # longer CSRF-exempt. Every later state-changing request also carries it, so these
+    # tests exercise AUTHORIZATION rather than tripping on CSRF.
     token = c.get("/csrf").json()["csrf_token"]
     c.headers.update({"X-CSRF-Token": token})
+    r = c.post("/login", data={"username": uname, "password": pw})
+    assert r.status_code == 200, r.text
     return c
 
 

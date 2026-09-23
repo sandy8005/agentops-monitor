@@ -31,8 +31,7 @@ _POOL_LOCK = threading.Lock()
 
 # Pool sizing: min kept warm, max hard ceiling. FastAPI runs endpoints in a
 # threadpool and background agent runs also hit the DB, so allow a healthy max.
-_MIN_CONN = 1
-_MAX_CONN = 20
+# Pool bounds come from settings (DB_POOL_MIN / DB_POOL_MAX) — see settings.py.
 
 
 def _get_pool():
@@ -45,7 +44,7 @@ def _get_pool():
             if _POOL is None:
                 settings.validate_db()   # fail loudly only when we actually connect
                 _POOL = _pgpool.ThreadedConnectionPool(
-                    _MIN_CONN, _MAX_CONN, **settings.db_kwargs()
+                    settings.db_pool_min, settings.db_pool_max, **settings.db_kwargs()
                 )
     return _POOL
 
