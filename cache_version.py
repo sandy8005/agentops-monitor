@@ -17,8 +17,8 @@ stored on each row so you can query/prune by version.
 """
 from settings import settings
 
-PARSER_VERSION = "1"
-REQS_VERSION = "2"   # bumped: cache key now includes TITLE + description (was desc-only)
+PARSER_VERSION = "2"   # bumped: parse prompt hardened (HARDENING_PREAMBLE + wrap_untrusted)
+REQS_VERSION = "3"   # bumped: reqs prompt hardened (HARDENING_PREAMBLE + wrap_untrusted); key already includes TITLE + description
 SCHEMA_VERSION = "1"
 
 

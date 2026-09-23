@@ -38,3 +38,38 @@ def test_normalize_education_alt_keys():
 def test_normalize_education_empty():
     assert _normalize_education([]) == []
     assert _normalize_education(None) == []
+
+# --- Full parse_resume() with a mocked LLM -----------------------------------
+# The regression guard the suite was missing. These call the WHOLE parse_resume,
+# so a gutted body (no json.loads / no return -> None) is caught instead of only
+# the _normalize_* helpers. Uses a mocked LLM response — no network, no DB.
+import pytest
+
+
+def test_parse_resume_end_to_end_with_mocked_llm(monkeypatch):
+    import parser as parsermod
+    mock_json = (
+        '```json\n'
+        '{"skills": ["Python", "SQL"], "years_experience": 5,\n'
+        ' "education": [{"degree": "BS CS", "institution": "MIT", "year": "2019"}],\n'
+        ' "projects": [{"name": "AgentOps", "tech": ["Python", "FastAPI"]}],\n'
+        ' "experience": [{"title": "Engineer", "company": "Acme", "years": 3},\n'
+        '                {"title": "Senior Eng", "company": "Beta", "months": 24}]}\n'
+        '```'
+    )
+    monkeypatch.setattr(parsermod, "logged_llm_call", lambda *a, **k: mock_json)
+    result = parsermod.parse_resume("resume text", run_id=1, step_id=1)
+    assert isinstance(result, dict)                        # NOT None — the regression
+    assert result["skills"] == ["Python", "SQL"]
+    assert result["projects"][0]["tech"] == ["Python", "FastAPI"]
+    assert result["experience"][1]["years"] == 2.0        # 24 months -> 2 years, once
+    assert result["years_experience_summed"] == 5.0       # reconcile ran
+
+
+def test_parse_resume_raises_on_unparseable_output(monkeypatch):
+    # Unparseable LLM output must RAISE (run fails cleanly, nothing cached),
+    # never return None (which poisoned the parse cache).
+    import parser as parsermod
+    monkeypatch.setattr(parsermod, "logged_llm_call", lambda *a, **k: "not json at all")
+    with pytest.raises(Exception):
+        parsermod.parse_resume("resume text", run_id=1, step_id=1)

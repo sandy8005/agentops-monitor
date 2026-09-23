@@ -176,4 +176,51 @@ RULES:
 """
     raw = logged_llm_call(prompt, run_id, step_id, budget=budget)
     cleaned = raw.strip().replace("```json", "").replace("```", "").strip()
-    # ... (the rest of parse_resume's body — validation/reconciliation — is unchanged)
+
+    # --- Parse model output -----------------------------------------------
+    # Fail LOUD on unparseable output rather than returning None: a None return
+    # would let the router cache json.dumps(None) == "null" and poison the parse
+    # cache; raising surfaces the failure so the run fails cleanly and nothing bad
+    # is cached.
+    try:
+        parsed = json.loads(cleaned)
+    except json.JSONDecodeError:
+        # The model occasionally wraps the object in prose despite instructions;
+        # salvage the outermost {...} before giving up.
+        match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+        if not match:
+            raise ValueError(
+                f"parse_resume: LLM output was not valid JSON (step_id={step_id})"
+            )
+        parsed = json.loads(match.group())
+
+    if not isinstance(parsed, dict):
+        raise ValueError(
+            f"parse_resume: expected a JSON object, got "
+            f"{type(parsed).__name__} (step_id={step_id})"
+        )
+
+    # --- Normalize each field into the canonical shape --------------------
+    skills = parsed.get("skills") or []
+    if isinstance(skills, str):
+        skills = [s.strip() for s in skills.split(",") if s.strip()]
+    elif isinstance(skills, list):
+        skills = [str(s).strip() for s in skills if str(s).strip()]
+    else:
+        skills = []
+
+    normalized = {
+        "skills": skills,
+        "years_experience": _to_float_or_default(parsed.get("years_experience")),
+        "education": _normalize_education(parsed.get("education")),
+        "projects": _normalize_projects(parsed.get("projects")),
+        "experience": _normalize_experience(parsed.get("experience")),
+    }
+
+    # --- Schema validation (core fields) ----------------------------------
+    validated = ParsedResume.model_validate(normalized).model_dump()
+
+    # --- Cross-check stated vs summed experience (adds audit metadata) ----
+    validated = _reconcile_experience(validated)
+
+    return validated
