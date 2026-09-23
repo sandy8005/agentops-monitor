@@ -5,6 +5,7 @@ from database import get_connection
 from google import genai
 import json
 from settings import settings
+from error_codes import ErrorCode
 from logging_config import get_logger
 log = get_logger(__name__)
 
@@ -271,20 +272,26 @@ def save_evaluation(run_id, step_id, evaluation):
 
 
 def finish_run(run_id, status="success", stop_reason=None, error_code=None):
+    """
+    Finalize a run. stop_reason and error_code are ALWAYS written to reflect THIS
+    outcome — including being cleared to NULL on a clean finish — so a run that failed
+    on an earlier attempt and then succeeded on retry doesn't keep a stale error_code /
+    stop_reason from the failed try.
+    """
     conn = get_connection()
     cur = conn.cursor()
+    # ErrorCode is a str-Enum; store its plain value. (psycopg2 would adapt it to the
+    # same string, but be explicit so the stored vocabulary is unambiguous.)
+    error_code_val = error_code.value if isinstance(error_code, ErrorCode) else error_code
     cur.execute("""
         UPDATE runs SET ended_at = %s, status = %s,
+            stop_reason = %s, error_code = %s,
             total_tokens = (SELECT COALESCE(SUM(prompt_tokens + completion_tokens), 0)
                             FROM llm_calls WHERE run_id = %s),
             total_cost = (SELECT COALESCE(SUM(cost_usd), 0)
                           FROM llm_calls WHERE run_id = %s)
         WHERE id = %s
-    """, (datetime.now(), status, run_id, run_id, run_id))
-    if stop_reason is not None:
-        cur.execute("UPDATE runs SET stop_reason = %s WHERE id = %s", (stop_reason, run_id))
-    if error_code is not None:
-        cur.execute("UPDATE runs SET error_code = %s WHERE id = %s", (error_code, run_id))
+    """, (datetime.now(), status, stop_reason, error_code_val, run_id, run_id, run_id))
     conn.commit()
     conn.close()
 
