@@ -240,7 +240,7 @@ def fetch_and_upsert_adzuna(role, location=None, limit=10, run_id=None, step_id=
     agent makes. Now OBSERVED with a CLASSIFIED status (success / empty /
     missing_keys / auth_error / rate_limited / http_error / network_error) rather
     than collapsing every non-result into "empty", so the trace shows WHY a fetch
-    produced nothing. Returns (inserted, skipped).
+    produced nothing. Returns (inserted, skipped, status).
     """
     import time
     from job_search import create_search, associate_jobs
@@ -279,7 +279,7 @@ def fetch_and_upsert_adzuna(role, location=None, limit=10, run_id=None, step_id=
 
     if fetched:
         log.info("adzuna: fetched %s, added %s new, %s already known (%sms)", fetched, inserted, skipped, latency_ms)
-    return (inserted, skipped)
+    return (inserted, skipped, status)
 
 
 if __name__ == "__main__":

@@ -117,12 +117,14 @@ def do_search_jobs(state, run_id):
         # Refresh the pool with REAL live jobs matching this role + location
         # (Adzuna does real search + location filtering). Best-effort — falls back
         # to the existing pool if the API is unavailable or keys are missing.
+        fetch_status = "success"
         try:
             from adzuna_jobs import fetch_and_upsert_adzuna
-            fetch_and_upsert_adzuna(state.target_role, state.location,
+            _, _, fetch_status = fetch_and_upsert_adzuna(state.target_role, state.location,
                                     run_id=run_id, step_id=step_id)
         except Exception as live_err:
             log.warning("adzuna fetch skipped (%s) — using existing pool", live_err)
+            fetch_status = "failed"
 
         state.jobs = logged_tool_call(
             "search_jobs",
@@ -133,6 +135,17 @@ def do_search_jobs(state, run_id):
              "work_mode": state.work_mode, "employment_type": state.employment_type,
              "live_only": state.live_only, "run_id": run_id},
             run_id, step_id, operation="search_jobs")
+
+        # In LIVE-ONLY mode, a PROVIDER failure that yielded no jobs is NOT
+        # "no matches" — the source was unavailable. Surface it as a search failure
+        # so the run reports search_failed instead of telling the user "no jobs
+        # matched" when the truth is the provider failed. A successful or genuinely
+        # empty fetch (status success/empty) with 0 results stays a real no_matches.
+        PROVIDER_FAILURES = {"missing_keys", "auth_error", "rate_limited",
+                             "http_error", "network_error", "failed"}
+        if state.live_only and not state.jobs and fetch_status in PROVIDER_FAILURES:
+            raise RuntimeError(f"live job source unavailable (adzuna: {fetch_status})")
+
         finish_step(step_id, "success")
     except Exception as e:
         fail_step(step_id, e)

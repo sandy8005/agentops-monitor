@@ -273,7 +273,10 @@ def cancel_run(run_id: int, user: dict = Depends(require_auth),
                _csrf: None = Depends(require_csrf)):
     with get_connection() as conn:
         cur = conn.cursor()
-        cur.execute("SELECT status FROM runs WHERE id = %s AND user_id = %s",
+        # Lock the run row so concurrent cancels (double-click) serialize — otherwise
+        # two cancels of a waiting_for_human run could each enqueue a resume job for
+        # the same LangGraph checkpoint. Same exactly-once pattern as /resume.
+        cur.execute("SELECT status FROM runs WHERE id = %s AND user_id = %s FOR UPDATE",
                     (run_id, user["id"]))
         row = cur.fetchone()
         if not row:
@@ -282,19 +285,25 @@ def cancel_run(run_id: int, user: dict = Depends(require_auth),
 
         if status in ("running", "queued"):
             # Cooperative cancel. 'running': the loop checks is_cancel_requested between
-            # jobs. 'queued': not claimed yet — set the flag now so that when a worker
-            # picks the job up and begins the run, it sees the cancel and stops early.
-            request_cancel(run_id)
+            # jobs. 'queued': not claimed yet — run_agent_graph checks the flag BEFORE
+            # any parse/search/LLM work, so no agent work is wasted. Set the flag in
+            # THIS locked transaction (not a separate connection).
+            cur.execute("UPDATE runs SET cancel_requested = TRUE WHERE id = %s", (run_id,))
             return {"run_id": run_id, "cancel_requested": True}
 
         if status == "waiting_for_human":
             # Paused at an interrupt — not executing, so no loop is checking the flag.
-            # Set the flag AND resume the graph so it wakes, sees the cancel, and
-            # terminates through its normal 'cancelled' routing (no orphaned checkpoint).
-            request_cancel(run_id)
-            enqueue("resume_run",
-                    {"run_id": run_id, "decision": "Skip", "comment": "cancelled by user"},
-                    run_id=run_id)
+            # Flip to queued, set the cancel flag, AND enqueue the resume-to-cancel job
+            # in ONE locked transaction (same pattern as /resume): the row lock makes
+            # this exactly-once, so two concurrent cancels can't create duplicate
+            # resume jobs for the same checkpoint. The graph wakes, sees the cancel,
+            # and terminates through its normal 'cancelled' routing (no orphaned
+            # checkpoint).
+            cur.execute("UPDATE runs SET status = 'queued', cancel_requested = TRUE WHERE id = %s",
+                        (run_id,))
+            enqueue_tx(cur, "resume_run",
+                       {"run_id": run_id, "decision": "Skip", "comment": "cancelled by user"},
+                       run_id=run_id)
             return {"run_id": run_id, "cancel_requested": True, "resumed_to_cancel": True}
 
         raise HTTPException(status_code=400,

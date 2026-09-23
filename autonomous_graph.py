@@ -284,6 +284,16 @@ def run_agent_graph(resume_id, target_role=None, location=None,
     seed.max_llm_calls = max_llm_calls
     initial = _dump(seed, run_id)
 
+    # Cancelled while QUEUED (before a worker claimed the job)? Stop before ANY agent
+    # work — no resume parse, no job search, no LLM calls. Finalize as cancelled here.
+    # (A cancel that arrives mid-run is still caught cooperatively between jobs.)
+    from llm import is_cancel_requested
+    if is_cancel_requested(run_id):
+        finish_run(run_id, "cancelled", stop_reason="cancelled by user",
+                   error_code=ErrorCode.CANCELLED)
+        log.info("run cancelled before start — no agent work done", extra={"run_id": run_id})
+        return {"cancelled": True}
+
     final_status = "success"
     final_state = initial
 
