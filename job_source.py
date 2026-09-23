@@ -222,33 +222,101 @@ def _merge_duplicate(winner, loser):
     return winner
 
 
+def _canonical_url(job):
+    """
+    A normalized apply/source URL used as the PRIMARY dedup identity. Two postings
+    with the same canonical URL are the same job (even across providers); postings
+    with DIFFERENT URLs are kept DISTINCT — so two real requisitions that merely share
+    a title+company+location are never merged into one. Returns None when the posting
+    has no usable URL (then we fall back to the content fingerprint).
+    """
+    for f in ("apply_url", "url", "source_url"):
+        u = job.get(f)
+        if u and isinstance(u, str):
+            # drop #fragment and ?query (tracking params), trailing slash, and case,
+            # so the same link matches regardless of ?utm=... etc.
+            u = u.strip().split("#", 1)[0].split("?", 1)[0].rstrip("/")
+            if u:
+                return u.lower()
+    return None
+
+
+def _dedupe_key(job):
+    """
+    (Retained for callers/tests that want the primary identity signal of a single
+    posting: its canonical URL if it has one, else its content fingerprint.)
+    """
+    cu = _canonical_url(job)
+    if cu:
+        return ("url", cu)
+    return ("content",) + _fingerprint(job)
+
+
 def _rank(job):
     return _SOURCE_RANK.get((job.get("source") or "").lower(), -1)
 
 
+def _merge_group(rows):
+    """Collapse rows that are the SAME job into one: the highest source-rank row wins,
+    and useful fields (apply_url, dates, external_id, ...) are salvaged from the rest."""
+    best_i = max(range(len(rows)), key=lambda i: _rank(rows[i]))
+    winner = dict(rows[best_i])
+    for i, r in enumerate(rows):
+        if i != best_i:
+            _merge_duplicate(winner, r)
+    return winner
+
+
 def _dedupe_jobs(jobs):
     """
-    Collapse cross-provider duplicates on a provider-independent content
-    fingerprint (normalized title + company + location). On a collision the
-    HIGHER-source-rank row wins (Adzuna > Remotive > scraped > csv > seed), but
-    useful fields from the loser (apply_url, dates, external_id, ...) are merged
-    into the winner so nothing valuable is dropped. First-seen order is preserved.
+    Collapse duplicates in TWO tiers, so genuinely distinct requisitions are never
+    silently merged (the reviewer's concern), while true duplicates still collapse:
+
+      1. Group by content fingerprint (title+company+location).
+      2. WITHIN a group, split by DISTINCT canonical URL. Rows that share a URL — or
+         have no URL — are the same job and merge (higher source-rank wins; apply_url
+         etc. salvaged from the losers). Rows with DIFFERENT URLs are DISTINCT
+         requisitions and each survive. A url-less row inside a group that has
+         multiple distinct URLs is ambiguous, so it's folded into the highest-rank URL
+         bucket rather than dropped or turned into a phantom row.
+
+    So "AI Engineer @ Google, NYC" for two different teams (two apply URLs) stays TWO
+    rows, while the SAME posting seen on two feeds (same URL, or one feed missing the
+    URL) collapses to one. First-seen order is preserved.
     """
-    best = {}
+    groups = {}
     order = []
     for j in jobs:
-        key = _fingerprint(j)
-        if key not in best:
-            best[key] = dict(j)          # copy — merging mutates the kept row
-            order.append(key)
-            continue
-        cur = best[key]
-        if _rank(j) > _rank(cur):
-            winner, loser = dict(j), cur   # new row outranks: it becomes the keeper
+        fp = _fingerprint(j)
+        if fp not in groups:
+            groups[fp] = []
+            order.append(fp)
+        groups[fp].append(j)
+
+    result = []
+    for fp in order:
+        members = groups[fp]
+        by_url = {}
+        urlless = []
+        for j in members:
+            cu = _canonical_url(j)
+            if cu:
+                by_url.setdefault(cu, []).append(j)
+            else:
+                urlless.append(j)
+
+        if len(by_url) <= 1:
+            # 0 or 1 distinct URL in this content group -> ONE job; merge every member.
+            result.append(_merge_group(members))
         else:
-            winner, loser = cur, j          # existing row stays the keeper
-        best[key] = _merge_duplicate(winner, loser)
-    return [best[k] for k in order]
+            # Multiple distinct URLs -> multiple distinct requisitions: one row each.
+            buckets = list(by_url.values())
+            if urlless:
+                target = max(buckets, key=lambda b: max(_rank(x) for x in b))
+                target.extend(urlless)
+            for b in buckets:
+                result.append(_merge_group(b))
+    return result
 
 
 def search_jobs(target_role=None, location=None, work_mode=None,
