@@ -2,9 +2,17 @@
 __pycache__/
 *.py[cod]
 *$py.class
+*.so
+
+# --- Test / type / lint caches ---
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
+.cache/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
 
 # --- Virtual environments ---
 venv/
@@ -12,38 +20,34 @@ venv/
 env/
 ENV/
 
-# --- Secrets / local config ---
+# --- Packaging / build ---
+build/
+dist/
+*.egg-info/
+*.egg
+.eggs/
+pip-wheel-metadata/
+
+# --- Secrets / local config (NEVER commit) ---
 .env
 .env.*
 !.env.example
 
-# --- Legacy SQLite artifacts (project is Postgres-only) ---
+# --- Local databases / dumps ---
 *.db
 *.sqlite
 *.sqlite3
-agentops.db
+*.sql.gz
+*.dump
 
-# --- Local dev/test utilities (throwaway scripts, not part of the app) ---
-clear_cache.py
-finish_stuck.py
-check_gemini.py
-check_run.py
-check_cols.py
-reset_pw.py
-force_paused_run.py
+# --- Logs ---
+*.log
+logs/
 
-# --- Uploaded resumes / local data ---
-*.pdf
-uploads/
-
-# --- OS / editor ---
+# --- Editor / OS ---
+.vscode/
+.idea/
+*.swp
+*.swo
 .DS_Store
 Thumbs.db
-.idea/
-.vscode/
-*.swp
-
-# --- Build / dist ---
-build/
-dist/
-*.egg-info/
