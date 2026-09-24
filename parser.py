@@ -100,11 +100,12 @@ def _normalize_experience(exp_list):
 
 def _reconcile_experience(parsed_dict):
     """
-    Cross-check the LLM's stated years_experience against the sum of individual
-    experience durations. The two are independent sources for the same fact; if
-    they diverge meaningfully, prefer the GROUNDED sum (itemized per-role
-    durations resist hallucination better than a free-floating total), and record
-    the discrepancy so it's VISIBLE rather than silently resolved.
+    Cross-check the LLM's stated years_experience against the sum of itemized role
+    durations and FLAG a large divergence — but do NOT overwrite the stated total.
+    A naive sum is not ground truth: it double-counts concurrent/overlapping roles
+    (accurate reconciliation needs date-range unioning) and under-counts when only
+    some roles are itemized. So we keep the model's stated total and surface the
+    discrepancy for a human / downstream awareness instead of silently replacing it.
     """
     stated = parsed_dict.get("years_experience", 0.0) or 0.0
     summed = round(sum(e.get("years", 0.0) or 0.0 for e in parsed_dict.get("experience", [])), 2)
@@ -114,19 +115,19 @@ def _reconcile_experience(parsed_dict):
 
     TOLERANCE_YEARS = 1.0
     if summed > 0 and abs(stated - summed) > TOLERANCE_YEARS:
-        # Meaningful divergence: trust the grounded sum, flag the discrepancy.
-        parsed_dict["years_experience"] = summed
+        # Divergence > 1yr: FLAG it, but keep the stated total (the sum is unreliable
+        # without date-range unioning). Do not silently replace years_experience.
         parsed_dict["experience_discrepancy"] = {
             "stated": stated,
             "summed": summed,
-            "used": summed,
-            "note": ("LLM-stated total diverged from the sum of itemized role "
-                     "durations by more than 1 year; using the grounded sum.")
+            "note": ("stated total and summed itemized-role durations diverge by "
+                     ">1 year; the sum may double-count concurrent roles or miss "
+                     "un-itemized ones — keeping the stated total, flagged for review."),
         }
     else:
-        # They agree, or there's no itemized data to check against — keep stated.
         parsed_dict["experience_discrepancy"] = None
 
+    # years_experience is left as STATED (not replaced).
     return parsed_dict
 
 

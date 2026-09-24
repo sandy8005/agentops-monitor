@@ -102,13 +102,16 @@ def test_project_score_uses_same_or_semantics():
 
 # ----------------------- experience reconciliation -----------------------
 
-def test_experience_prefers_grounded_sum_on_divergence():
+def test_experience_flags_divergence_but_keeps_stated():
+    # A naive sum double-counts concurrent roles, so the stated total is NOT replaced;
+    # the divergence is flagged instead.
     p = {"years_experience": 4.0,
          "experience": [{"title": "A", "company": "X", "years": 1.0},
                         {"title": "B", "company": "Y", "years": 0.5}]}
     out = _reconcile_experience(p)
-    assert out["years_experience"] == 1.5           # grounded sum used
+    assert out["years_experience"] == 4.0           # STATED kept (sum not ground truth)
     assert out["years_experience_stated"] == 4.0
+    assert out["years_experience_summed"] == 1.5
     assert out["experience_discrepancy"] is not None
 
 def test_experience_keeps_stated_when_within_tolerance():

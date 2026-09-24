@@ -291,11 +291,25 @@ def cancel_run(run_id: int, user: dict = Depends(require_auth),
             raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
         status = row[0]
 
-        if status in ("running", "queued", "retrying"):
-            # Cooperative cancel. 'running': the loop checks is_cancel_requested between
-            # jobs. 'queued'/'retrying': not executing right now — run_agent_graph checks
-            # the flag BEFORE any parse/search/LLM work, so no agent work is wasted. Set
-            # the flag in THIS locked transaction (not a separate connection).
+        if status == "running":
+            # Actively executing — cooperative cancel: the loop checks is_cancel_requested
+            # between jobs. Set the flag in THIS locked transaction.
+            cur.execute("UPDATE runs SET cancel_requested = TRUE WHERE id = %s", (run_id,))
+            return {"run_id": run_id, "cancel_requested": True}
+
+        if status in ("queued", "retrying"):
+            # NOT executing. Cancel the queued job BEFORE a worker claims it, so the user
+            # doesn't wait through retry backoff. The row lock serializes against
+            # claim_next: if we cancel the queued job first, finalize the run IMMEDIATELY;
+            # if a worker just claimed it (now 'running'), fall back to cooperative cancel.
+            cur.execute("UPDATE job_queue SET status = 'cancelled', finished_at = NOW() "
+                        "WHERE run_id = %s AND status = 'queued'", (run_id,))
+            if cur.rowcount > 0:
+                cur.execute("UPDATE runs SET status = 'cancelled', ended_at = NOW(), "
+                            "cancel_requested = TRUE, error_code = 'cancelled', "
+                            "stop_reason = 'cancelled by user' WHERE id = %s", (run_id,))
+                return {"run_id": run_id, "cancelled": True}
+            # A worker claimed it in the meantime — cooperative cancel instead.
             cur.execute("UPDATE runs SET cancel_requested = TRUE WHERE id = %s", (run_id,))
             return {"run_id": run_id, "cancel_requested": True}
 
