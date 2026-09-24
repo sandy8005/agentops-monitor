@@ -17,7 +17,13 @@ from slowapi import Limiter
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 
-app = FastAPI(title="AgentOps Monitor")
+# Auto-generated API docs are handy in dev but expose the full API schema, so they
+# are turned off in production (ENV=production). Set ENV to anything else to re-enable
+# them locally.
+_docs = None if settings.is_production else "/docs"
+app = FastAPI(title="AgentOps Monitor", docs_url=_docs,
+              redoc_url=(None if settings.is_production else "/redoc"),
+              openapi_url=(None if settings.is_production else "/openapi.json"))
 
 # --- Rate limiting ----------------------------------------------------------
 # Per-client-IP limits (in-memory) to blunt login brute-force and enqueue abuse.
