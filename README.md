@@ -36,7 +36,7 @@ You therefore run **two processes**: the API (`uvicorn api:app`) and the worker 
 
 1. **load_resume** — load the stored resume document for the run.
 2. **parse_resume** — an LLM structures the resume into JSON (skills, projects, education, experience), validated with Pydantic; the parsed result is cached.
-3. **search_jobs** — refresh the pool with live jobs (Adzuna real search + location), then search the pool filtered by role/location/mode/type. Role matching understands aliases (e.g. "ML" ↔ "machine learning"). Duplicate postings are collapsed URL-first (the same canonical apply URL means the same job), falling back to a title+company+location fingerprint only for postings with no URL — so two genuinely distinct requisitions that merely share a title/company/location are kept separate.
+3. **search_jobs** — refresh the pool with live jobs from Adzuna (real role+location search) and Remotive (remote-only), each run-scoped, then search the pool filtered by role/location/mode/type. Role matching understands aliases (e.g. "ML" ↔ "machine learning"). Duplicate postings are collapsed URL-first (the same canonical apply URL means the same job), falling back to a title+company+location fingerprint only for postings with no URL — so two genuinely distinct requisitions that merely share a title/company/location are kept separate.
 4. For each job: **extract_requirements** (required vs. preferred skills, min experience; cached with provenance) → deterministic **match_score** (100-point, normalized when optional categories are absent) → **judge** (LLM Apply/Maybe/Skip, only in the uncertain 20–80 band, budget-permitting) → **disagreement/quality flags** → if flagged, **pause for human review** (inline) → **evaluator** on risky jobs.
 5. **rank_jobs** — sorts by the authoritative decision bucket (Apply > Maybe > Skip), then by score. The ranked list is persisted to `run_rankings`.
 6. **generate_advice** — combined application-strategy + resume-edit advice for the top viable jobs, persisted to `run_advice`.
@@ -96,7 +96,7 @@ The agent doesn't depend on a single source. Jobs flow into one `job_postings` t
 
 - **Seed** — built-in sample postings
 - **CSV** — imported from a spreadsheet
-- **Adzuna / Remotive** — live jobs. Adzuna does a real role+location search and is the source refreshed per-run in live mode; Remotive is supported as a feed but is not currently part of the run-scoped live refresh.
+- **Adzuna / Remotive** — live jobs, **both refreshed per-run** in live mode and scoped to that run's search. Adzuna does a real role+location search; Remotive is remote-only (location is informational).
 - **Web scraping** — scraped from a static, scraping-permitted job board
 
 New feeds can be added without changing the agent.
