@@ -345,7 +345,7 @@ def search_jobs(target_role=None, location=None, work_mode=None,
         # read for filtering (kept only until a later migration drops it).
         cur.execute("""
             SELECT p.id, p.title, p.company, p.description, p.location, p.work_mode,
-                   p.employment_type, p.source, p.external_id, p.last_seen_at,
+                   p.employment_type, p.source, p.external_id, p.last_seen_at, p.apply_url,
                    COALESCE(
                        ARRAY_AGG(DISTINCT lower(s.location))
                        FILTER (WHERE s.location IS NOT NULL),
@@ -373,8 +373,8 @@ def search_jobs(target_role=None, location=None, work_mode=None,
         all_jobs = [
             {"id": r[0], "title": r[1], "company": r[2], "description": r[3],
              "location": r[4], "work_mode": r[5], "employment_type": r[6], "source": r[7],
-             "external_id": r[8], "last_seen_at": r[9],
-             "assoc_locations": set(r[10] or [])}
+             "external_id": r[8], "last_seen_at": r[9], "apply_url": r[10],
+             "assoc_locations": set(r[11] or [])}
             for r in rows
         ]
 

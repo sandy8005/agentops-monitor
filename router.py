@@ -346,8 +346,11 @@ def do_process_job(state, run_id):
                 llm_decision = "skipped (judge_unavailable)"
                 log.warning("judge unavailable for '%s' (%s) — keeping score", job['title'], judge_err)
 
-        needs_review = record_score(step_id, score, score_result["decision"],
-                                    llm_decision, breakdown=score_result["breakdown"])
+        # record_score sets the score-vs-LLM DISAGREEMENT review flag (additively) as a
+        # side effect. Its return value is only that ONE trigger, so it is NOT used for
+        # the routing decision — the authoritative DB flag (below) is.
+        record_score(step_id, score, score_result["decision"],
+                     llm_decision, breakdown=score_result["breakdown"])
 
         # Compute the authoritative decision (human > llm > score). Defaults to the
         # best automated signal now; a human review overrides it later.
@@ -366,31 +369,11 @@ def do_process_job(state, run_id):
         # Structured AgentOps signals (queryable columns).
         record_judge_signals(step_id, judge_status, judge_skip_reason, cache_hit)
 
-        state.job_results.append({
-            "step_id": step_id,
-            "job_id": job.get("id"),   # stable link to job_postings.id (not title)
-            "title": job["title"], "company": job["company"],
-            "score": score, "decision": score_result["decision"],
-            "llm_decision": llm_decision, "final_decision": final_decision,
-            "needs_review": needs_review, "apply_url": job.get("apply_url")
-        })
-
-        # Surface review status to the graph so routing can pause for a human.
-        state.last_job_needs_review = bool(needs_review)
-        if needs_review:
-            state.last_review_step_id = step_id
-            state.last_review_info = {
-                "step_id": step_id,
-                "job_title": job["title"],
-                "company": job.get("company"),
-                "score": score,
-                "score_decision": score_result["decision"],
-                "llm_decision": llm_decision,
-            }
-
-        # --- Evaluator (#8): ONLY on risky (flagged) jobs where the judge ran
-        # (so 'result' exists) and budget allows. Most jobs skip this. ---
-        if (state.evaluate and needs_review and result is not None
+        # --- Evaluator: on risky (FLAGGED) jobs where the judge ran (so 'result'
+        # exists) and budget allows. "Flagged" is the AUTHORITATIVE DB flag so far
+        # (prompt injection from extract_requirements + score disagreement) — not just
+        # the score-vs-LLM disagreement — so an injection-only job still gets evaluated.
+        if (state.evaluate and _step_needs_review(step_id) and result is not None
                 and not state.budget_exceeded()
                 and llm_decision in ("Apply", "Maybe", "Skip")):
             try:
@@ -409,6 +392,31 @@ def do_process_job(state, run_id):
             except Exception as eval_err:
                 flag_for_review(step_id, reason="evaluation_failed")
                 log.warning("evaluation requested but failed: %s", eval_err)
+
+        # AUTHORITATIVE review decision, AFTER every trigger has run (prompt injection,
+        # score disagreement, hallucination, evaluation failure). The graph routes on
+        # THIS flag — so a job flagged for prompt injection pauses for a human even when
+        # the deterministic score and the LLM judge happen to agree.
+        needs_review = _step_needs_review(step_id)
+        state.job_results.append({
+            "step_id": step_id,
+            "job_id": job.get("id"),   # stable link to job_postings.id (not title)
+            "title": job["title"], "company": job["company"],
+            "score": score, "decision": score_result["decision"],
+            "llm_decision": llm_decision, "final_decision": final_decision,
+            "needs_review": needs_review, "apply_url": job.get("apply_url")
+        })
+        state.last_job_needs_review = needs_review
+        if needs_review:
+            state.last_review_step_id = step_id
+            state.last_review_info = {
+                "step_id": step_id,
+                "job_title": job["title"],
+                "company": job.get("company"),
+                "score": score,
+                "score_decision": score_result["decision"],
+                "llm_decision": llm_decision,
+            }
 
         finish_step(step_id, "success")
     except Exception as e:

@@ -270,9 +270,11 @@ def run_agent_graph(resume_id, target_role=None, location=None,
     from the FINAL state dict, and finalizes the run.
     """
     if run_id is None:
-        run_id = create_run("autonomous job search (langgraph)", resume_id=resume_id,
-                            target_role=target_role, location=location,
-                            work_mode=work_mode, employment_type=employment_type)
+        # The worker EXECUTES runs; it never creates anonymous ones. Runs are created
+        # (with an owner — runs.user_id is NOT NULL) by the API. Requiring run_id keeps
+        # the ownership invariant intact and avoids an unowned-run schema violation.
+        raise ValueError("run_agent_graph requires an existing run_id (runs are "
+                         "created with an owner by the API; the worker only executes them)")
 
     # Build the initial flat state via AgentState (so defaults match exactly).
     seed = AgentState(
@@ -521,5 +523,16 @@ def resume_agent_graph(run_id, decision, comment=""):
 
 if __name__ == "__main__":
     import sys
+    from llm import create_run, get_connection
     rid = int(sys.argv[1]) if len(sys.argv) > 1 else 1
-    run_agent_graph(resume_id=rid, target_role="engineer")
+    # Runs need an owner (runs.user_id is NOT NULL). For a manual CLI run, attach it to
+    # the first user; create one via the app first if none exists.
+    with get_connection() as _c:
+        _cur = _c.cursor()
+        _cur.execute("SELECT id FROM users ORDER BY id LIMIT 1")
+        _u = _cur.fetchone()
+    if not _u:
+        print("No users exist — create one via the app, then re-run.")
+        sys.exit(1)
+    _rid = create_run("manual CLI run", resume_id=rid, target_role="engineer", user_id=_u[0])
+    run_agent_graph(resume_id=rid, target_role="engineer", run_id=_rid)

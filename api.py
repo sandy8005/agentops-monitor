@@ -118,8 +118,9 @@ def login(request: Request, username: str = Form(...), password: str = Form(...)
 
 
 @app.post("/logout")
-def logout(request: Request):
-    """Clear the session cookie."""
+def logout(request: Request, _csrf: None = Depends(require_csrf)):
+    """Clear the session cookie. CSRF-protected (the frontend already sends the token)
+    so a cross-site page can't force a logout."""
     request.session.clear()
     return {"ok": True}
 
