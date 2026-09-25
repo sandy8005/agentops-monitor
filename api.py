@@ -39,6 +39,25 @@ def _rate_limit_handler(request: Request, exc: RateLimitExceeded):
 
 MAX_UPLOAD_BYTES = 5 * 1024 * 1024
 
+from logging_config import get_logger
+log = get_logger("api")
+
+# Free-text input limits — guard memory, LLM cost, latency, and DB size. A 5 MB PDF
+# can still expand to a lot of text, so the extracted resume is capped too.
+MAX_NAME_CHARS = 200
+MAX_ROLE_CHARS = 200
+MAX_LOCATION_CHARS = 200
+MAX_COMMENT_CHARS = 2000
+MAX_USERNAME_CHARS = 150
+MAX_PASSWORD_CHARS = 200
+MAX_RESUME_CHARS = 60000
+
+
+def _check_len(field, value, limit):
+    if value and len(value) > limit:
+        raise HTTPException(status_code=400,
+                            detail=f"{field} is too long (max {limit} characters)")
+
 # --- Session auth -----------------------------------------------------------
 # Signed, HttpOnly session cookie via Starlette's SessionMiddleware. The signing
 # key MUST be set (SESSION_SECRET in .env) for a public deploy; we refuse to boot
@@ -109,6 +128,8 @@ def login(request: Request, username: str = Form(...), password: str = Form(...)
           _csrf: None = Depends(require_csrf)):
     """Verify credentials via auth.authenticate and start a signed session.
     Rate-limited per IP to blunt brute-force."""
+    _check_len("username", username, MAX_USERNAME_CHARS)
+    _check_len("password", password, MAX_PASSWORD_CHARS)
     user = authenticate(username, password)
     if not user:
         raise HTTPException(status_code=401, detail="Invalid username or password")
@@ -137,6 +158,7 @@ async def upload_resume(file: UploadFile = File(...), name: str = Form(""),
                         _csrf: None = Depends(require_csrf)):
     if not file.filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Please upload a PDF file")
+    _check_len("name", name, MAX_NAME_CHARS)
 
     contents = await file.read()
     if len(contents) > MAX_UPLOAD_BYTES:
@@ -156,15 +178,19 @@ async def upload_resume(file: UploadFile = File(...), name: str = Form(""),
     if not resume_text or not resume_text.strip():
         raise HTTPException(status_code=400, detail="Could not extract text from the PDF")
 
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("""
-        INSERT INTO resumes (name, resume_text, created_at, user_id)
-        VALUES (%s, %s, %s, %s) RETURNING id
-    """, (name or file.filename, resume_text, datetime.now(), user["id"]))
-    resume_id = cur.fetchone()[0]
-    conn.commit()
-    conn.close()
+    # Cap the extracted text before storing / feeding it to the LLM — a big PDF can
+    # expand into a very large amount of text (memory, LLM cost, latency, DB size).
+    if len(resume_text) > MAX_RESUME_CHARS:
+        log.info("resume text truncated from %d to %d chars", len(resume_text), MAX_RESUME_CHARS)
+        resume_text = resume_text[:MAX_RESUME_CHARS]
+
+    with get_connection() as conn:   # guaranteed release even if the INSERT throws
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO resumes (name, resume_text, created_at, user_id)
+            VALUES (%s, %s, %s, %s) RETURNING id
+        """, (name or file.filename, resume_text, datetime.now(), user["id"]))
+        resume_id = cur.fetchone()[0]
 
     return {"resume_id": resume_id, "name": name or file.filename,
             "chars": len(resume_text), "message": f"Resume stored as #{resume_id}"}
@@ -233,6 +259,8 @@ def start_run(request: Request, resume_id: int = None,
         raise HTTPException(status_code=400, detail="resume_id is required; upload or pick a resume first")
     if not target_role.strip():
         raise HTTPException(status_code=400, detail="target_role is required for a search")
+    _check_len("target_role", target_role, MAX_ROLE_CHARS)
+    _check_len("location", location, MAX_LOCATION_CHARS)
 
     conn = get_connection()
     try:
@@ -268,7 +296,8 @@ def start_run(request: Request, resume_id: int = None,
         raise
     except Exception as e:
         conn.rollback()
-        raise HTTPException(status_code=500, detail=f"Failed to start run: {e}")
+        log.exception("start_run failed: %s", e)   # full detail to the server log only
+        raise HTTPException(status_code=500, detail="Unable to start the run.")
     finally:
         conn.close()
     return {"run_id": run_id, "resume_id": resume_id, "target_role": target_role,
@@ -434,6 +463,7 @@ def resume_run(run_id: int, decision: str = "Maybe", comment: str = "",
     """Resume a paused (waiting_for_human) run with the human's decision."""
     if decision not in ("Apply", "Maybe", "Skip"):
         raise HTTPException(status_code=400, detail="decision must be Apply, Maybe, or Skip")
+    _check_len("comment", comment, MAX_COMMENT_CHARS)
     conn = get_connection()
     try:
         cur = conn.cursor()
@@ -466,7 +496,8 @@ def resume_run(run_id: int, decision: str = "Maybe", comment: str = "",
         raise
     except Exception as e:
         conn.rollback()
-        raise HTTPException(status_code=500, detail=f"Failed to resume run: {e}")
+        log.exception("resume_run failed: %s", e)
+        raise HTTPException(status_code=500, detail="Unable to resume the run.")
     finally:
         conn.close()
     return {"run_id": run_id, "resumed_with": decision}
