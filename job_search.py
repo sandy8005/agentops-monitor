@@ -14,35 +14,38 @@ location lives per-search, in the join, not as a fixed property of the job.
 creates a search row (run_id NULL) so associations remain queryable, and it never
 raises into the agent.
 """
+from timeutil import utcnow
 import os
 from database import get_connection as _get_connection
 from datetime import datetime
 
 
-def create_search(run_id, target_role, location, source, conn=None):
+def create_search(run_id, target_role, location, source, conn=None,
+                  location_filter_applied=True):
     """
     Insert a job_searches row and return its id. Reuses an open connection when
     given one (so the whole fetch+associate is a single transaction); otherwise
     opens and commits its own.
+
+    location_filter_applied records whether the PROVIDER actually filtered by
+    location. Only such searches make a posting count as "returned for" a location
+    (see job_source.search_jobs); remote-only providers pass False.
     """
-    own = conn is None
-    if own:
-        conn = _get_connection()
+    if conn is None:
+        with _get_connection() as own:
+            return create_search(run_id, target_role, location, source, conn=own,
+                                 location_filter_applied=location_filter_applied)
     cur = conn.cursor()
     cur.execute(
         """
-        INSERT INTO job_searches (run_id, target_role, location, source, created_at)
-        VALUES (%s, %s, %s, %s, %s) RETURNING id
+        INSERT INTO job_searches (run_id, target_role, location, source, created_at,
+                                  location_filter_applied)
+        VALUES (%s, %s, %s, %s, %s, %s) RETURNING id
         """,
         (run_id, (target_role or "").strip() or None,
-         (location or "").strip() or None, source, datetime.now()),
+         (location or "").strip() or None, source, utcnow(), bool(location_filter_applied)),
     )
-    search_id = cur.fetchone()[0]
-    if own:
-        conn.commit()
-        cur.close()
-        conn.close()
-    return search_id
+    return cur.fetchone()[0]
 
 
 def associate_jobs(search_id, job_ids, conn=None):
@@ -53,9 +56,9 @@ def associate_jobs(search_id, job_ids, conn=None):
     ids = [i for i in (job_ids or []) if i is not None]
     if not search_id or not ids:
         return 0
-    own = conn is None
-    if own:
-        conn = _get_connection()
+    if conn is None:
+        with _get_connection() as own:
+            return associate_jobs(search_id, ids, conn=own)
     cur = conn.cursor()
     for job_id in ids:
         cur.execute(
@@ -65,10 +68,6 @@ def associate_jobs(search_id, job_ids, conn=None):
             """,
             (search_id, job_id),
         )
-    if own:
-        conn.commit()
-        cur.close()
-        conn.close()
     return len(ids)
 
 
@@ -80,9 +79,9 @@ def job_ids_for_run(run_id, conn=None):
     """
     if run_id is None:
         return set()
-    own = conn is None
-    if own:
-        conn = _get_connection()
+    if conn is None:
+        with _get_connection() as own:
+            return job_ids_for_run(run_id, conn=own)
     cur = conn.cursor()
     cur.execute(
         """
@@ -93,8 +92,4 @@ def job_ids_for_run(run_id, conn=None):
         """,
         (run_id,),
     )
-    ids = {row[0] for row in cur.fetchall()}
-    if own:
-        cur.close()
-        conn.close()
-    return ids
+    return {row[0] for row in cur.fetchall()}

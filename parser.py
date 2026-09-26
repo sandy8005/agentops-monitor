@@ -131,18 +131,63 @@ def _reconcile_experience(parsed_dict):
     return parsed_dict
 
 
+def _norm_ws(text):
+    return " ".join(str(text or "").lower().split())
+
+
+def ground_skills(skills, skill_evidence, resume_text):
+    """
+    Make the parser's skill claims TRACEABLE to the resume text, deterministically.
+
+    The LLM is asked for a verbatim evidence snippet per skill. Here we keep only
+    snippets that really occur in the resume (whitespace/case-normalized), and mark a
+    skill as grounded if it has verified evidence OR the skill term itself appears in
+    the resume as a whole word/phrase. Anything else is an UNGROUNDED claim — a
+    candidate extraction error or hallucination — surfaced for monitoring and kept
+    out of the judge's "candidate skills".
+
+    Returns {"skill_evidence": [...verified...], "grounded_skills": [...],
+             "ungrounded_skills": [...]}.
+    """
+    resume_norm = _norm_ws(resume_text)
+    resume_tokens = set(re.findall(r"[a-z0-9\+\#\.]+", resume_norm))
+    verified = {}
+    for item in (skill_evidence or []):
+        if not isinstance(item, dict):
+            continue
+        skill = str(item.get("skill") or "").strip()
+        ev = str(item.get("evidence") or "").strip()
+        if skill and ev and _norm_ws(ev) in resume_norm:
+            verified.setdefault(skill.lower(), {"skill": skill, "evidence": ev})
+
+    def _literal(skill):
+        s = _norm_ws(skill)
+        if not s:
+            return False
+        return s in resume_norm if (" " in s or "-" in s) else s in resume_tokens
+
+    grounded, ungrounded = [], []
+    for sk in skills:
+        (grounded if (sk.lower() in verified or _literal(sk)) else ungrounded).append(sk)
+    return {"skill_evidence": list(verified.values()),
+            "grounded_skills": grounded, "ungrounded_skills": ungrounded}
+
+
 def parse_resume(resume_text, run_id, step_id, budget=None):
     from prompt_safety import wrap_untrusted, HARDENING_PREAMBLE, detect_injection
     # The resume is the most attacker-controlled input (a candidate uploads it).
-    # Log any injection-looking patterns for observability, then rely on the
-    # structural defense (delimiting + hardening) below; we still parse the resume.
+    # Injection-looking patterns are recorded as a SECURITY WARNING, not a review
+    # request: the graph deliberately continues after parse_resume (there is no
+    # human-review route here), so writing needs_human_review would make the Monitor
+    # claim "human review required" for a review that will never happen. The
+    # structural defense (delimiting + hardening) below is what protects the prompt.
     flags = detect_injection(resume_text)
     if flags:
         try:
-            from llm import flag_for_review
-            flag_for_review(step_id, reason="possible_prompt_injection(resume)")
+            from llm import flag_security
+            flag_security(step_id, reason="possible_prompt_injection(resume)")
         except Exception:
-            pass
+            log.warning("could not record resume security flag", exc_info=True)
         log.warning("[prompt-safety] injection-like patterns in resume: %s", flags, extra={"step_id": step_id})
     prompt = f"""
 {HARDENING_PREAMBLE}
@@ -165,6 +210,9 @@ and using EXACTLY these key names:
   ],
   "experience": [
     {{"title": "...", "company": "...", "years": <number>}}
+  ],
+  "skill_evidence": [
+    {{"skill": "FastAPI", "evidence": "built a FastAPI backend serving 2k req/s"}}
   ]
 }}
 
@@ -173,6 +221,8 @@ RULES:
 - experience "title": the job title (key must be "title", not "role").
 - experience "years": total years in that role as a NUMBER (key must be "years", not "months").
 - "years_experience": total professional years as a number.
+- "skill_evidence": for each skill, a SHORT phrase COPIED VERBATIM from the resume
+  that shows it. Never paraphrase. Omit a skill here if no such text exists.
 - If a value is unknown, use an empty string "" or 0 — never omit a key.
 """
     raw = logged_llm_call(prompt, run_id, step_id, budget=budget)
@@ -223,5 +273,8 @@ RULES:
 
     # --- Cross-check stated vs summed experience (adds audit metadata) ----
     validated = _reconcile_experience(validated)
+
+    # --- Deterministic grounding of the parsed skills ----------------------
+    validated.update(ground_skills(skills, parsed.get("skill_evidence"), resume_text))
 
     return validated

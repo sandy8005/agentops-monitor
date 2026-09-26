@@ -1,70 +1,57 @@
 """
-Pure-logic tests for the autonomous agent: planner routing, judge skipping,
-budget math, cancellation, and (future) human-review routing. No DB, no LLM —
-these mirror the decision logic so they run fast and free in CI.
+Pure-logic tests for the autonomous agent: LangGraph routing, judge skipping,
+budget math, cancellation. No DB, no LLM — they run fast and free in CI.
 
-Run:  pytest test_autonomous.py -v
+Routing is tested on the REAL routing functions in autonomous_graph.py (the
+runtime), not on the retired planner (moved to legacy/).
 """
 import pytest
 from agent_state import AgentState
-from planner import plan_next_action
+from autonomous_graph import (
+    route_after_start, route_after_parse, route_after_search,
+    route_after_process_job, route_after_human_review, route_after_rank,
+)
 
 
-# ----------------------- planner routing -----------------------
+# ----------------------- graph routing -----------------------
 
 def _ready_state(**kw):
     s = AgentState(goal="m", resume_id=1, **kw)
     return s
 
-def test_planner_walks_full_sequence():
-    s = _ready_state()
-    assert plan_next_action(s) == "load_resume"
-    s.resume_text = "r"
-    assert plan_next_action(s) == "parse_resume"
-    s.parsed_resume = {"skills": []}
-    assert plan_next_action(s) == "search_jobs"
-    s.jobs = [{"title": "A"}, {"title": "B"}]
-    assert plan_next_action(s) == "process_job"
-    s.current_job_index = 2
-    assert plan_next_action(s) == "rank_jobs"
-    s.ranking_done = True
-    s.ranked = [{"title": "A", "decision": "Apply"}]
-    assert plan_next_action(s) == "generate_advice"
-    s.advice_done = True
-    assert plan_next_action(s) == "done"
+def _d(**kw):
+    """Flat graph-state dict, like LangGraph passes to routing functions."""
+    return _ready_state().to_dict() | kw
 
-def test_planner_no_matches_terminates():
-    s = _ready_state()
-    s.resume_text = "r"; s.parsed_resume = {"skills": []}; s.jobs = []
-    assert plan_next_action(s) == "finish_no_matches"
+def test_routing_walks_full_sequence():
+    assert route_after_start(_d(resume_text="r")) == "parse_resume"
+    assert route_after_parse(_d(parsed_resume={"skills": []})) == "search_jobs"
+    jobs = [{"title": "A"}, {"title": "B"}]
+    assert route_after_search(_d(jobs=jobs)) == "process_job"
+    assert route_after_process_job(_d(jobs=jobs, current_job_index=1)) == "process_job"
+    assert route_after_process_job(_d(jobs=jobs, current_job_index=2)) == "rank_jobs"
+    assert route_after_rank(_d(ranked=[])) == "generate_advice"   # empty ranking terminates
 
-def test_planner_empty_ranked_still_terminates():
-    # regression: empty ranked list must NOT loop on rank_jobs
-    s = _ready_state()
-    s.resume_text = "r"; s.parsed_resume = {"skills": []}; s.jobs = [{"title": "A"}]
-    s.current_job_index = 1; s.ranking_done = True; s.ranked = []; s.advice_done = True
-    assert plan_next_action(s) == "done"
+def test_routing_no_matches_terminates():
+    assert route_after_search(_d(jobs=[])) == "no_matches"
 
-def test_planner_error_routes_to_fail():
-    s = _ready_state()
-    s.error = "boom"
-    assert plan_next_action(s) == "fail"
+def test_routing_error_routes_to_fail():
+    for route in (route_after_start, route_after_parse, route_after_search):
+        assert route(_d(error="boom")) == "fail"
+
+def test_flagged_job_routes_to_human_review():
+    assert route_after_process_job(_d(jobs=[{"title": "A"}], current_job_index=1,
+                                      last_job_needs_review=True)) == "human_review"
 
 
 # ----------------------- cancellation -----------------------
 
-def test_planner_cancelled_routes_to_finish_cancelled():
-    s = _ready_state()
-    s.resume_text = "r"; s.parsed_resume = {"skills": []}; s.jobs = [{"title": "A"}]
-    s.cancelled = True
-    assert plan_next_action(s) == "finish_cancelled"
-
-def test_cancelled_takes_priority_over_normal_work():
-    s = _ready_state()
-    s.resume_text = "r"; s.parsed_resume = {"skills": []}; s.jobs = [{"title": "A"}]
-    s.current_job_index = 0        # work remains
-    s.cancelled = True
-    assert plan_next_action(s) == "finish_cancelled"   # cancel wins
+def test_cancelled_takes_priority_over_normal_work_and_review():
+    jobs = [{"title": "A"}, {"title": "B"}]
+    assert route_after_process_job(_d(jobs=jobs, current_job_index=0, cancelled=True)) == "cancelled"
+    assert route_after_process_job(_d(jobs=jobs, current_job_index=1, cancelled=True,
+                                      last_job_needs_review=True)) == "cancelled"
+    assert route_after_human_review(_d(jobs=jobs, current_job_index=1, cancelled=True)) == "cancelled"
 
 
 # ----------------------- budget math (can_spend / spend) -----------------------
@@ -80,14 +67,11 @@ def test_budget_spend_and_can_spend():
     assert s.can_spend() is False           # 3/3 spent
     assert s.budget_exceeded() is True
 
-def test_planner_does_not_stop_on_budget():
-    # Budget must NOT halt the planner — free work (ranking) still runs when quota is spent.
+def test_routing_does_not_stop_on_budget():
+    # Budget must NOT halt routing — free work (ranking) still runs when quota is spent.
     s = _ready_state()
-    s.resume_text = "r"; s.parsed_resume = {"skills": []}; s.jobs = [{"title": "A"}]
-    s.current_job_index = 1        # jobs done
-    s.llm_calls_made = s.max_llm_calls   # budget exhausted
-    # should route to rank_jobs (free), NOT stop
-    assert plan_next_action(s) == "rank_jobs"
+    d = _d(jobs=[{"title": "A"}], current_job_index=1, llm_calls_made=s.max_llm_calls)
+    assert route_after_process_job(d) == "rank_jobs"
 
 
 # ----------------------- judge skipping logic -----------------------

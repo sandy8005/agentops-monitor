@@ -25,12 +25,14 @@ from autonomous_graph import run_agent_graph, resume_agent_graph
 from error_codes import ErrorCode, classify_exception
 from database import get_connection
 from logging_config import get_logger
+import run_lock
 
 log = get_logger("worker")
 
 POLL_INTERVAL = 2.0        # seconds to sleep when the queue is empty
 HEARTBEAT_INTERVAL = 30.0  # seconds between heartbeats during a running job
 ORPHAN_SWEEP_INTERVAL = 60.0  # seconds between orphan-recovery sweeps
+RETENTION_SWEEP_INTERVAL = 3600.0  # seconds between trace-retention purges
 
 # --- Worker outcome contract -------------------------------------------------
 # The queue outcome is decided by the RUN'S recorded status/error_code, NOT by
@@ -42,18 +44,30 @@ SUCCESS = "success"
 RETRYABLE_FAILURE = "retryable_failure"
 TERMINAL_FAILURE = "terminal_failure"
 
-# Failures worth retrying: transient / infrastructure codes. Everything else (bad
-# input, parse failure, budget spent, cancelled) is terminal — retrying won't help.
-RETRYABLE_ERROR_CODES = {ErrorCode.LLM_UNAVAILABLE, ErrorCode.LLM_QUOTA_EXHAUSTED}
+# Failures worth retrying: TRANSIENT infrastructure codes only. A per-minute rate
+# limit or an unavailable provider clears on its own; an exhausted daily/project
+# QUOTA does not recover on a 10-40s backoff, so it is terminal (retrying would only
+# burn attempts). Everything else (bad input, parse failure, budget, cancel) is
+# terminal too.
+RETRYABLE_ERROR_CODES = {ErrorCode.LLM_UNAVAILABLE, ErrorCode.LLM_RATE_LIMITED}
+
+# How long to wait before re-offering a job whose run is still locked by another
+# worker (not counted as an attempt).
+LOCK_BUSY_DELAY = 15
 
 
 def _mark_run_retrying(run_id):
     """During retry backoff, show the run as 'retrying' (not 'failed') so the monitor
     and users don't see a 'failed' run that's actually about to run again. Keeps the
-    last attempt's error_code/stop_reason. No-op if the run is already terminal."""
+    last attempt's error_code/stop_reason for context.
+
+    ended_at is CLEARED (a retrying run has not ended) and the failed attempt's end
+    time moves to last_attempt_ended_at — otherwise the row would read
+    "status=retrying, ended_at=10:15", which contradicts itself."""
     with get_connection() as conn:
         conn.cursor().execute(
-            "UPDATE runs SET status='retrying' "
+            "UPDATE runs SET status='retrying', "
+            "  last_attempt_ended_at = COALESCE(ended_at, NOW()), ended_at = NULL "
             "WHERE id=%s AND status IN ('queued','running','failed')", (run_id,))
 
 
@@ -80,11 +94,10 @@ def _run_outcome(run_id):
     A paused run (waiting_for_human) means THIS job finished its work; the run
     continues later via a separate resume_run job, so it counts as job success.
     """
-    conn = get_connection()
-    cur = conn.cursor()
-    cur.execute("SELECT status, error_code FROM runs WHERE id = %s", (run_id,))
-    row = cur.fetchone()
-    conn.close()
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT status, error_code FROM runs WHERE id = %s", (run_id,))
+        row = cur.fetchone()
     if not row:
         return TERMINAL_FAILURE, None   # run vanished — nothing to retry into
     status, error_code = row
@@ -117,12 +130,69 @@ def _run_job(job):
             live_only=p.get("live_only", False),
         )
     elif kind == "resume_run":
-        resume_agent_graph(p["run_id"], p["decision"], p.get("comment", ""))
+        resume_agent_graph(p["run_id"], p["decision"], p.get("comment", ""),
+                           reviewer_user_id=p.get("reviewer_user_id"),
+                           reviewer=p.get("reviewer"),
+                           queue_attempt=job.get("attempts", 1))
     else:
         raise ValueError(f"unknown job kind: {kind}")
 
 
+def _job_is_stale(job):
+    """
+    True if this job no longer has anything to do, because the run already moved on
+    — typically a job that orphan recovery requeued while its original worker was
+    merely slow, and that worker then finished the run. Executing it again would
+    duplicate the whole run (start_run) or apply a stale decision to the NEXT review
+    (resume_run). Checked AFTER taking the run lock, so the answer can't change
+    underneath us.
+    """
+    run_id = job.get("run_id")
+    if run_id is None:
+        return False
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT status FROM runs WHERE id = %s", (run_id,))
+        row = cur.fetchone()
+    if not row:
+        return True
+    # A start_run or resume_run is only meaningful while the run is still active.
+    return row[0] not in ("queued", "retrying", "running")
+
+
 def _process(job):
+    """Execute one claimed job under the RUN-LEVEL execution lock (see run_lock).
+
+    The queue lease decides who owns the queue ROW; the run lock decides who may
+    EXECUTE the run. If another worker still holds the run (e.g. the job was
+    reclaimed as an orphan while its original worker was merely slow), this worker
+    hands the job back without consuming an attempt instead of running it in
+    parallel."""
+    run_id = job.get("run_id")
+    if run_id is None:
+        return _process_locked(job, None)
+    lock = run_lock.RunLock.try_acquire(run_id)
+    if lock is None:
+        released = job_queue.release(job["id"], job["lease_token"], LOCK_BUSY_DELAY)
+        log.warning("job %s: run %s is being executed by another worker — %s",
+                    job["id"], run_id,
+                    "handed back to the queue" if released else "lease already lost",
+                    extra={"run_id": run_id})
+        return
+    run_lock.clear(run_id)
+    try:
+        if _job_is_stale(job):
+            if job_queue.mark_done(job["id"], job["lease_token"]):
+                log.info("job %s: run %s already moved on — stale job closed without executing",
+                         job["id"], run_id, extra={"run_id": run_id})
+            return
+        _process_locked(job, lock)
+    finally:
+        lock.release()
+        run_lock.clear(run_id)
+
+
+def _process_locked(job, lock):
     """Run one job under a heartbeat, then record its outcome on the queue.
 
     Two-part contract:
@@ -139,11 +209,23 @@ def _process(job):
     lost_lease = threading.Event()
     lease = job["lease_token"]
 
+    def _lose(reason):
+        lost_lease.set()
+        if job.get("run_id") is not None:
+            # Cooperative stop: the agent aborts at its next node boundary and the
+            # graph entrypoints skip finalization (another worker owns the run now).
+            run_lock.mark_lost(job["run_id"])
+        log.warning("job %s: %s — stopping execution", job["id"], reason,
+                    extra={"run_id": job["run_id"]})
+
     def _beat():
         while not stop.wait(HEARTBEAT_INTERVAL):
+            if lock is not None and not lock.alive():
+                _lose("run-lock connection lost (lock released by the server)")
+                return
             try:
                 if not job_queue.heartbeat(job["id"], lease):
-                    lost_lease.set()
+                    _lose("queue lease lost")
                     log.warning("job %s lease lost — another worker owns it now; "
                                 "this worker will stop touching the queue record",
                                 job["id"], extra={"run_id": job["run_id"]})
@@ -212,8 +294,19 @@ def main():
         log.warning("orphan recovery failed on startup: %s", e)
 
     last_sweep = time.time()
+    last_retention = 0.0
     while True:
         try:
+            # Periodic trace-retention purge (settings.trace_retention_days).
+            if time.time() - last_retention > RETENTION_SWEEP_INTERVAL:
+                try:
+                    from privacy import purge_expired_traces
+                    from settings import settings
+                    purge_expired_traces(settings.trace_retention_days)
+                except Exception as e:
+                    log.warning("trace retention purge failed: %s", e)
+                last_retention = time.time()
+
             # Periodic orphan sweep (in case a sibling worker died).
             if time.time() - last_sweep > ORPHAN_SWEEP_INTERVAL:
                 try:

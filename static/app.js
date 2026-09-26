@@ -26,6 +26,39 @@ var NL = String.fromCharCode(10);
       return fetch(url, opts);
     }
 
+    // Run lifecycle vocabulary (mirrors the backend). ACTIVE runs keep the detail
+    // view polling — a run that is 'queued' or 'retrying' is still going to change,
+    // it just hasn't been picked up by a worker yet.
+    var ACTIVE_STATUSES = ['queued', 'retrying', 'running'];
+    function isActive(status) { return ACTIVE_STATUSES.indexOf(status) !== -1; }
+
+    // Every status gets explicit styling (falls back to 'errors' only for unknowns).
+    var STATUS_CLASS = {
+      success: 'success', failed: 'failed', running: 'running', queued: 'queued',
+      retrying: 'retrying', waiting_for_human: 'waiting', cancelled: 'cancelled',
+      no_matches: 'no_matches', completed_with_errors: 'errors'
+    };
+    function statusClass(status) { return STATUS_CLASS[status] || 'errors'; }
+
+    // Score breakdown. New rows store {earned, max} per category — the max is the
+    // REAL renormalized weight (e.g. required is worth 62.5 when the job lists no
+    // preferred skills). Legacy rows are flat numbers; for those we show the earned
+    // points only rather than inventing a fixed /50 /20 /15 /15 denominator.
+    function renderBreakdown(b) {
+      var parts = [];
+      ['required', 'preferred', 'projects', 'experience'].forEach(function(cat) {
+        var v = b[cat];
+        if (v === undefined || v === null) return;
+        if (typeof v === 'object') {
+          if (!v.max) { parts.push(cat + ' n/a'); return; }
+          parts.push(cat + ' ' + escapeHtml(v.earned) + '/' + escapeHtml(v.max));
+        } else {
+          parts.push(cat + ' ' + escapeHtml(v));
+        }
+      });
+      return parts.join(' &nbsp; ');
+    }
+
     function escapeHtml(s) {
       return String(s == null ? '' : s)
         .replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
@@ -76,7 +109,7 @@ var NL = String.fromCharCode(10);
             '<div class="search-form">' +
               '<div class="row">' +
                 '<div><label>Target role</label><br><input type="text" id="role_' + r.id + '" placeholder="AI/ML Engineer" style="width:95%;"></div>' +
-                '<div><label>Location <span style="color:#8b8f9c;">(informational — does not filter)</span></label><br><input type="text" id="loc_' + r.id + '" placeholder="Michigan" style="width:95%;"></div>' +
+                '<div><label>Location <span style="color:#8b8f9c;">(filters Adzuna; remote-only sources ignore it)</span></label><br><input type="text" id="loc_' + r.id + '" placeholder="Michigan" style="width:95%;"></div>' +
               '</div>' +
               '<div class="row" style="margin-top:6px;">' +
                 '<div><label>Work mode</label><br><select id="mode_' + r.id + '" style="width:100%;">' +
@@ -147,16 +180,12 @@ var NL = String.fromCharCode(10);
         const runs = await res.json();
         tbody.innerHTML = '';
         for (const r of runs) {
-          let cls = 'errors';
-          if (r.status === 'success') cls = 'success';
-          else if (r.status === 'failed') cls = 'failed';
-          else if (r.status === 'running') cls = 'running';
-          else if (r.status === 'cancelled') cls = 'cancelled';
-          else if (r.status === 'no_matches') cls = 'no_matches';
+          const cls = statusClass(r.status);
           const searchDesc = (r.target_role || '-') + (r.location ? ' / ' + r.location : '') + (r.work_mode ? ' / ' + r.work_mode : '');
           const tr = document.createElement('tr');
           tr.innerHTML = '<td>#' + escapeHtml(r.id) + '</td>' +
-            '<td><span class="status ' + cls + '">' + escapeHtml(r.status) + '</span></td>' +
+            '<td><span class="status ' + cls + '">' + escapeHtml(r.status) + '</span>' +
+              (r.error_code ? ' <span class="code">' + escapeHtml(r.error_code) + '</span>' : '') + '</td>' +
             '<td style="font-size:12px;color:#b0b4c0;">' + escapeHtml(searchDesc) + '</td>' +
             '<td>' + escapeHtml((r.started_at || '').replace('T', ' ').slice(0, 16)) + '</td>' +
             '<td>' + escapeHtml(r.total_tokens || 0) + '</td>' +
@@ -180,11 +209,30 @@ var NL = String.fromCharCode(10);
         const done = run.steps.filter(function(s) {
           return s.status === 'success' || s.status === 'failed';
         }).length;
+        const active = isActive(run.status);
         const running = run.status === 'running';
 
-        let html = '<h2>Run #' + escapeHtml(run.id) + ' - ' + escapeHtml(run.status);
+        let html = '<h2>Run #' + escapeHtml(run.id) + ' - <span class="status ' + statusClass(run.status) + '">' + escapeHtml(run.status) + '</span>';
         if (run.target_role) html += ' <span class="note">(' + escapeHtml(run.target_role) + (run.location ? ' / ' + escapeHtml(run.location) : '') + ')</span>';
+        if (run.attempt && run.attempt > 1) html += ' <span class="retry">attempt ' + escapeHtml(run.attempt) + '</span>';
         html += '</h2>';
+
+        // Machine-readable outcome — the reason the error taxonomy exists.
+        if (run.error_code || run.stop_reason) {
+          html += '<div class="step outcome ' + (run.status === 'failed' ? 'outcome-failed' : '') + '">' +
+            '<strong>' + escapeHtml(String(run.status).toUpperCase()) + '</strong>' +
+            (run.error_code ? '<div>Code: <span class="code">' + escapeHtml(String(run.error_code).toUpperCase()) + '</span></div>' : '') +
+            (run.stop_reason ? '<div>Reason: ' + escapeHtml(run.stop_reason) + '</div>' : '') +
+            '</div>';
+        }
+
+        if (active && !running) {
+          html += '<div class="step progress"><strong class="' + statusClass(run.status) + '-text">&#9679; ' +
+            escapeHtml(String(run.status).toUpperCase()) + '</strong> &nbsp; ' +
+            (run.status === 'retrying' ? 'the last attempt failed with a transient error; waiting to retry'
+                                       : 'waiting for a worker to pick this run up') +
+            ' &nbsp; <button class="btn-sm btn-reject" onclick="cancelRun(' + run.id + ')">Cancel</button></div>';
+        }
 
         if (running) {
           const active = run.steps.filter(function(s){ return s.status === 'running'; });
@@ -196,10 +244,24 @@ var NL = String.fromCharCode(10);
             '</div>';
         }
 
+        var lastAttempt = null;
         for (const s of run.steps) {
+          // Group trace rows by execution attempt, so a retried run's second pass
+          // doesn't interleave with the first (step order restarts per attempt).
+          if (run.attempt > 1 && s.run_attempt !== lastAttempt) {
+            html += '<div class="section-title">Attempt ' + escapeHtml(s.run_attempt || 1) + '</div>';
+            lastAttempt = s.run_attempt;
+          }
           const review = s.needs_human_review;
           html += '<div class="step ' + (review ? 'review' : '') + '">' +
             '<strong>' + escapeHtml(s.step_name) + '</strong> [' + escapeHtml(s.status) + ']';
+          if (s.security_flag) {
+            html += ' <span class="security">&#9888; SECURITY WARNING</span> <span class="reason">[' +
+              escapeHtml(s.security_reason || '') + ']</span>';
+          }
+          if (s.judge_status === 'invalid_output') {
+            html += ' <span class="flag">judge returned invalid output</span>';
+          }
           if (s.match_score !== null) {
             var finalDec = s.final_decision || s.llm_decision || s.score_decision;
             html += ' - <strong>' + escapeHtml(finalDec) + '</strong>' + ' <span class="call">(score ' + escapeHtml(s.match_score) + ':' + escapeHtml(s.score_decision) + ', judge:' + escapeHtml(s.llm_decision) + ')</span>';
@@ -218,11 +280,7 @@ var NL = String.fromCharCode(10);
           }
           // Score breakdown — shows WHERE the score came from, key context for review.
           if (s.score_breakdown) {
-            const b = s.score_breakdown;
-            html += '<div class="bd">required ' + escapeHtml(b.required) + '/50 &nbsp; ' +
-                    'preferred ' + escapeHtml(b.preferred) + '/20 &nbsp; ' +
-                    'projects ' + escapeHtml(b.projects) + '/15 &nbsp; ' +
-                    'experience ' + escapeHtml(b.experience) + '/15</div>';
+            html += '<div class="bd">' + renderBreakdown(s.score_breakdown) + '</div>';
           }
           if (s.error_message) {
             html += '<div class="call call-failed">error: ' + escapeHtml(s.error_message) + '</div>';
@@ -245,14 +303,15 @@ var NL = String.fromCharCode(10);
           }
           if (s.evaluation) {
             const ev = s.evaluation;
-            html += '<div class="call">eval: rel=' + escapeHtml(ev.relevance_score) + ' faith=' + escapeHtml(ev.faithfulness_score) + ' complete=' + escapeHtml(ev.completeness_score) + ' halluc=' + escapeHtml(ev.hallucination_detected) + '</div>';
+            // An LLM grading an LLM: a quality SIGNAL, not proof of (no) hallucination.
+            html += '<div class="call">eval signal (LLM judge): rel=' + escapeHtml(ev.relevance_score) + ' faith=' + escapeHtml(ev.faithfulness_score) + ' complete=' + escapeHtml(ev.completeness_score) + ' halluc=' + escapeHtml(ev.hallucination_detected) + '</div>';
           }
           html += '</div>';
         }
         d.innerHTML = html;
 
         if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
-        if (running) {
+        if (active) {
           pollTimer = setTimeout(function() { loadDetail(id); }, 3000);
         } else {
           loadRuns();
@@ -281,6 +340,8 @@ var NL = String.fromCharCode(10);
             escapeHtml(pr.job_title || '(job)') +
             ' | score ' + escapeHtml(pr.score) + ' (' + escapeHtml(pr.score_decision) + ')' +
             ' | LLM: ' + escapeHtml(pr.llm_decision) +
+            '<div class="reason" style="margin-top:6px;">Why this paused: ' +
+              escapeHtml(pr.review_reason || 'flagged for review') + '</div>' +
             '<div style="margin-top:8px;">' +
               '<input id="grc_' + r.id + '" class="rev-input" placeholder="comment (optional)" style="width:260px;">' +
             '</div>' +

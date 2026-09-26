@@ -23,6 +23,7 @@ from router import (
 from llm import create_run, finish_run
 from logging_config import get_logger
 from error_codes import ErrorCode, classify_exception
+import run_lock
 
 log = get_logger(__name__)
 
@@ -31,16 +32,17 @@ def _stage_error_code(error_text):
     """
     Map a state.error string (set by a router stage) to an ErrorCode.
 
-    Transient LLM/infra failures (503, quota, timeout) are classified FIRST, before
-    the stage-specific codes. A parse or search that failed *because Gemini was down*
-    is a retryable infrastructure problem, not a terminal "unparseable resume" — so
-    it must map to LLM_UNAVAILABLE / LLM_QUOTA_EXHAUSTED (which the worker retries
-    with backoff) rather than PARSE_FAILED / SEARCH_FAILED (terminal). Otherwise a
-    temporary provider spike permanently fails every run. Only a genuine,
-    non-transient stage failure falls through to the terminal stage code.
+    LLM provider failures (503/timeout, rate limit, quota) are classified FIRST,
+    before the stage-specific codes. A parse or search that failed *because Gemini
+    was down or rate-limited* is an infrastructure problem, not an "unparseable
+    resume" — so it keeps its LLM code: LLM_UNAVAILABLE / LLM_RATE_LIMITED (which the
+    worker retries with backoff) or LLM_QUOTA_EXHAUSTED (terminal, but correctly
+    labelled) rather than PARSE_FAILED / SEARCH_FAILED. Only a genuine, non-LLM
+    stage failure falls through to the stage code.
     """
     code = classify_exception(error_text)
-    if code in (ErrorCode.LLM_UNAVAILABLE, ErrorCode.LLM_QUOTA_EXHAUSTED):
+    if code in (ErrorCode.LLM_UNAVAILABLE, ErrorCode.LLM_RATE_LIMITED,
+                ErrorCode.LLM_QUOTA_EXHAUSTED):
         return code
     t = (error_text or "").lower()
     if t.startswith("parse") or "parse failed" in t:
@@ -52,16 +54,19 @@ def _stage_error_code(error_text):
 
 def _db_uri():
     """
-    libpq keyword/value connection string (NOT a URI) for the LangGraph Postgres
-    checkpointer. Built from the centralized settings (the single source of DB
-    config) rather than reading os.getenv here. Keyword/value form avoids URI
-    parsing, so special characters in the password (@, #, :, /) are safe.
+    libpq connection string for the LangGraph Postgres checkpointer, built from the
+    centralized settings.
+
+    Built with psycopg's make_conninfo(), NOT by string interpolation: libpq
+    keyword/value syntax needs values containing spaces, quotes or backslashes to be
+    quoted and escaped, and a hand-built f-string gets that wrong (a password like
+    `p@ss w"ord` produced an unparseable conninfo). make_conninfo quotes/escapes each
+    value correctly and validates the result.
     """
+    from psycopg.conninfo import make_conninfo
     from settings import settings
-    p = settings.db_kwargs()
-    return (f"host={p['host']} port={p['port']} "
-            f"dbname={p['dbname']} user={p['user']} "
-            f"password={p['password']}")
+    p = {k: v for k, v in settings.db_kwargs().items() if v is not None}
+    return make_conninfo(**p)
 
 
 # --- Flat, serializable graph state. Every field is JSON-serializable so the
@@ -110,7 +115,10 @@ class GraphState(TypedDict, total=False):
 # --- Adapter helpers: dict <-> AgentState, so router.py stays unchanged. ---
 
 def _hydrate(state: GraphState) -> AgentState:
-    """Rebuild an AgentState from the flat graph-state dict."""
+    """Rebuild an AgentState from the flat graph-state dict. Every node goes through
+    here, so this is also the node-boundary ownership check: a worker that lost the
+    run (lease taken / lock connection gone) stops before doing any more work."""
+    run_lock.check_owner(state.get("run_id"))
     return AgentState.from_dict(state)
 
 def _dump(s: AgentState, run_id: int) -> dict:
@@ -157,9 +165,12 @@ def node_human_review(state: GraphState) -> dict:
     payload = s.last_review_info or {"step_id": s.last_review_step_id}
     # --- PAUSE HERE. Resumes with the human's decision. ---
     human = interrupt({"type": "review_request", **payload})
-    decision = (human or {}).get("decision", "Maybe")
-    comment = (human or {}).get("comment", "")
-    apply_human_decision(s, state["run_id"], s.last_review_step_id, decision, comment)
+    human = human or {}
+    decision = human.get("decision", "Maybe")
+    comment = human.get("comment", "")
+    apply_human_decision(s, state["run_id"], s.last_review_step_id, decision, comment,
+                         reviewer_user_id=human.get("reviewer_user_id"),
+                         reviewer=human.get("reviewer"))
     # clear the flag so we don't re-review on the next loop
     s.last_job_needs_review = False
     s.record_action("human_review")
@@ -261,6 +272,34 @@ def build_graph(checkpointer=None):
 # run_agent_graph. (A ConnectionPool could keep it warm later; simple first.)
 
 
+def _final_status(fs):
+    """
+    (status, error_code) for a graph that ran to completion. The SINGLE
+    classification used by both run_agent_graph and resume_agent_graph, so a failure
+    after a human review gets the same precise code (e.g. llm_unavailable, which the
+    worker retries) as one before it — instead of a blanket internal_error.
+    """
+    if fs.get("cancelled"):
+        return "cancelled", ErrorCode.CANCELLED
+    if fs.get("error"):
+        return "failed", _stage_error_code(fs.get("error"))
+    if fs.get("jobs") is not None and len(fs.get("jobs")) == 0:
+        return "no_matches", ErrorCode.NO_MATCHES
+    if fs.get("failed_jobs", 0) > 0:
+        return "completed_with_errors", None   # partial failure; results still produced
+    return "success", None
+
+
+def _abandon_if_lost(run_id, where):
+    """True (and logs) if this worker lost ownership of the run: the caller must
+    return WITHOUT finalizing, because another worker now owns the run's status."""
+    if run_lock.is_lost(run_id):
+        log.warning("%s: ownership of run lost — not finalizing (another worker owns it)",
+                    where, extra={"run_id": run_id})
+        return True
+    return False
+
+
 def run_agent_graph(resume_id, target_role=None, location=None,
                     work_mode=None, employment_type=None, evaluate=False,
                     run_id=None, max_llm_calls=30, live_only=False):
@@ -303,7 +342,8 @@ def run_agent_graph(resume_id, target_role=None, location=None,
         # Execution begins now — the worker has claimed this job. Leave 'queued'
         # and enter 'running', stamping started_at on this first transition so
         # latency reflects real execution, not time spent waiting in the queue.
-        _mark_run_running(run_id)
+        # Every start_run execution is a NEW attempt (a retry replays from the start).
+        _mark_run_running(run_id, new_attempt=True)
         with PostgresSaver.from_conn_string(_db_uri()) as checkpointer:
             checkpointer.setup()
             graph = build_graph(checkpointer=checkpointer)
@@ -313,30 +353,24 @@ def run_agent_graph(resume_id, target_role=None, location=None,
 
         # If the graph PAUSED at an interrupt, result carries "__interrupt__".
         if isinstance(result, dict) and result.get("__interrupt__"):
+            if _abandon_if_lost(run_id, "run"):
+                return result
             payload = _extract_interrupt_payload(result)
             _mark_run_status(run_id, "waiting_for_human", pending_review=payload)
             log.info("run PAUSED for human review: %s", payload or "(interrupt)", extra={"run_id": run_id})
             return result
 
+        if _abandon_if_lost(run_id, "run"):
+            return result
         final_state = result
-        error_code = None
-        if final_state.get("cancelled"):
-            final_status = "cancelled"
-            error_code = ErrorCode.CANCELLED
-        elif final_state.get("error"):
-            final_status = "failed"
-            error_code = _stage_error_code(final_state.get("error"))
-        elif final_state.get("jobs") is not None and len(final_state.get("jobs")) == 0:
-            final_status = "no_matches"
-            error_code = ErrorCode.NO_MATCHES
-        elif final_state.get("failed_jobs", 0) > 0:
-            final_status = "completed_with_errors"
-            # partial failure — leave error_code NULL (run still produced results)
-        else:
-            final_status = "success"
-        finish_run(run_id, final_status, error_code=error_code)
+        final_status, error_code = _final_status(final_state)
+        finish_run(run_id, final_status, error_code=error_code,
+                   stop_reason=(final_state.get("error") if final_status == "failed" else None))
         _clear_pending_review(run_id)   # run completed → no outstanding review
     except Exception as e:
+        if isinstance(e, run_lock.ExecutionLost) or _abandon_if_lost(run_id, "run"):
+            log.warning("run execution abandoned: %s", e, extra={"run_id": run_id})
+            return {"abandoned": True}
         final_status = "failed"
         log.error("graph run failed: %s", e, extra={"run_id": run_id})
         finish_run(run_id, final_status, stop_reason=str(e),
@@ -371,22 +405,30 @@ def _extract_interrupt_payload(result):
         return None
 
 
-def _mark_run_running(run_id):
+def _mark_run_running(run_id, new_attempt=False):
     """
     Flip the run to 'running' at the moment execution actually begins — i.e. when
-    the worker has claimed the job and is about to invoke the graph. started_at is
-    stamped on the FIRST such transition via COALESCE, so a resumed run keeps its
-    true start time rather than being reset. This is the counterpart to create_run()
-    inserting 'queued' with a NULL started_at: together they ensure queue-wait time
-    is never counted as execution/latency.
+    the worker has claimed the job and is about to invoke the graph.
+
+      * started_at is stamped on the FIRST such transition (COALESCE), so a resumed
+        or retried run keeps its true start time and queue-wait isn't counted.
+      * ended_at is CLEARED: an active run has no end time. A failed attempt that is
+        being retried keeps its end in last_attempt_ended_at instead, so the row is
+        never "status=running, ended_at=10:15".
+      * new_attempt=True increments runs.attempt; every step / LLM call / tool call
+        written from now on is tagged with it, so attempts are distinguishable in the
+        trace (step_order restarts at 0 on each attempt).
     """
     from llm import get_connection
     with get_connection() as conn:
         cur = conn.cursor()
         cur.execute(
-            "UPDATE runs SET status = 'running', started_at = COALESCE(started_at, NOW()) "
+            "UPDATE runs SET status = 'running', started_at = COALESCE(started_at, NOW()), "
+            "  last_attempt_ended_at = COALESCE(ended_at, last_attempt_ended_at), "
+            "  ended_at = NULL, "
+            "  attempt = CASE WHEN %s OR attempt = 0 THEN attempt + 1 ELSE attempt END "
             "WHERE id = %s",
-            (run_id,),
+            (bool(new_attempt), run_id),
         )
 
 
@@ -421,19 +463,18 @@ def _mark_run_status(run_id, status, pending_review="__unset__"):
 
 def _clear_pending_review(run_id):
     """Clear runs.pending_review (set NULL). Called on any terminal transition so a
-    finished/failed/cancelled run never shows a stale review card. Best-effort."""
+    finished/failed/cancelled run never shows a stale review card. Best-effort; the
+    connection is always returned to the pool."""
     from llm import get_connection
     try:
-        conn = get_connection()
-        cur = conn.cursor()
-        cur.execute("UPDATE runs SET pending_review = NULL WHERE id = %s", (run_id,))
-        conn.commit()
-        conn.close()
+        with get_connection() as conn:
+            conn.cursor().execute("UPDATE runs SET pending_review = NULL WHERE id = %s", (run_id,))
     except Exception as e:
         log.warning("clear pending_review failed: %s", e, extra={"run_id": run_id})
 
 
-def resume_agent_graph(run_id, decision, comment=""):
+def resume_agent_graph(run_id, decision, comment="", reviewer_user_id=None,
+                       reviewer=None, queue_attempt=1):
     """
     Resume a paused run with the human's decision. Reopens the checkpointer,
     loads the checkpoint by thread_id, and continues via Command(resume=...).
@@ -448,6 +489,9 @@ def resume_agent_graph(run_id, decision, comment=""):
     regardless of how the graph exited - including when the graph would otherwise
     pause AGAIN on the next flagged job. A cancel wins over a re-pause; we do not
     re-enter waiting_for_human.
+
+    Attempts: a resume CONTINUES the current attempt; only a retried resume job
+    (queue_attempt > 1) starts a new attempt number in the trace.
     """
     from llm import is_cancel_requested
 
@@ -461,16 +505,20 @@ def resume_agent_graph(run_id, decision, comment=""):
         # Execution resumes now — the worker claimed the resume job. Move queued ->
         # running (started_at is preserved via COALESCE, since this run already
         # started earlier before it paused).
-        _mark_run_running(run_id)
+        _mark_run_running(run_id, new_attempt=(queue_attempt or 1) > 1)
         with PostgresSaver.from_conn_string(_db_uri()) as checkpointer:
             checkpointer.setup()
             graph = build_graph(checkpointer=checkpointer)
             config = {"configurable": {"thread_id": str(run_id)},
                       "recursion_limit": 100}
             result = graph.invoke(
-                Command(resume={"decision": decision, "comment": comment}),
+                Command(resume={"decision": decision, "comment": comment,
+                                "reviewer_user_id": reviewer_user_id,
+                                "reviewer": reviewer}),
                 config=config)
 
+        if _abandon_if_lost(run_id, "resume"):
+            return result
         paused_again = isinstance(result, dict) and result.get("__interrupt__")
 
         # --- Cancel wins over everything, including a re-pause. ---
@@ -489,16 +537,9 @@ def resume_agent_graph(run_id, decision, comment=""):
 
         # --- Completed after resume. ---
         fs = result
-        if fs.get("cancelled"):
-            status = "cancelled"
-        elif fs.get("error"):
-            status = "failed"
-        elif fs.get("failed_jobs", 0) > 0:
-            status = "completed_with_errors"
-        else:
-            status = "success"
-        finish_run(run_id, status,
-                   error_code=(ErrorCode.INTERNAL if status == 'failed' else None))
+        status, error_code = _final_status(fs)
+        finish_run(run_id, status, error_code=error_code,
+                   stop_reason=(fs.get("error") if status == "failed" else None))
         _clear_pending_review(run_id)   # resolved -> clear the review card
         log.info("run resumed and finished: %s", status, extra={"run_id": run_id})
         if fs.get("ranked"):
@@ -508,6 +549,9 @@ def resume_agent_graph(run_id, decision, comment=""):
         return result
 
     except Exception as e:
+        if isinstance(e, run_lock.ExecutionLost) or _abandon_if_lost(run_id, "resume"):
+            log.warning("resume execution abandoned: %s", e, extra={"run_id": run_id})
+            return {"abandoned": True}
         # A cancel that was requested still wins even if the resume errored out.
         final = "cancelled" if cancel_requested else "failed"
         reason = "cancelled by user" if cancel_requested else f"resume failed: {e}"

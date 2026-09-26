@@ -19,6 +19,15 @@ tr:hover td { background: #171a22; cursor: pointer; }
 .running { background: #1e2a4a; color: #60a5fa; }
 .cancelled { background: #2a2e3a; color: #b0b4c0; }
 .no_matches { background: #2a2e3a; color: #b0b4c0; }
+.queued { background: #1f2937; color: #93c5fd; }
+.retrying { background: #3a2f14; color: #fcd34d; }
+.waiting { background: #3a2814; color: #fbbf24; }
+.queued-text { color: #93c5fd; } .retrying-text { color: #fcd34d; }
+.code { font-family: ui-monospace, monospace; font-size: 11px; color: #f87171; }
+.outcome { border-color: #4b5563; font-size: 13px; }
+.outcome-failed { border-color: #f87171; }
+.security { color: #f472b6; font-size: 12px; font-weight: 600; }
+.retry { color: #fbbf24; font-size: 12px; }
 .detail { margin-top: 24px; }
 .step { background: #171a22; border: 1px solid #2a2e3a; border-radius: 6px; padding: 12px 16px; margin-bottom: 8px; }
 .review { border-color: #fbbf24; }

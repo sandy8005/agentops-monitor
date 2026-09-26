@@ -64,10 +64,50 @@ def test_distinct_urls_in_same_content_group_stay_separate():
     assert len(out) == 2
 
 
-def test_canonical_url_normalizes_tracking_and_case():
-    a = _canonical_url({"apply_url": "HTTPS://ATS.co/Job/9?utm=x#frag"})
+def test_canonical_url_normalizes_host_and_tracking_but_keeps_path_case():
+    a = _canonical_url({"apply_url": "HTTPS://ATS.co/Job/9?utm_source=x#frag"})
     b = _canonical_url({"apply_url": "https://ats.co/Job/9/"})
-    assert a == b == "https://ats.co/job/9"
+    assert a == b == "https://ats.co/Job/9"
+    # Paths can be case-sensitive: /Jobs/ABC and /jobs/abc are NOT assumed equal.
+    assert _canonical_url({"apply_url": "https://site.com/Jobs/ABC"}) != \
+        _canonical_url({"apply_url": "https://site.com/jobs/abc"})
+
+
+def test_identity_bearing_query_params_are_preserved():
+    a = _canonical_url({"apply_url": "https://ats.co/jobs?jobId=123&utm_medium=feed"})
+    b = _canonical_url({"apply_url": "https://ats.co/jobs?jobId=456&gclid=zz"})
+    assert a == "https://ats.co/jobs?jobId=123"
+    assert a != b
+    out = _dedupe_jobs([
+        {"title": "AI Engineer", "company": "Acme", "location": "NYC", "source": "adzuna",
+         "apply_url": "https://ats.co/jobs?jobId=123"},
+        {"title": "AI Engineer", "company": "Acme", "location": "NYC", "source": "adzuna",
+         "apply_url": "https://ats.co/jobs?jobId=456"},
+    ])
+    assert len(out) == 2
+
+
+def test_seniority_levels_without_urls_stay_distinct():
+    out = _dedupe_jobs([
+        {"title": "Senior AI Engineer", "company": "Acme", "location": "NYC",
+         "description": "lead the platform team, 8+ years, mentor engineers", "source": "seed"},
+        {"title": "AI Engineer", "company": "Acme", "location": "NYC",
+         "description": "build models with the team, 3+ years python", "source": "seed"},
+        {"title": "Junior AI Engineer", "company": "Acme", "location": "NYC",
+         "description": "entry level role, learn from seniors, python basics", "source": "seed"},
+    ])
+    assert len(out) == 3
+
+
+def test_seniority_wording_variant_merges_only_with_matching_description():
+    desc = "Build and deploy ML models on AWS with Python, Docker and Kubernetes."
+    out = _dedupe_jobs([
+        {"title": "Sr. AI Engineer", "company": "Acme Inc", "location": "NYC",
+         "description": desc, "source": "adzuna"},
+        {"title": "AI Engineer", "company": "Acme", "location": "NYC",
+         "description": desc, "source": "live"},
+    ])
+    assert len(out) == 1 and out[0]["source"] == "adzuna"
 
 
 def test_higher_rank_source_wins_and_fields_merge():

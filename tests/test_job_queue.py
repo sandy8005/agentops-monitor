@@ -7,6 +7,7 @@ The worker is NOT running during tests, so each test starts from an empty queue
 (claim_next picks the oldest queued row across the whole table, so leftover rows from
 other tests would make claims non-deterministic).
 """
+from timeutil import utcnow
 import threading
 import uuid
 from datetime import datetime, timedelta
@@ -42,7 +43,7 @@ def _row(job_id):
 
 
 def _make_user():
-    return create_user("jqtest_" + uuid.uuid4().hex[:10], "password123", role="user")
+    return create_user("jqtest_" + uuid.uuid4().hex[:10], "password-1234", role="user")
 
 
 # --- claiming -----------------------------------------------------------------
@@ -108,7 +109,7 @@ def test_orphan_reclaim_requeues_and_clears_lease():
     with get_connection() as conn:
         conn.cursor().execute(
             "UPDATE job_queue SET heartbeat_at=%s WHERE id=%s",
-            (datetime.now() - timedelta(hours=1), jid),
+            (utcnow() - timedelta(hours=1), jid),
         )
     reclaim_orphans()
     status, lease, _, _ = _row(jid)
@@ -124,7 +125,7 @@ def test_retry_backoff_gate_and_curve():
     assert out == "requeued"
     status, lease, available_at, _ = _row(jid)
     assert status == "queued" and lease is None
-    assert available_at is not None and available_at > datetime.now()
+    assert available_at is not None and available_at > utcnow()
     assert claim_next() is None                    # backoff gate blocks immediate re-claim
     # exponential curve, capped
     assert _retry_delay(1) == 10 and _retry_delay(2) == 20 and _retry_delay(10) == 300

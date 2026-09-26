@@ -9,11 +9,13 @@ Usage:
     python migrate.py           # apply all pending migrations
     python migrate.py --status  # show applied vs pending, don't change anything
 
-Fresh install:  run db_pg.py (builds the full schema and records 0001 as applied),
-                then `python migrate.py` applies any 0002+ that exist.
-Existing DB:    run `python migrate.py` — it applies 0001_baseline (idempotent, all
-                IF NOT EXISTS) to bring the DB under management, then any 0002+.
+Fresh install:  `python migrate.py` on an EMPTY database applies 0001_baseline and
+                every later migration — this is the only supported way to build the
+                schema (db_pg.py is just an alias for it).
+Existing DB:    `python migrate.py` applies only what's pending. 0001_baseline is
+                idempotent (IF NOT EXISTS) so a pre-migration DB is adopted safely.
 """
+from timeutil import utcnow
 import os
 import re
 import sys
@@ -21,18 +23,16 @@ import importlib.util
 from datetime import datetime
 
 import psycopg2
-from dotenv import load_dotenv
 
-load_dotenv()
+from settings import settings
 
 MIGRATIONS_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "migrations")
 _FILE_RE = re.compile(r"^(\d{4})_([A-Za-z0-9_]+)\.py$")
 
 
 def _connect():
-    return psycopg2.connect(
-        dbname=os.getenv("DB_NAME"), user=os.getenv("DB_USER"),
-        password=os.getenv("DB_PASSWORD"), host=os.getenv("DB_HOST"), port=os.getenv("DB_PORT"))
+    settings.validate_db()
+    return psycopg2.connect(**settings.db_kwargs())
 
 
 def _ensure_tracking_table(cur):
@@ -40,7 +40,7 @@ def _ensure_tracking_table(cur):
         CREATE TABLE IF NOT EXISTS schema_migrations (
             version TEXT PRIMARY KEY,
             migration_name TEXT,
-            applied_at TIMESTAMP DEFAULT NOW()
+            applied_at TIMESTAMPTZ DEFAULT NOW()
         )
     """)
 
@@ -103,7 +103,7 @@ def migrate():
             cur.execute(
                 "INSERT INTO schema_migrations (version, migration_name, applied_at) "
                 "VALUES (%s, %s, %s) ON CONFLICT (version) DO NOTHING",
-                (version, name, datetime.now()),
+                (version, name, utcnow()),
             )
             conn.commit()
             print(f"  applied {version}_{name}")

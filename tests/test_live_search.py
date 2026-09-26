@@ -27,14 +27,18 @@ def test_dedupe_collapses_across_providers_despite_different_external_ids():
     assert len(out) == 1
     assert out[0]["source"] == "adzuna"          # higher rank wins
 
-def test_dedupe_normalizes_seniority_and_company_suffix():
-    # "Senior AI Engineer @ Wipro Inc." and "AI Engineer @ Wipro" are the same job.
+def test_dedupe_normalizes_company_suffix_but_keeps_seniority():
+    # Company suffixes are noise ("Wipro Inc." == "Wipro"), but seniority is not:
+    # without confirming evidence, Senior and plain AI Engineer are distinct openings.
     from job_source import _dedupe_jobs
-    jobs = [
+    assert len(_dedupe_jobs([
+        {"title": "AI Engineer", "company": "Wipro Inc.", "location": "Texas", "source": "live"},
+        {"title": "AI Engineer", "company": "Wipro", "location": "Texas", "source": "adzuna"},
+    ])) == 1
+    assert len(_dedupe_jobs([
         {"title": "Senior AI Engineer", "company": "Wipro Inc.", "location": "Texas", "source": "live"},
         {"title": "AI Engineer", "company": "Wipro", "location": "Texas", "source": "adzuna"},
-    ]
-    assert len(_dedupe_jobs(jobs)) == 1
+    ])) == 2
 
 def test_dedupe_merges_fields_from_loser():
     # Winner (adzuna) lacks an apply_url; loser (live) has one — it's salvaged.

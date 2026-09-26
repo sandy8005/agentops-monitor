@@ -40,7 +40,7 @@ def _fresh_logged_in_client():
     from auth import create_user
     import api
     uname = "authtest_" + uuid.uuid4().hex[:10]
-    pw = "pw_" + uuid.uuid4().hex[:8]
+    pw = "pw_" + uuid.uuid4().hex[:12]
     create_user(uname, pw, role="user")
     c = TestClient(api.app)
     # Fetch the session-bound CSRF token FIRST (like the frontend's ensureCsrf before

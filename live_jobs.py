@@ -7,6 +7,7 @@ jobs matching THIS search. Results are normalized to the job_postings shape and
 deduplicated on upsert (see upsert_live_jobs). Remotive is remote-only and free;
 that's the honest limit of what this source provides.
 """
+from timeutil import utcnow
 import requests
 import hashlib
 from logging_config import get_logger
@@ -37,6 +38,19 @@ def _map_employment_type(job_type):
     if "contract" in jt or "freelance" in jt:
         return "contract"
     return "full-time"
+
+
+def _parse_published(value):
+    """Remotive publication_date (e.g. '2026-09-20T14:03:11') -> aware UTC datetime,
+    or None if absent/unparseable (never raises into the fetch)."""
+    if not value:
+        return None
+    from datetime import datetime, timezone
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
 
 
 def _external_id(job):
@@ -88,6 +102,9 @@ def fetch_live_jobs(role, location=None, limit=10):
             "work_mode": "remote",
             "employment_type": _map_employment_type(j.get("job_type")),
             "source": "live",
+            # Remotive's posting URL (the apply entry point) and publication date.
+            "apply_url": (j.get("url") or "").strip() or None,
+            "posted_at": _parse_published(j.get("publication_date")),
         })
     return (out, "success" if out else "empty", None)
 
@@ -101,44 +118,14 @@ def _get_connection():
 
 def upsert_live_jobs(jobs, conn=None):
     """
-    Insert live jobs not already in the pool (dedup on external_id) and return
-    (inserted, skipped, job_ids). job_ids are ALL upserted postings (new AND
-    already-present), so the caller can associate every fetched posting with the
-    current run's search. Accepts an existing `conn` (caller owns the transaction);
-    opens and commits its own when none is given.
+    Upsert Remotive postings through the SAME persistence path as Adzuna
+    (job_persistence.upsert_postings): fetched_at / last_seen_at / posted_at /
+    apply_url are all written, and last_seen_at is refreshed on every sighting, so
+    Remotive postings age out of search like any other live posting. Returns
+    (inserted, skipped, job_ids).
     """
-    if not jobs:
-        return (0, 0, [])
-    own = conn is None
-    if own:
-        conn = _get_connection()
-    cur = conn.cursor()
-    inserted = 0
-    job_ids = []
-    for j in jobs:
-        cur.execute("""
-            INSERT INTO job_postings
-            (title, company, description, location, work_mode, employment_type, source, external_id)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (external_id) WHERE external_id IS NOT NULL DO NOTHING
-            RETURNING id
-        """, (j["title"], j["company"], j["description"], j["location"],
-              j["work_mode"], j["employment_type"], j["source"], j["external_id"]))
-        row = cur.fetchone()
-        if row:
-            inserted += 1
-            job_ids.append(row[0])
-        else:  # conflict -> fetch the existing id so it's still associated to this run
-            cur.execute("SELECT id FROM job_postings WHERE external_id = %s", (j["external_id"],))
-            r2 = cur.fetchone()
-            if r2:
-                job_ids.append(r2[0])
-    if own:
-        conn.commit()
-        cur.close()
-        conn.close()
-    skipped = len(jobs) - inserted
-    return (inserted, skipped, job_ids)
+    from job_persistence import upsert_postings
+    return upsert_postings(jobs, conn=conn)
 
 
 def fetch_and_upsert(role, location=None, limit=10):
@@ -159,19 +146,11 @@ def _log_remotive_call(run_id, step_id, role, location, latency_ms,
     if run_id is None or step_id is None:
         return
     try:
-        import json
-        from datetime import datetime
-        from database import get_connection
-        with get_connection() as conn:
-            conn.cursor().execute("""
-                INSERT INTO tool_calls
-                (run_id, step_id, tool_name, input_json, output_json, latency_ms,
-                 status, error_message, created_at, operation_name)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            """, (run_id, step_id, "remotive_fetch",
-                  json.dumps({"role": role, "location": location}),
-                  json.dumps({"fetched": fetched, "inserted": inserted, "duplicates": duplicates}),
-                  latency_ms, status, error_message, datetime.now(), "live_fetch"))
+        from llm import log_tool_call
+        log_tool_call(run_id, step_id, "remotive_fetch", {"role": role, "location": location},
+                      {"fetched": fetched, "inserted": inserted, "duplicates": duplicates,
+                       "location_filter_applied": False},
+                      latency_ms, status, error_message, "live_fetch")
     except Exception as log_err:
         log.warning("remotive trace log failed: %s", log_err)
 
@@ -195,7 +174,12 @@ def fetch_and_upsert_remotive(role, location=None, limit=10, run_id=None, step_i
             try:
                 inserted, skipped, job_ids = upsert_live_jobs(jobs, conn=conn)
                 if job_ids:
-                    search_id = create_search(run_id, role, location, "remotive", conn=conn)
+                    # Remotive is remote-only and ignores location: record the search
+                    # WITHOUT a location and mark that no geographic filter was
+                    # applied, so the association is never read as "this job was
+                    # returned for <location>".
+                    search_id = create_search(run_id, role, None, "remotive", conn=conn,
+                                              location_filter_applied=False)
                     associate_jobs(search_id, job_ids, conn=conn)
                 conn.commit()
             finally:

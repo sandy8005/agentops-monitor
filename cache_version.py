@@ -17,7 +17,7 @@ stored on each row so you can query/prune by version.
 """
 from settings import settings
 
-PARSER_VERSION = "2"   # bumped: parse prompt hardened (HARDENING_PREAMBLE + wrap_untrusted)
+PARSER_VERSION = "3"   # bumped: parse prompt asks for verbatim skill evidence (grounding)
 REQS_VERSION = "3"   # bumped: reqs prompt hardened (HARDENING_PREAMBLE + wrap_untrusted); key already includes TITLE + description
 SCHEMA_VERSION = "1"
 

@@ -77,21 +77,21 @@ def _run_job(mp, run_id, evaluate=False, **wire):
 
 
 def test_no_flags_continues(monkeypatch):
-    uid = create_user("h1_" + uuid.uuid4().hex[:8], "password123")
+    uid = create_user("h1_" + uuid.uuid4().hex[:8], "password-1234")
     s = _run_job(monkeypatch, _run(uid), score_decision="Apply", llm_decision="Apply")
     assert s.last_job_needs_review is False
     assert s.job_results[-1]["needs_review"] is False
 
 
 def test_score_disagreement_pauses(monkeypatch):
-    uid = create_user("h2_" + uuid.uuid4().hex[:8], "password123")
+    uid = create_user("h2_" + uuid.uuid4().hex[:8], "password-1234")
     s = _run_job(monkeypatch, _run(uid), score_decision="Apply", llm_decision="Skip")
     assert s.last_job_needs_review is True
 
 
 def test_prompt_injection_only_pauses(monkeypatch):
     # THE regression: injection flagged but score & judge AGREE — must still pause.
-    uid = create_user("h3_" + uuid.uuid4().hex[:8], "password123")
+    uid = create_user("h3_" + uuid.uuid4().hex[:8], "password-1234")
     s = _run_job(monkeypatch, _run(uid), score_decision="Apply", llm_decision="Apply",
                  flag_injection=True)
     assert s.last_job_needs_review is True
@@ -101,14 +101,14 @@ def test_prompt_injection_only_pauses(monkeypatch):
 def test_hallucination_pauses(monkeypatch):
     # A flagged (disagreeing) job runs the evaluator, which detects hallucination and
     # adds a flag; the final authoritative decision still pauses.
-    uid = create_user("h4_" + uuid.uuid4().hex[:8], "password123")
+    uid = create_user("h4_" + uuid.uuid4().hex[:8], "password-1234")
     s = _run_job(monkeypatch, _run(uid), evaluate=True,
                  score_decision="Apply", llm_decision="Skip", halluc=True)
     assert s.last_job_needs_review is True
 
 
 def test_multiple_reasons_pause(monkeypatch):
-    uid = create_user("h5_" + uuid.uuid4().hex[:8], "password123")
+    uid = create_user("h5_" + uuid.uuid4().hex[:8], "password-1234")
     s = _run_job(monkeypatch, _run(uid), score_decision="Apply", llm_decision="Skip",
                  flag_injection=True)
     assert s.last_job_needs_review is True

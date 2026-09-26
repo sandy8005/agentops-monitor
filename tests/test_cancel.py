@@ -4,6 +4,7 @@ immediately — the queued job is marked cancelled and the run finalized now, so
 user never waits through retry backoff. An actively-running run stays cooperative.
 Needs Postgres.
 """
+from timeutil import utcnow
 import uuid
 from datetime import datetime, timedelta
 
@@ -41,7 +42,7 @@ def _status(run_id, job_id):
 
 
 def test_queued_run_cancels_immediately():
-    uid = create_user("cx1_" + uuid.uuid4().hex[:8], "password123")
+    uid = create_user("cx1_" + uuid.uuid4().hex[:8], "password-1234")
     run_id, job_id = _mk(uid, "queued")
     res = api.cancel_run(run_id, user={"id": uid}, _csrf=None)
     run_status, ended, job_status = _status(run_id, job_id)
@@ -52,8 +53,8 @@ def test_queued_run_cancels_immediately():
 def test_retrying_run_with_future_backoff_cancels_immediately():
     # The key win: a retrying run whose job is gated behind a long available_at is
     # still cancelled now, not after the backoff elapses.
-    uid = create_user("cx2_" + uuid.uuid4().hex[:8], "password123")
-    run_id, job_id = _mk(uid, "retrying", datetime.now() + timedelta(minutes=5))
+    uid = create_user("cx2_" + uuid.uuid4().hex[:8], "password-1234")
+    run_id, job_id = _mk(uid, "retrying", utcnow() + timedelta(minutes=5))
     res = api.cancel_run(run_id, user={"id": uid}, _csrf=None)
     run_status, ended, job_status = _status(run_id, job_id)
     assert res.get("cancelled") is True
@@ -62,7 +63,7 @@ def test_retrying_run_with_future_backoff_cancels_immediately():
 
 def test_running_run_is_cooperative_not_immediate():
     # An actively-running run isn't force-finalized here; it gets the cooperative flag.
-    uid = create_user("cx3_" + uuid.uuid4().hex[:8], "password123")
+    uid = create_user("cx3_" + uuid.uuid4().hex[:8], "password-1234")
     run_id, job_id = _mk(uid, "running")
     # mark the job claimed/running to reflect a real in-flight run
     with get_connection() as c:

@@ -1,3 +1,4 @@
+from timeutil import utcnow
 from database import get_connection as _db_get_connection
 from settings import settings
 from fastapi import (FastAPI, HTTPException, UploadFile, File,
@@ -5,8 +6,8 @@ from fastapi import (FastAPI, HTTPException, UploadFile, File,
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.sessions import SessionMiddleware
-from datetime import datetime
-import psycopg2, os, tempfile
+import os, tempfile
+from typing import Literal
 from llm import create_run, create_run_tx, request_cancel
 from job_queue import enqueue, enqueue_tx
 from pdf_reader import read_resume_file
@@ -41,6 +42,13 @@ MAX_UPLOAD_BYTES = 5 * 1024 * 1024
 
 from logging_config import get_logger
 log = get_logger("api")
+
+# Closed vocabularies. The browser dropdowns are NOT validation — a client can call
+# the API directly — so the server declares the allowed values and FastAPI rejects
+# anything else with 422 before the handler runs. "" means "any".
+WorkMode = Literal["", "remote", "hybrid", "onsite"]
+EmploymentType = Literal["", "full-time", "part-time", "contract", "internship"]
+Decision = Literal["Apply", "Maybe", "Skip"]
 
 # Free-text input limits — guard memory, LLM cost, latency, and DB size. A 5 MB PDF
 # can still expand to a lot of text, so the extracted resume is capped too.
@@ -133,9 +141,11 @@ def login(request: Request, username: str = Form(...), password: str = Form(...)
     user = authenticate(username, password)
     if not user:
         raise HTTPException(status_code=401, detail="Invalid username or password")
-    request.session["user"] = {"id": user["id"], "username": user["username"],
-                               "role": user["role"]}
-    return {"ok": True, "username": user["username"], "role": user["role"]}
+    # Session carries identity only. users.role exists in the schema but there is no
+    # role-based authorization in this app yet (every endpoint is owner-scoped), so it
+    # is deliberately NOT exposed — advertising a role implies RBAC that doesn't exist.
+    request.session["user"] = {"id": user["id"], "username": user["username"]}
+    return {"ok": True, "username": user["username"]}
 
 
 @app.post("/logout")
@@ -149,7 +159,7 @@ def logout(request: Request, _csrf: None = Depends(require_csrf)):
 @app.get("/me")
 def whoami(user: dict = Depends(require_auth)):
     """Who am I — used by the frontend to decide whether to show the login form."""
-    return {"username": user["username"], "role": user["role"]}
+    return {"username": user["username"]}
 
 
 @app.post("/upload")
@@ -175,6 +185,8 @@ async def upload_resume(file: UploadFile = File(...), name: str = Form(""),
     finally:
         os.remove(tmp_path)
 
+    name = (name or file.filename or "resume.pdf")[:MAX_NAME_CHARS]
+
     if not resume_text or not resume_text.strip():
         raise HTTPException(status_code=400, detail="Could not extract text from the PDF")
 
@@ -189,10 +201,10 @@ async def upload_resume(file: UploadFile = File(...), name: str = Form(""),
         cur.execute("""
             INSERT INTO resumes (name, resume_text, created_at, user_id)
             VALUES (%s, %s, %s, %s) RETURNING id
-        """, (name or file.filename, resume_text, datetime.now(), user["id"]))
+        """, (name, resume_text, utcnow(), user["id"]))
         resume_id = cur.fetchone()[0]
 
-    return {"resume_id": resume_id, "name": name or file.filename,
+    return {"resume_id": resume_id, "name": name,
             "chars": len(resume_text), "message": f"Resume stored as #{resume_id}"}
 
 
@@ -215,18 +227,21 @@ def list_resumes(user: dict = Depends(require_auth)):
 @app.delete("/resumes/{resume_id}")
 def delete_resume(resume_id: int, user: dict = Depends(require_auth),
                   _csrf: None = Depends(require_csrf)):
-    with get_connection() as conn:
-        cur = conn.cursor()
-        cur.execute("SELECT 1 FROM resumes WHERE id = %s AND user_id = %s", (resume_id, user["id"]))
-        if not cur.fetchone():
-            # 404 (not 403) so we don't reveal that the id exists for another owner.
-            raise HTTPException(status_code=404, detail=f"Resume {resume_id} not found")
-        # Soft delete: hide from the library but keep the row, so historical runs
-        # that reference this resume keep an intact link. A hard DELETE would orphan
-        # those runs (runs.resume_id would point at a missing row).
-        cur.execute("UPDATE resumes SET is_deleted = TRUE WHERE id = %s AND user_id = %s",
-                    (resume_id, user["id"]))
-    return {"resume_id": resume_id, "deleted": True}
+    """
+    Delete a resume — for real. The row is kept so historical runs keep a valid
+    foreign key and their metrics stay auditable, but the resume TEXT and name are
+    erased, together with every trace that embeds them (LLM prompts/responses, tool
+    I/O, context, advice, cached parse, LangGraph checkpoints). See privacy.py.
+    """
+    from privacy import erase_resume, ErasureConflict
+    try:
+        found = erase_resume(resume_id, user["id"])
+    except ErasureConflict as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    if not found:
+        # 404 (not 403) so we don't reveal that the id exists for another owner.
+        raise HTTPException(status_code=404, detail=f"Resume {resume_id} not found")
+    return {"resume_id": resume_id, "deleted": True, "erased": True}
 
 
 @app.get("/runs")
@@ -235,7 +250,7 @@ def list_runs(limit: int = Query(20, ge=1, le=100), user: dict = Depends(require
         cur = conn.cursor()
         cur.execute("""
             SELECT id, status, started_at, total_tokens, total_cost,
-                   target_role, location, work_mode
+                   target_role, location, work_mode, error_code
             FROM runs WHERE user_id = %s ORDER BY id DESC LIMIT %s
         """, (user["id"], limit))
         rows = cur.fetchall()
@@ -243,7 +258,8 @@ def list_runs(limit: int = Query(20, ge=1, le=100), user: dict = Depends(require
             {"id": r[0], "status": r[1],
              "started_at": r[2].isoformat() if r[2] else None,
              "total_tokens": r[3], "total_cost": float(r[4]) if r[4] else 0,
-             "target_role": r[5], "location": r[6], "work_mode": r[7]}
+             "target_role": r[5], "location": r[6], "work_mode": r[7],
+             "error_code": r[8]}
             for r in rows
         ]
 
@@ -251,8 +267,8 @@ def list_runs(limit: int = Query(20, ge=1, le=100), user: dict = Depends(require
 @app.post("/runs")
 @limiter.limit(settings.rate_limit_runs)
 def start_run(request: Request, resume_id: int = None,
-              target_role: str = "", location: str = "", work_mode: str = "",
-              employment_type: str = "", evaluate: bool = False,
+              target_role: str = "", location: str = "", work_mode: WorkMode = "",
+              employment_type: EmploymentType = "", evaluate: bool = False,
               live_only: bool = False, user: dict = Depends(require_auth),
               _csrf: None = Depends(require_csrf)):
     if resume_id is None:
@@ -305,6 +321,20 @@ def start_run(request: Request, resume_id: int = None,
             "message": f"Run {run_id} enqueued (job {job_id})."}
 
 
+@app.delete("/runs/{run_id}")
+def delete_run_endpoint(run_id: int, user: dict = Depends(require_auth),
+                        _csrf: None = Depends(require_csrf)):
+    """Hard-delete one of the caller's finished runs and all of its traces."""
+    from privacy import delete_run, ErasureConflict
+    try:
+        found = delete_run(run_id, user["id"])
+    except ErasureConflict as e:
+        raise HTTPException(status_code=409, detail=str(e))
+    if not found:
+        raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
+    return {"run_id": run_id, "deleted": True}
+
+
 @app.post("/runs/{run_id}/cancel")
 def cancel_run(run_id: int, user: dict = Depends(require_auth),
                _csrf: None = Depends(require_csrf)):
@@ -353,7 +383,8 @@ def cancel_run(run_id: int, user: dict = Depends(require_auth),
             cur.execute("UPDATE runs SET status = 'queued', cancel_requested = TRUE WHERE id = %s",
                         (run_id,))
             enqueue_tx(cur, "resume_run",
-                       {"run_id": run_id, "decision": "Skip", "comment": "cancelled by user"},
+                       {"run_id": run_id, "decision": "Skip", "comment": "cancelled by user",
+                        "reviewer_user_id": user["id"], "reviewer": user["username"]},
                        run_id=run_id)
             return {"run_id": run_id, "cancel_requested": True, "resumed_to_cancel": True}
 
@@ -369,7 +400,7 @@ def get_run(run_id: int, user: dict = Depends(require_auth)):
         cur.execute("""
             SELECT id, status, started_at, ended_at, input_summary, total_tokens, total_cost,
                    resume_id, target_role, location, work_mode, employment_type, pending_review,
-                   stop_reason, error_code
+                   stop_reason, error_code, attempt, last_attempt_ended_at
             FROM runs WHERE id = %s AND user_id = %s
         """, (run_id, user["id"]))
         run = cur.fetchone()
@@ -380,8 +411,9 @@ def get_run(run_id: int, user: dict = Depends(require_auth)):
             SELECT id, step_name, status, match_score, score_decision,
                    llm_decision, needs_human_review, review_status, error_message,
                    retrieved_context, reviewer, review_comment, review_reason, score_breakdown,
-                   final_decision
-            FROM steps WHERE run_id = %s ORDER BY step_order
+                   final_decision, run_attempt, security_flag, security_reason,
+                   judge_status, judge_skip_reason, reviewed_at
+            FROM steps WHERE run_id = %s ORDER BY run_attempt NULLS FIRST, step_order, id
         """, (run_id,))
         step_rows = cur.fetchall()
 
@@ -437,6 +469,10 @@ def get_run(run_id: int, user: dict = Depends(require_auth)):
                 "reviewer": s[10], "review_comment": s[11], "review_reason": s[12],
                 "score_breakdown": s[13],
                 "final_decision": s[14],
+                "run_attempt": s[15],
+                "security_flag": s[16], "security_reason": s[17],
+                "judge_status": s[18], "judge_skip_reason": s[19],
+                "reviewed_at": s[20].isoformat() if s[20] else None,
                 "tool_calls": tool_calls, "llm_calls": llm_calls,
                 "evaluation": evaluation
             })
@@ -452,17 +488,18 @@ def get_run(run_id: int, user: dict = Depends(require_auth)):
             "work_mode": run[10], "employment_type": run[11],
             "pending_review": run[12],
             "stop_reason": run[13], "error_code": run[14],
+            "attempt": run[15],
+            "last_attempt_ended_at": run[16].isoformat() if run[16] else None,
             "steps": steps
         }
 
 
 @app.post("/runs/{run_id}/resume")
-def resume_run(run_id: int, decision: str = "Maybe", comment: str = "",
+def resume_run(run_id: int, decision: Decision = "Maybe", comment: str = "",
                user: dict = Depends(require_auth),
                _csrf: None = Depends(require_csrf)):
-    """Resume a paused (waiting_for_human) run with the human's decision."""
-    if decision not in ("Apply", "Maybe", "Skip"):
-        raise HTTPException(status_code=400, detail="decision must be Apply, Maybe, or Skip")
+    """Resume a paused (waiting_for_human) run with the human's decision. The
+    reviewer's identity travels with the decision into the audit trail."""
     _check_len("comment", comment, MAX_COMMENT_CHARS)
     conn = get_connection()
     try:
@@ -488,7 +525,8 @@ def resume_run(run_id: int, decision: str = "Maybe", comment: str = "",
         # 'waiting_for_human' and the user can retry — no lost work.
         cur.execute("UPDATE runs SET status = 'queued' WHERE id = %s", (run_id,))
         enqueue_tx(cur, "resume_run",
-                   {"run_id": run_id, "decision": decision, "comment": comment},
+                   {"run_id": run_id, "decision": decision, "comment": comment,
+                    "reviewer_user_id": user["id"], "reviewer": user["username"]},
                    run_id=run_id)
         conn.commit()
     except HTTPException:

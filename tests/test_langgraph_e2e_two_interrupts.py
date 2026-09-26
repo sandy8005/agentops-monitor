@@ -56,9 +56,8 @@ pytestmark = pytest.mark.skipif(
 
 
 def _db_uri():
-    return (f"host={os.getenv('DB_HOST')} port={os.getenv('DB_PORT')} "
-            f"dbname={os.getenv('DB_NAME')} user={os.getenv('DB_USER')} "
-            f"password={os.getenv('DB_PASSWORD')}")
+    from autonomous_graph import _db_uri as _safe_uri   # escaped conninfo (#14)
+    return _safe_uri()
 
 
 # ---------------------------------------------------------------------------
@@ -116,7 +115,8 @@ def _stub_process_job(state, run_id):
     state.current_job_index += 1
 
 
-def _stub_apply_human_decision(state, run_id, step_id, decision, comment=""):
+def _stub_apply_human_decision(state, run_id, step_id, decision, comment="",
+                               reviewer_user_id=None, reviewer=None):
     # No DB write; just record the human's call in-memory like the real one does.
     state.human_decisions[str(step_id)] = {"decision": decision, "comment": comment}
     for r in state.job_results:

@@ -28,7 +28,8 @@ def build_prompt(resume_text, parsed, job, overlap, requirements):
 
 You are a hiring assistant. Compare the candidate below against the job posting.
 
-CANDIDATE SKILLS: {wrap_untrusted(parsed['skills'], "CANDIDATE_SKILLS")}
+CANDIDATE SKILLS (verified against the resume text): {wrap_untrusted(parsed.get('grounded_skills', parsed['skills']), "CANDIDATE_SKILLS")}
+SKILL EVIDENCE (verbatim resume snippets): {wrap_untrusted(parsed.get('skill_evidence', []), "SKILL_EVIDENCE")}
 YEARS OF EXPERIENCE: {wrap_untrusted(parsed['years_experience'], "YEARS_EXPERIENCE")}
 EDUCATION: {wrap_untrusted([e['degree'] for e in parsed['education']], "EDUCATION")}
 PROJECTS: {wrap_untrusted([{'name': p['name'], 'tech': p['tech']} for p in parsed['projects']], "PROJECTS")}

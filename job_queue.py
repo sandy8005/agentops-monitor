@@ -23,6 +23,7 @@ record, so it can no longer mark a job done/failed out from under the worker tha
 owns it. This can't undo duplicate SIDE EFFECTS already written by the agent, but it
 keeps the queue record itself consistent and single-owner.
 """
+from timeutil import utcnow
 import json
 import socket
 import os
@@ -64,7 +65,7 @@ def enqueue_tx(cur, kind, payload, run_id=None, max_attempts=3):
     cur.execute("""
         INSERT INTO job_queue (kind, payload, run_id, status, max_attempts, enqueued_at)
         VALUES (%s, %s, %s, 'queued', %s, %s) RETURNING id
-    """, (kind, json.dumps(payload), run_id, max_attempts, datetime.now()))
+    """, (kind, json.dumps(payload), run_id, max_attempts, utcnow()))
     return cur.fetchone()[0]
 
 
@@ -111,7 +112,7 @@ def claim_next(worker_id=WORKER_ID):
             conn.commit()
             return None
         job_id, kind, payload, run_id, attempts, max_attempts = row
-        now = datetime.now()
+        now = utcnow()
         # Fresh per-claim lease token. Every later mutation of this row must present
         # it (plus status='running'), so a stale prior owner can't touch the record
         # after it's been reclaimed and re-claimed under a new token.
@@ -147,7 +148,7 @@ def heartbeat(job_id, lease_token):
         cur.execute("""
             UPDATE job_queue SET heartbeat_at = %s
             WHERE id = %s AND status = 'running' AND lease_token = %s
-        """, (datetime.now(), job_id, lease_token))
+        """, (utcnow(), job_id, lease_token))
         owned = cur.rowcount == 1
         return owned
 
@@ -163,7 +164,7 @@ def mark_done(job_id, lease_token):
         cur.execute("""
             UPDATE job_queue SET status = 'done', finished_at = %s
             WHERE id = %s AND status = 'running' AND lease_token = %s
-        """, (datetime.now(), job_id, lease_token))
+        """, (utcnow(), job_id, lease_token))
         owned = cur.rowcount == 1
         return owned
 
@@ -186,7 +187,7 @@ def mark_failed(job_id, error, attempts, max_attempts, lease_token, terminal=Fal
     with get_connection() as conn:
         cur = conn.cursor()
         if not terminal and attempts < max_attempts:
-            available_at = datetime.now() + timedelta(seconds=_retry_delay(attempts))
+            available_at = utcnow() + timedelta(seconds=_retry_delay(attempts))
             cur.execute("""
                 UPDATE job_queue
                 SET status = 'queued', last_error = %s, claimed_at = NULL,
@@ -200,21 +201,55 @@ def mark_failed(job_id, error, attempts, max_attempts, lease_token, terminal=Fal
                 UPDATE job_queue
                 SET status = 'failed', last_error = %s, finished_at = %s, lease_token = NULL
                 WHERE id = %s AND status = 'running' AND lease_token = %s
-            """, (str(error)[:2000], datetime.now(), job_id, lease_token))
+            """, (str(error)[:2000], utcnow(), job_id, lease_token))
             outcome = "failed" if cur.rowcount == 1 else "lost"
         return outcome
 
 
 # ------------------------------------------------------- orphan recovery -----
 
+def release(job_id, lease_token, delay_seconds=5):
+    """
+    Give a claimed job BACK to the queue without counting it as an attempt — used
+    when the worker can't execute it right now through no fault of the job (another
+    worker still holds the run's execution lock). Lease-guarded. Returns True if the
+    row was released, False if the lease was already lost.
+    """
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            UPDATE job_queue
+            SET status = 'queued', attempts = GREATEST(attempts - 1, 0),
+                claimed_at = NULL, heartbeat_at = NULL, worker_id = NULL,
+                lease_token = NULL, available_at = %s
+            WHERE id = %s AND status = 'running' AND lease_token = %s
+        """, (utcnow() + timedelta(seconds=delay_seconds), job_id, lease_token))
+        return cur.rowcount == 1
+
+
+# Run statuses in which a run is still ACTIVE (not finalized, not paused for review).
+_ACTIVE_RUN_STATUSES = ("queued", "running", "retrying")
+
+
 def reclaim_orphans():
     """
-    Return jobs stuck in 'running' with a stale/absent heartbeat (their worker
-    died) to 'queued' so another worker retries them — or 'failed' if they're out
-    of attempts. Called by the worker on startup and periodically. Returns the
-    number reclaimed.
+    Recover jobs stuck in 'running' with a stale/absent heartbeat (their worker
+    died) — and RECONCILE THE RUNS they belong to, in the same transaction, so the
+    queue and the runs table can't disagree:
+
+      * orphan with attempts left  -> job 'queued'  ; its run -> 'retrying'
+                                      (ended_at cleared: the run is not over)
+      * orphan out of attempts     -> job 'failed'  ; its run -> 'failed' with
+                                      ended_at = NOW(), error_code = worker_lost
+                                      and a stop_reason — never left 'running'
+                                      forever.
+
+    Runs are only touched while still ACTIVE (a run a surviving worker already
+    finalized or paused is left alone). Called by the worker on startup and
+    periodically. Returns the number of jobs reclaimed.
     """
-    cutoff = datetime.now() - ORPHAN_AFTER
+    from error_codes import ErrorCode
+    cutoff = utcnow() - ORPHAN_AFTER
     with get_connection() as conn:
         cur = conn.cursor()
         # Requeue orphans that still have attempts left.
@@ -226,8 +261,20 @@ def reclaim_orphans():
             WHERE status = 'running'
               AND attempts < max_attempts
               AND (heartbeat_at IS NULL OR heartbeat_at < %s)
+            RETURNING id, run_id
         """, (cutoff,))
-        requeued = cur.rowcount
+        requeued = cur.fetchall()
+        requeued_runs = sorted({r for _, r in requeued if r is not None})
+        if requeued_runs:
+            cur.execute("""
+                UPDATE runs
+                SET status = 'retrying',
+                    last_attempt_ended_at = COALESCE(ended_at, NOW()),
+                    ended_at = NULL,
+                    stop_reason = 'worker stopped heartbeating; job requeued'
+                WHERE id = ANY(%s) AND status = ANY(%s)
+            """, (requeued_runs, list(_ACTIVE_RUN_STATUSES)))
+
         # Fail orphans that are out of attempts.
         cur.execute("""
             UPDATE job_queue
@@ -236,6 +283,16 @@ def reclaim_orphans():
             WHERE status = 'running'
               AND attempts >= max_attempts
               AND (heartbeat_at IS NULL OR heartbeat_at < %s)
-        """, (datetime.now(), cutoff))
-        failed = cur.rowcount
-        return requeued + failed
+            RETURNING id, run_id
+        """, (utcnow(), cutoff))
+        failed = cur.fetchall()
+        failed_runs = sorted({r for _, r in failed if r is not None})
+        if failed_runs:
+            cur.execute("""
+                UPDATE runs
+                SET status = 'failed', ended_at = NOW(), error_code = %s,
+                    stop_reason = 'worker stopped heartbeating and the job ran out of attempts',
+                    pending_review = NULL
+                WHERE id = ANY(%s) AND status = ANY(%s)
+            """, (ErrorCode.WORKER_LOST.value, failed_runs, list(_ACTIVE_RUN_STATUSES)))
+        return len(requeued) + len(failed)

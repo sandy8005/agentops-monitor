@@ -8,8 +8,10 @@ All tool executions pass through logged_tool_call() so the autonomous path
 keeps full AgentOps observability. Caching, cooperative cancellation, and
 conditional Gemini use also live here.
 """
+from timeutil import utcnow
 import hashlib
 import json
+from datetime import timedelta
 
 from parser import parse_resume
 from job_source import search_jobs
@@ -166,17 +168,25 @@ def do_search_jobs(state, run_id):
 # PROVENANCE — how it was produced (llm vs rule_based) and under which model/version
 # — so a cache hit is traceable and its quality is known. ---
 
+# A rule-based extraction is a DEGRADED result (produced because the LLM was down or
+# the budget was spent). It is cached only briefly and is never allowed to shadow a
+# later LLM extraction; an LLM row is durable and is never downgraded.
+RULE_BASED_CACHE_TTL = timedelta(days=1)
+
+
 def _reqs_cache_get(desc_hash):
     """
     Return (reqs, provenance) on hit, or (None, None) on miss. provenance is a dict
     {"extraction_method":..., "source_model":...} describing how the cached row was
-    produced, so callers can trace/trust it without re-extracting.
+    produced, so callers can trace/trust it without re-extracting. Expired rows
+    (rule-based fallbacks past their TTL) are treated as a miss.
     """
     with get_connection() as conn:
         cur = conn.cursor()
         cur.execute("""
             SELECT reqs_json, extraction_method, source_model
-            FROM job_reqs_cache WHERE desc_hash = %s
+            FROM job_reqs_cache
+            WHERE desc_hash = %s AND (expires_at IS NULL OR expires_at > NOW())
         """, (desc_hash,))
         row = cur.fetchone()
         if not row:
@@ -189,25 +199,75 @@ def _reqs_cache_put(desc_hash, reqs, extraction_method):
     """
     Store a requirements row WITH provenance:
       - extraction_method : 'llm' or 'rule_based'
-      - source_model      : the MODEL NAME that produced it (e.g. 'gemini-3.6-flash')
-                            for LLM extraction, or NULL for rule_based (no model was
-                            used). Previously this incorrectly stored the composite
-                            cache_version STRING here — a bug; source_model now holds
-                            the actual model, from the single source of truth.
-    Idempotent (ON CONFLICT DO NOTHING) — first writer wins for a given key.
+      - source_model      : the MODEL NAME for LLM extraction, NULL for rule_based.
+      - expires_at        : NULL (durable) for LLM rows; now + RULE_BASED_CACHE_TTL
+                            for rule-based fallbacks.
+
+    Conflict policy — quality only ever goes UP:
+      * an incoming LLM row replaces an existing rule-based row (upgrade);
+      * an incoming rule-based row may refresh an existing rule-based row;
+      * an existing LLM row is NEVER overwritten by a rule-based one (no downgrade)
+        and is kept on an LLM-vs-LLM conflict (first writer wins).
     """
     from cache_version import model_version
-    # rule_based extraction used no model, so its source_model is NULL (not the
-    # LLM model), keeping provenance honest.
     source_model = model_version() if extraction_method == "llm" else None
+    expires_at = None if extraction_method == "llm" else utcnow() + RULE_BASED_CACHE_TTL
     with get_connection() as conn:
         cur = conn.cursor()
         cur.execute("""
             INSERT INTO job_reqs_cache
-                (desc_hash, reqs_json, cache_version, extraction_method, source_model)
-            VALUES (%s, %s, %s, %s, %s) ON CONFLICT (desc_hash) DO NOTHING
+                (desc_hash, reqs_json, cache_version, extraction_method, source_model,
+                 expires_at, created_at)
+            VALUES (%s, %s, %s, %s, %s, %s, NOW())
+            ON CONFLICT (desc_hash) DO UPDATE SET
+                reqs_json = EXCLUDED.reqs_json,
+                cache_version = EXCLUDED.cache_version,
+                extraction_method = EXCLUDED.extraction_method,
+                source_model = EXCLUDED.source_model,
+                expires_at = EXCLUDED.expires_at,
+                created_at = NOW()
+            WHERE job_reqs_cache.extraction_method IS DISTINCT FROM 'llm'
         """, (desc_hash, json.dumps(reqs), reqs_cache_version(),
-              extraction_method, source_model))
+              extraction_method, source_model, expires_at))
+
+
+def _get_requirements(state, job, run_id, step_id):
+    """
+    Requirements for one job, cache-aware and quality-aware. Returns
+    (requirements, cache_hit, method).
+
+      * durable LLM cache hit            -> use it, 0 LLM calls
+      * rule-based cache hit             -> try to UPGRADE via the LLM when budget
+                                            allows; on failure keep the cached rules
+      * miss                             -> LLM when budget allows, else rules
+    """
+    from rule_requirements import extract_requirements_rule_based
+    dhash = _reqs_cache_key(job["title"], job["description"])
+    cached, provenance = _reqs_cache_get(dhash)
+    method = (provenance or {}).get("extraction_method")
+    if cached is not None and method == "llm":
+        log.info("requirements for '%s' served from cache [llm] — 0 LLM calls", job["title"])
+        return cached, True, "llm"
+
+    if not state.budget_exceeded():
+        try:
+            reqs = extract_requirements(job, run_id, step_id, budget=state)
+            _reqs_cache_put(dhash, reqs, "llm")
+            if cached is not None:
+                log.info("requirements for '%s' upgraded rule_based -> llm", job["title"])
+            return reqs, False, "llm"
+        except Exception as extract_err:
+            log.warning("requirements LLM extraction failed (%s)", extract_err)
+
+    if cached is not None:
+        # Degraded but still valid fallback that hasn't expired — reuse it, don't rewrite.
+        log.info("requirements for '%s' served from cache [%s]", job["title"], method)
+        return cached, True, method or "rule_based"
+
+    reqs = extract_requirements_rule_based(job)
+    _reqs_cache_put(dhash, reqs, "rule_based")
+    log.info("requirements via rules — 0 LLM calls")
+    return reqs, False, "rule_based"
 
 
 _REAL_DECISIONS = {"Apply", "Maybe", "Skip"}
@@ -246,14 +306,21 @@ def _step_needs_review(step_id):
     — score disagreement, prompt injection, hallucination, and evaluation failure all
     set it via flag_for_review, and record_score never clears it.
     """
-    conn = get_connection()
-    try:
+    with get_connection() as conn:
         cur = conn.cursor()
         cur.execute("SELECT needs_human_review FROM steps WHERE id = %s", (step_id,))
         row = cur.fetchone()
         return bool(row and row[0])
-    finally:
-        conn.close()
+
+
+def _step_review_reason(step_id):
+    """The accumulated review_reason for a step (e.g. 'score_disagreement;
+    possible_prompt_injection(job)'), so the reviewer is told WHY the run paused."""
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT review_reason FROM steps WHERE id = %s", (step_id,))
+        row = cur.fetchone()
+        return row[0] if row else None
 
 
 def do_process_job(state, run_id):
@@ -274,32 +341,15 @@ def do_process_job(state, run_id):
     job = state.jobs[state.current_job_index]
     step_id = create_step(run_id, job["title"], len(state.completed_actions))
     try:
-        # 1. requirements FIRST — structured, optional-aware extraction (cached #2).
-        dhash = _reqs_cache_key(job["title"], job["description"])
-        requirements, provenance = _reqs_cache_get(dhash)
-        cache_hit = requirements is not None
-        if requirements is None:
-            # Extract requirements: LLM when budget allows (best quality), else
-            # rule-based fallback (no LLM) so the job still gets requirements and
-            # never drops out just because quota ran out. Graceful degradation,
-            # same pattern as the judge.
-            extraction_method = "rule_based"   # default unless the LLM path succeeds
-            if not state.budget_exceeded():
-                try:
-                    requirements = extract_requirements(job, run_id, step_id, budget=state)
-                    extraction_method = "llm"
-                except Exception as extract_err:
-                    from rule_requirements import extract_requirements_rule_based
-                    requirements = extract_requirements_rule_based(job)
-                    log.warning("requirements via rules (LLM failed: %s) — 0 LLM calls", extract_err)
-            else:
-                from rule_requirements import extract_requirements_rule_based
-                requirements = extract_requirements_rule_based(job)
-                log.info("requirements via rules (budget spent) — 0 LLM calls")
-            _reqs_cache_put(dhash, requirements, extraction_method)
-        else:
-            method = (provenance or {}).get("extraction_method") or "unknown"
-            log.info("requirements for '%s' served from cache [%s] — 0 LLM calls", job['title'], method)
+        # 0. Untrusted job text is scanned EVERY time — not only when the LLM
+        #    extractor runs — so an injection attempt is still caught (and pauses the
+        #    run for review) when requirements come from the cache.
+        from prompt_safety import detect_injection
+        if detect_injection(f"{job.get('title', '')}\n{job.get('description', '')}"):
+            flag_for_review(step_id, reason="possible_prompt_injection(job)")
+
+        # 1. requirements — structured, optional-aware, cache- and quality-aware.
+        requirements, cache_hit, _method = _get_requirements(state, job, run_id, step_id)
 
         # 2. deterministic score — traced (0 LLM calls), runs FIRST (#4)
         user_input = {
@@ -336,21 +386,33 @@ def do_process_job(state, run_id):
             prompt = build_prompt(state.resume_text, state.parsed_resume, job, evidence, requirements)
             try:
                 result = logged_llm_call(prompt, run_id, step_id, operation="job_judge", budget=state)
-                judge_status = "ran"
                 try:
                     llm_decision = _parse_decision(result)
-                except Exception:
+                    judge_status = "ran"
+                except Exception as parse_err:
+                    # The call succeeded but the structured output was invalid. That is
+                    # an AI-quality failure, not a successful judgment: record it as
+                    # such and ask a human (this job is in the uncertain band by
+                    # construction, so there is no trustworthy second opinion).
+                    judge_status = "invalid_output"
+                    judge_skip_reason = "parse_error"
                     llm_decision = "Unknown"
+                    result = None          # nothing valid for the evaluator to grade
+                    flag_for_review(step_id, reason="judge_invalid_output")
+                    log.warning("judge returned invalid structured output for '%s': %s",
+                                job['title'], parse_err)
             except Exception as judge_err:
                 judge_skip_reason = "judge_unavailable"
                 llm_decision = "skipped (judge_unavailable)"
                 log.warning("judge unavailable for '%s' (%s) — keeping score", job['title'], judge_err)
 
         # record_score sets the score-vs-LLM DISAGREEMENT review flag (additively) as a
-        # side effect. Its return value is only that ONE trigger, so it is NOT used for
-        # the routing decision — the authoritative DB flag (below) is.
+        # side effect. Its return value is only that ONE trigger, so it is deliberately
+        # NOT used for routing — the authoritative DB flag (_step_needs_review, read
+        # below AFTER every trigger incl. the evaluator) is.
         record_score(step_id, score, score_result["decision"],
-                     llm_decision, breakdown=score_result["breakdown"])
+                     llm_decision, breakdown=score_result["breakdown"],
+                     breakdown_max=score_result.get("breakdown_max"))
 
         # Compute the authoritative decision (human > llm > score). Defaults to the
         # best automated signal now; a human review overrides it later.
@@ -416,6 +478,9 @@ def do_process_job(state, run_id):
                 "score": score,
                 "score_decision": score_result["decision"],
                 "llm_decision": llm_decision,
+                # WHY it paused — score disagreement, prompt injection, hallucination,
+                # evaluation failure, invalid judge output (possibly several).
+                "review_reason": _step_review_reason(step_id),
             }
 
         finish_step(step_id, "success")
@@ -451,24 +516,23 @@ def _persist_rankings(run_id, ranked):
     Persist the final ranked list as self-contained snapshot rows in run_rankings
     (1-based rank_position). Snapshot fields are stored so the ranking is readable
     later without joining job_postings. Best-effort — a persistence failure never
-    breaks the run. Re-persisting a run replaces its previous rows.
+    breaks the run. Re-persisting a run replaces its previous rows. The connection
+    is always returned to the pool (context manager), even when an INSERT fails.
     """
     try:
-        conn = get_connection()
-        cur = conn.cursor()
-        cur.execute("DELETE FROM run_rankings WHERE run_id = %s", (run_id,))
-        for pos, r in enumerate(ranked or [], start=1):
-            cur.execute("""
-                INSERT INTO run_rankings
-                    (run_id, job_id, rank_position, title, company, score,
-                     final_decision, apply_url)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-            """, (run_id, r.get("job_id"), pos, r.get("title"), r.get("company"),
-                  r.get("score"), r.get("final_decision") or r.get("decision"),
-                  r.get("apply_url")))
-        conn.commit()
-        conn.close()
-    except Exception as e:
+        with get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("DELETE FROM run_rankings WHERE run_id = %s", (run_id,))
+            for pos, r in enumerate(ranked or [], start=1):
+                cur.execute("""
+                    INSERT INTO run_rankings
+                        (run_id, job_id, rank_position, title, company, score,
+                         final_decision, apply_url)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                """, (run_id, r.get("job_id"), pos, r.get("title"), r.get("company"),
+                      r.get("score"), r.get("final_decision") or r.get("decision"),
+                      r.get("apply_url")))
+    except Exception:
         log.exception("persist rankings failed", extra={"run_id": run_id})
 
 
@@ -506,22 +570,21 @@ RESUME EDITS:
 
 def _persist_advice(run_id, job_id, title, advice):
     """Persist one advice text to run_advice, keyed to (run_id, job_id). Best-effort
-    — never breaks the run. Re-persisting the same (run, job) replaces the prior row."""
+    — never breaks the run. Re-persisting the same (run, job) replaces the prior row.
+    The connection is always returned to the pool, even when a statement fails."""
     if not advice:
         return
     try:
-        conn = get_connection()
-        cur = conn.cursor()
-        cur.execute(
-            "DELETE FROM run_advice WHERE run_id = %s AND job_id IS NOT DISTINCT FROM %s",
-            (run_id, job_id))
-        cur.execute("""
-            INSERT INTO run_advice (run_id, job_id, title, advice)
-            VALUES (%s, %s, %s, %s)
-        """, (run_id, job_id, title, advice.strip()))
-        conn.commit()
-        conn.close()
-    except Exception as e:
+        with get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute(
+                "DELETE FROM run_advice WHERE run_id = %s AND job_id IS NOT DISTINCT FROM %s",
+                (run_id, job_id))
+            cur.execute("""
+                INSERT INTO run_advice (run_id, job_id, title, advice)
+                VALUES (%s, %s, %s, %s)
+            """, (run_id, job_id, title, advice.strip()))
+    except Exception:
         log.exception("persist advice failed", extra={"run_id": run_id})
 
 
@@ -568,21 +631,29 @@ def do_generate_advice(state, run_id, top_n=2):
         state.advice_done = True   # don't loop on advice failure
 
 
-def apply_human_decision(state, run_id, step_id, decision, comment=""):
+def apply_human_decision(state, run_id, step_id, decision, comment="",
+                         reviewer_user_id=None, reviewer=None):
     """
     Record the human's Apply/Maybe/Skip decision for a reviewed step as the
     AUTHORITATIVE outcome, preserving the agent's original decisions in the
     trace (audit). Called after a LangGraph resume.
+
+    Audit trail: WHO decided (reviewer_user_id + reviewer username), WHEN
+    (reviewed_at), WHAT (decision) and WHY (comment). reviewer falls back to
+    "unknown" only for legacy queue payloads that predate reviewer identity.
     """
     with get_connection() as conn:
         cur = conn.cursor()
         cur.execute("""
             UPDATE steps
-            SET review_status = %s, reviewed_at = %s, reviewer = %s, review_comment = %s,
-                final_decision = %s
+            SET review_status = %s, reviewed_at = %s, reviewer = %s, reviewer_user_id = %s,
+                review_comment = %s, final_decision = %s
             WHERE id = %s
-        """, (decision, __import__("datetime").datetime.now(), "human", comment, decision, step_id))
-    state.human_decisions[str(step_id)] = {"decision": decision, "comment": comment}
+        """, (decision, utcnow(), reviewer or "unknown", reviewer_user_id,
+              comment, decision, step_id))
+    state.human_decisions[str(step_id)] = {"decision": decision, "comment": comment,
+                                           "reviewer_user_id": reviewer_user_id,
+                                           "reviewer": reviewer}
 
     # Make the human decision authoritative in the in-memory results too, so
     # downstream ranking/advice (which read final_decision) use the human's call.

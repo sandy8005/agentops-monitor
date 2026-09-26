@@ -1,3 +1,4 @@
+from timeutil import utcnow
 from database import get_connection
 import re
 from datetime import datetime, timedelta
@@ -155,12 +156,18 @@ def _role_matcher(target_role):
 # Adzuna (real search) > live/api (Remotive) > scraped > csv > seed.
 _SOURCE_RANK = {"adzuna": 5, "live": 4, "api": 3, "scraped": 2, "csv": 1, "seed": 0}
 
-# Seniority / qualifier words stripped from a title before fingerprinting, so
-# "Senior AI Engineer" and "AI Engineer" from two providers fingerprint the same.
+# Seniority is BUSINESS-SIGNIFICANT: "Senior AI Engineer" and "Junior AI Engineer" at
+# the same company/location are different requisitions, so seniority stays in the
+# strict identity. Only spelling variants are normalized (sr -> senior, ...).
+_TITLE_SYNONYMS = {"sr": "senior", "jr": "junior", "snr": "senior"}
+# Words removed only for the RELAXED fingerprint, which merely nominates POSSIBLE
+# duplicates (e.g. one feed dropping "Senior" from the title). A relaxed-only match is
+# merged only with strong confirmation — near-identical descriptions.
 _TITLE_NOISE = {
     "senior", "sr", "junior", "jr", "staff", "principal", "lead", "associate",
     "entry", "level", "mid", "i", "ii", "iii", "iv",
 }
+RELAXED_MATCH_MIN_DESC_SIMILARITY = 0.9
 # Company-suffix noise stripped so "Wipro Inc." == "Wipro" == "Wipro, LLC".
 _COMPANY_NOISE = {
     "inc", "inc.", "llc", "ltd", "ltd.", "limited", "corp", "corp.",
@@ -168,7 +175,7 @@ _COMPANY_NOISE = {
 }
 
 
-def _norm_token_string(text, drop=frozenset()):
+def _norm_token_string(text, drop=frozenset(), synonyms=None):
     """
     Lowercase, split on non-alphanumerics (keeping + and # so 'c++'/'c#' survive),
     drop noise tokens, and rejoin with single spaces. Provider-independent — the
@@ -178,26 +185,44 @@ def _norm_token_string(text, drop=frozenset()):
     if not text:
         return ""
     tokens = re.findall(r"[a-z0-9\+\#]+", text.lower())
+    if synonyms:
+        tokens = [synonyms.get(t, t) for t in tokens]
     kept = [t for t in tokens if t not in drop]
     return " ".join(kept)
 
 
 def _fingerprint(job):
     """
-    Provider-INDEPENDENT identity for a posting: normalized title + company +
-    location. This is the whole redesign — external_id and apply URLs are
-    provider-namespaced ('adzuna:1' vs 'remotive:2') and NEVER match across feeds,
-    so the same job on Adzuna and Remotive used to slip through as two rows. A
-    content fingerprint collapses them.
-
-    LOCATION stays in the key (normalized), so 'AI Engineer @ Wipro' in Texas and
-    in California remain DISTINCT — matching the existing location-aware intent.
+    STRICT provider-independent identity for a URL-less posting: normalized title
+    (seniority KEPT) + company + location. external_id and apply URLs are
+    provider-namespaced and never match across feeds, so a content fingerprint is
+    the fallback; LOCATION stays in the key so the same role in two cities stays
+    distinct, and SENIORITY stays so "Senior X" and "Junior X" stay distinct.
     """
     return (
-        _norm_token_string(job.get("title"), drop=_TITLE_NOISE),
+        _norm_token_string(job.get("title"), synonyms=_TITLE_SYNONYMS),
         _norm_token_string(job.get("company"), drop=_COMPANY_NOISE),
         _norm_token_string(job.get("location")),
     )
+
+
+def _relaxed_fingerprint(job):
+    """Seniority-stripped fingerprint. Only NOMINATES possible duplicates; see
+    _dedupe_jobs for the description-similarity confirmation required to merge."""
+    return (
+        _norm_token_string(job.get("title"), drop=_TITLE_NOISE, synonyms=_TITLE_SYNONYMS),
+        _norm_token_string(job.get("company"), drop=_COMPANY_NOISE),
+        _norm_token_string(job.get("location")),
+    )
+
+
+def _desc_similarity(a, b):
+    """Jaccard similarity of the two descriptions' token sets (0..1). Empty -> 0."""
+    ta = set(re.findall(r"[a-z0-9\+\#]+", (a or "").lower()))
+    tb = set(re.findall(r"[a-z0-9\+\#]+", (b or "").lower()))
+    if not ta or not tb:
+        return 0.0
+    return len(ta & tb) / len(ta | tb)
 
 
 # Fields worth salvaging from a discarded duplicate when the winner lacks them.
@@ -222,22 +247,56 @@ def _merge_duplicate(winner, loser):
     return winner
 
 
+# Query parameters that only TRACK a click and never identify a job. Everything else
+# in the query string is preserved, because many ATSs carry the job's identity there
+# (/jobs?jobId=123 vs /jobs?jobId=456 are two different postings).
+_TRACKING_PARAMS = {
+    "gclid", "fbclid", "msclkid", "dclid", "yclid", "mc_cid", "mc_eid", "_hsenc",
+    "_hsmi", "ref", "ref_src", "referrer", "src", "source", "trk", "trackingid",
+    "igshid", "si",
+}
+
+
+def _is_tracking_param(key):
+    k = key.lower()
+    return k.startswith("utm") or k in _TRACKING_PARAMS
+
+
 def _canonical_url(job):
     """
     A normalized apply/source URL used as the PRIMARY dedup identity. Two postings
     with the same canonical URL are the same job (even across providers); postings
-    with DIFFERENT URLs are kept DISTINCT — so two real requisitions that merely share
-    a title+company+location are never merged into one. Returns None when the posting
-    has no usable URL (then we fall back to the content fingerprint).
+    with DIFFERENT URLs are kept DISTINCT. Returns None when the posting has no usable
+    URL (then we fall back to the content fingerprint).
+
+    Normalization is deliberately conservative (urllib.parse, not string surgery):
+      * scheme and HOST are lowercased (they're case-insensitive); default ports and
+        the #fragment are dropped;
+      * the PATH keeps its case (paths can be case-sensitive) and only loses a
+        trailing slash;
+      * the QUERY keeps every identity-bearing parameter and drops only known
+        tracking parameters (utm_*, gclid, fbclid, ...), sorted for stability.
     """
+    from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
     for f in ("apply_url", "url", "source_url"):
         u = job.get(f)
-        if u and isinstance(u, str):
-            # drop #fragment and ?query (tracking params), trailing slash, and case,
-            # so the same link matches regardless of ?utm=... etc.
-            u = u.strip().split("#", 1)[0].split("?", 1)[0].rstrip("/")
-            if u:
-                return u.lower()
+        if not (u and isinstance(u, str) and u.strip()):
+            continue
+        try:
+            parts = urlsplit(u.strip())
+        except ValueError:
+            continue
+        if not parts.netloc:
+            continue
+        scheme = parts.scheme.lower()
+        host = (parts.hostname or "").lower()
+        port = parts.port
+        if port and not ((scheme == "http" and port == 80) or (scheme == "https" and port == 443)):
+            host = f"{host}:{port}"
+        path = parts.path.rstrip("/")
+        query = urlencode(sorted((k, v) for k, v in parse_qsl(parts.query, keep_blank_values=True)
+                                 if not _is_tracking_param(k)))
+        return urlunsplit((scheme, host, path, query, ""))
     return None
 
 
@@ -316,7 +375,36 @@ def _dedupe_jobs(jobs):
                 target.extend(urlless)
             for b in buckets:
                 result.append(_merge_group(b))
-    return result
+    return _merge_relaxed_duplicates(result)
+
+
+def _merge_relaxed_duplicates(rows):
+    """
+    Second, CONSERVATIVE pass: rows that differ only by seniority wording (same
+    relaxed fingerprint) are merged only when neither carries a conflicting URL AND
+    their descriptions are near-identical — i.e. the same posting where one feed
+    dropped "Senior" from the title. Different seniority with different descriptions
+    (a real Senior vs Junior opening) stays separate.
+    """
+    out = []
+    for row in rows:
+        merged = False
+        for i, kept in enumerate(out):
+            if _fingerprint(kept) == _fingerprint(row):
+                continue   # already handled by the strict pass (distinct URLs)
+            if _relaxed_fingerprint(kept) != _relaxed_fingerprint(row):
+                continue
+            ku, ru = _canonical_url(kept), _canonical_url(row)
+            if ku and ru and ku != ru:
+                continue   # two distinct requisitions
+            if _desc_similarity(kept.get("description"), row.get("description")) \
+                    >= RELAXED_MATCH_MIN_DESC_SIMILARITY:
+                out[i] = _merge_group([kept, row])
+                merged = True
+                break
+        if not merged:
+            out.append(row)
+    return out
 
 
 def search_jobs(target_role=None, location=None, work_mode=None,
@@ -346,9 +434,14 @@ def search_jobs(target_role=None, location=None, work_mode=None,
         cur.execute("""
             SELECT p.id, p.title, p.company, p.description, p.location, p.work_mode,
                    p.employment_type, p.source, p.external_id, p.last_seen_at, p.apply_url,
+                   -- Only searches whose provider actually GEO-FILTERED count as
+                   -- "returned for this location". Remotive is remote-only and
+                   -- ignores location, so its searches carry
+                   -- location_filter_applied = FALSE and are not a location match.
                    COALESCE(
                        ARRAY_AGG(DISTINCT lower(s.location))
-                       FILTER (WHERE s.location IS NOT NULL),
+                       FILTER (WHERE s.location IS NOT NULL
+                                 AND s.location_filter_applied),
                        '{}'
                    ) AS assoc_locations
             FROM job_postings p
@@ -386,11 +479,17 @@ def search_jobs(target_role=None, location=None, work_mode=None,
                 all_jobs = [j for j in all_jobs if j["id"] in run_job_ids]
 
         # --- freshness filter: drop jobs not seen recently ---
-        # Jobs with no last_seen_at (seed/csv/scraped — not time-based) are always fresh.
-        cutoff = datetime.now() - timedelta(days=STALE_AFTER_DAYS)
+        # Practice data (seed/csv/scraped) has no sighting time and is always kept.
+        # A LIVE posting must have been seen within the window; a live row with no
+        # last_seen_at is treated as STALE, never as "fresh forever".
+        cutoff = utcnow() - timedelta(days=STALE_AFTER_DAYS)
         def _is_fresh(job):
             ls = job.get("last_seen_at")
-            return ls is None or ls >= cutoff
+            if ls is None:
+                return (job.get("source") or "").lower() not in LIVE_SOURCES
+            if ls.tzinfo is None:   # defensive: legacy naive value
+                ls = ls.replace(tzinfo=cutoff.tzinfo)
+            return ls >= cutoff
         all_jobs = [j for j in all_jobs if _is_fresh(j)]
 
         if not target_role:
@@ -412,8 +511,10 @@ def search_jobs(target_role=None, location=None, work_mode=None,
             def location_ok(job):
                 assoc = job.get("assoc_locations") or set()
                 if not assoc:
-                    return True          # unassociated → location-agnostic (practice data)
-                return loc in assoc      # matched by at least one search for this location
+                    # No geo-filtered association: practice data, or a remote-only
+                    # provider that doesn't filter by location — location-agnostic.
+                    return True
+                return loc in assoc      # matched by at least one geo-filtered search
 
             filtered = [j for j in filtered if location_ok(j)]
 

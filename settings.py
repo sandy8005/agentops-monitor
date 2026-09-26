@@ -61,6 +61,11 @@ class Settings:
         self.rate_limit_login = _get("RATE_LIMIT_LOGIN", "5/minute")
         self.rate_limit_runs = _get("RATE_LIMIT_RUNS", "20/minute")
 
+        # Trace retention: prompts/responses/tool I/O/context/checkpoints of runs that
+        # ended more than this many days ago are purged by the worker (metrics kept).
+        # 0 disables purging.
+        self.trace_retention_days = int(_get("TRACE_RETENTION_DAYS", "30"))
+
         # --- LLM ---
         self.gemini_api_key = _get("GEMINI_API_KEY")
         self.gemini_model = _get("GEMINI_MODEL", "gemini-3.6-flash")

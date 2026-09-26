@@ -29,7 +29,7 @@ def _run_and_step(uid):
 
 
 def test_remotive_fetch_is_run_scoped_and_visible_in_live_only(monkeypatch):
-    uid = create_user("rmt_" + uuid.uuid4().hex[:10], "password123")
+    uid = create_user("rmt_" + uuid.uuid4().hex[:10], "password-1234")
     run_id, step_id = _run_and_step(uid)
 
     eid = "remotive:test-" + uuid.uuid4().hex[:10]
@@ -58,7 +58,7 @@ def test_remotive_fetch_is_run_scoped_and_visible_in_live_only(monkeypatch):
 
 
 def test_remotive_fetch_failure_reports_classified_status(monkeypatch):
-    uid = create_user("rmtf_" + uuid.uuid4().hex[:10], "password123")
+    uid = create_user("rmtf_" + uuid.uuid4().hex[:10], "password-1234")
     run_id, step_id = _run_and_step(uid)
     monkeypatch.setattr(live_jobs, "fetch_live_jobs",
                         lambda role, location=None, limit=10: ([], "network_error", "boom"))
