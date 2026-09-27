@@ -1,19 +1,22 @@
 """
 Data erasure and trace retention.
 
-REDACT_SENSITIVE only hides fields from API RESPONSES. The database still holds
+REDACT_TRACE_PAYLOADS (formerly REDACT_SENSITIVE) only hides fields from API RESPONSES. The database still holds
 resume text, LLM prompts/responses (which embed the resume), tool I/O, retrieved
 context, advice, and LangGraph checkpoints (whose state carries the full resume
 text). "Not shown by the API" is not "not stored", so this module provides the
 real controls:
 
   erase_resume(resume_id, user_id)  – user deletes a resume: its text AND every
-                                      trace/derived artifact that embeds it is erased.
+                                      trace/derived artifact that embeds it is erased,
+                                      including cached parses from ALL parser versions.
   delete_run(run_id, user_id)       – hard-delete one finished run and all its traces.
-  purge_expired_traces(days)        – retention: strip trace payloads (prompts,
-                                      responses, tool I/O, context, checkpoints) from
-                                      runs that ended more than `days` ago. Metrics
-                                      (tokens, cost, latency, status, scores) are kept.
+  purge_expired_traces(days)        – retention: run the idempotent scrubber on EVERY
+                                      terminal run that ended more than `days` ago
+                                      (prompts, responses, tool I/O, context, review
+                                      comments, evaluation notes, advice, pending
+                                      review, checkpoints). Metrics (tokens, cost,
+                                      latency, status, scores) are kept.
 
 What this does NOT cover (deployment responsibilities, see README "Data handling"):
 database-level encryption at rest, backup retention/rotation (erased data lives on
@@ -84,9 +87,12 @@ def erase_resume(resume_id, user_id):
 
         text = row[0] or ""
         if text and text != ERASED:
-            from router import _resume_cache_key
-            cur.execute("DELETE FROM parsed_resume_cache WHERE resume_hash = %s",
-                        (_resume_cache_key(text),))
+            # The cache is keyed by a STABLE content hash plus a separate version, so
+            # this removes EVERY cached parse of this text — including parses made
+            # by older parser/schema/model versions (derived personal data).
+            from router import resume_content_hash
+            cur.execute("DELETE FROM parsed_resume_cache WHERE content_hash = %s",
+                        (resume_content_hash(text),))
         cur.execute("SELECT id FROM runs WHERE resume_id = %s", (resume_id,))
         _scrub_run_payloads(cur, [r[0] for r in cur.fetchall()])
         cur.execute("UPDATE resumes SET resume_text = %s, name = %s, is_deleted = TRUE "
@@ -120,29 +126,47 @@ def delete_run(run_id, user_id):
     return True
 
 
-def purge_expired_traces(retention_days):
+def purge_expired_traces(retention_days, batch_size=500):
     """
-    Retention: strip sensitive trace payloads from runs that ENDED more than
-    retention_days ago. Idempotent. Returns the number of runs purged.
+    Retention: scrub sensitive payloads from EVERY terminal run that ENDED more than
+    retention_days ago. Idempotent. Returns the number of runs scrubbed.
     retention_days <= 0 disables purging.
+
+    Eligibility is (terminal status AND ended before the cutoff) — deliberately NOT
+    "still has a non-NULL prompt/tool input". A run whose LLM/tool payloads happen
+    to be gone can still hold review comments, evaluation notes, hallucinated
+    claims, advice, a pending-review payload or LangGraph checkpoint data; the old
+    EXISTS filter never selected such runs, so that data outlived the retention
+    period. The scrubber is idempotent, so re-scrubbing a clean run is harmless.
+
+    Runs already scrubbed are remembered via runs.trace_purged_at so each sweep only
+    touches NEW expirations (processed in batches to keep transactions short).
     """
     if not retention_days or retention_days <= 0:
         return 0
-    with get_connection() as conn:
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT id FROM runs
-            WHERE ended_at IS NOT NULL
-              AND ended_at < NOW() - make_interval(days => %s)
-              AND status <> ALL(%s)
-              AND EXISTS (SELECT 1 FROM llm_calls l WHERE l.run_id = runs.id
-                          AND (l.prompt IS NOT NULL OR l.response IS NOT NULL)
-                          UNION ALL
-                          SELECT 1 FROM tool_calls t WHERE t.run_id = runs.id
-                          AND t.input_json IS NOT NULL)
-        """, (int(retention_days), list(ACTIVE_RUN_STATUSES)))
-        run_ids = [r[0] for r in cur.fetchall()]
-        _scrub_run_payloads(cur, run_ids)
-    if run_ids:
-        log.info("retention: purged trace payloads of %d run(s)", len(run_ids))
-    return len(run_ids)
+    total = 0
+    while True:
+        with get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("""
+                SELECT id FROM runs
+                WHERE ended_at IS NOT NULL
+                  AND ended_at < NOW() - make_interval(days => %s)
+                  AND status <> ALL(%s)
+                  AND trace_purged_at IS NULL
+                ORDER BY id
+                LIMIT %s
+                FOR UPDATE SKIP LOCKED
+            """, (int(retention_days), list(ACTIVE_RUN_STATUSES), int(batch_size)))
+            run_ids = [r[0] for r in cur.fetchall()]
+            if not run_ids:
+                break
+            _scrub_run_payloads(cur, run_ids)
+            cur.execute("UPDATE runs SET trace_purged_at = NOW() WHERE id = ANY(%s)",
+                        (run_ids,))
+        total += len(run_ids)
+        if len(run_ids) < batch_size:
+            break
+    if total:
+        log.info("retention: scrubbed trace payloads of %d run(s)", total)
+    return total

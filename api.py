@@ -7,10 +7,11 @@ from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.sessions import SessionMiddleware
 import os, tempfile
-from typing import Literal
+from typing import Literal, Optional
+from pydantic import BaseModel, Field, ConfigDict
 from llm import create_run, create_run_tx, request_cancel
 from job_queue import enqueue, enqueue_tx
-from pdf_reader import read_resume_file
+from pdf_reader import read_resume_file_isolated, PdfExtractionError
 from auth import authenticate
 from csrf import get_or_create_token, require_csrf
 
@@ -27,10 +28,50 @@ app = FastAPI(title="AgentOps Monitor", docs_url=_docs,
               openapi_url=(None if settings.is_production else "/openapi.json"))
 
 # --- Rate limiting ----------------------------------------------------------
-# Per-client-IP limits (in-memory) to blunt login brute-force and enqueue abuse.
-# Configurable via settings (RATE_LIMIT_LOGIN / RATE_LIMIT_RUNS).
-limiter = Limiter(key_func=get_remote_address)
+# Per-client-IP limits to blunt login brute-force and enqueue abuse. Configurable via
+# settings (RATE_LIMIT_LOGIN / RATE_LIMIT_RUNS).
+#
+# Storage: the default memory:// store is PER PROCESS — with 4 API workers the
+# effective limit is 4x. Set RATE_LIMIT_STORAGE_URI (e.g. redis://redis:6379/0) to
+# share counters before scaling horizontally.
+#
+# Client IP: get_remote_address reads request.client.host. Behind a reverse proxy
+# that is the PROXY's address unless Uvicorn is started with --proxy-headers and
+# --forwarded-allow-ips=<the proxy's IP> (never '*' on an internet-facing host, or
+# clients can spoof X-Forwarded-For and dodge the limit).
+limiter = Limiter(key_func=get_remote_address,
+                  storage_uri=settings.rate_limit_storage_uri)
 app.state.limiter = limiter
+
+
+# --- HTTP security headers --------------------------------------------------
+# The dashboard is a cookie-authenticated browser app, so it gets a strict CSP (all
+# scripts/styles are served from /static; no inline script is needed), framing is
+# forbidden (clickjacking), MIME sniffing is off, and referrers don't leak run URLs.
+# HSTS is sent only in production (HTTPS-only deployments).
+_CSP = ("default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; "
+        "img-src 'self' data:; connect-src 'self'; object-src 'none'; "
+        "base-uri 'self'; form-action 'self'; frame-ancestors 'none'")
+_DOCS_CSP = ("default-src 'self'; script-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+             "style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; "
+             "img-src 'self' data: https://fastapi.tiangolo.com; frame-ancestors 'none'")
+
+
+@app.middleware("http")
+async def _security_headers(request: Request, call_next):
+    response = await call_next(request)
+    path = request.url.path
+    is_docs = path in ("/docs", "/redoc") or path.startswith("/docs/")
+    response.headers.setdefault("Content-Security-Policy", _DOCS_CSP if is_docs else _CSP)
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "no-referrer")
+    response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+    response.headers.setdefault("Cross-Origin-Opener-Policy", "same-origin")
+    if settings.is_production:
+        response.headers.setdefault("Strict-Transport-Security",
+                                    "max-age=63072000; includeSubDomains")
+    return response
 
 
 @app.exception_handler(RateLimitExceeded)
@@ -87,10 +128,30 @@ app.add_middleware(
     max_age=settings.session_max_age,
 )
 
-# Redact resume-bearing / trace fields from API responses when deploying
-# publicly. Toggle with REDACT_SENSITIVE=1 (on for public deploys, off locally).
-REDACT_SENSITIVE = settings.redact_sensitive
+# Trace-payload redaction (REDACT_TRACE_PAYLOADS, default ON; the old name
+# REDACT_SENSITIVE is still honoured). EXACTLY what it covers, in API responses:
+#   * LLM prompts and responses                     (embed resume + job text)
+#   * tool-call inputs and outputs                  (embed resume + job text)
+#   * step retrieved_context                        (resume-derived evidence)
+#   * evaluation notes and hallucinated claims      (quote resume/job content)
+#   * LLM / tool / step ERROR MESSAGES               (providers can echo input)
+# What it deliberately does NOT hide — these are the product's OUTPUT to the run's
+# owner, shown only to that authenticated owner:
+#   * generated application advice (/runs/{id}/rankings)
+#   * the owner's own review comments and the review reason codes
+#   * scores, decisions, job titles/companies, metrics
+# It is a DISPLAY control, not deletion: the database still holds the data until
+# erasure or the retention purge (privacy.py).
+REDACT_TRACE_PAYLOADS = settings.redact_trace_payloads
+REDACT_SENSITIVE = REDACT_TRACE_PAYLOADS   # deprecated alias
 _REDACTED = "[redacted]"
+
+
+def _redact(value):
+    """Redact one trace payload when redaction is on (None stays None)."""
+    if not REDACT_TRACE_PAYLOADS or value is None:
+        return value
+    return _REDACTED
 
 
 def get_connection():
@@ -166,7 +227,8 @@ def whoami(user: dict = Depends(require_auth)):
 async def upload_resume(file: UploadFile = File(...), name: str = Form(""),
                         user: dict = Depends(require_auth),
                         _csrf: None = Depends(require_csrf)):
-    if not file.filename.lower().endswith(".pdf"):
+    filename = file.filename or ""          # multipart parts may omit the filename
+    if not filename.lower().endswith(".pdf"):
         raise HTTPException(status_code=400, detail="Please upload a PDF file")
     _check_len("name", name, MAX_NAME_CHARS)
 
@@ -181,31 +243,46 @@ async def upload_resume(file: UploadFile = File(...), name: str = Form(""),
         tmp_path = tmp.name
 
     try:
-        resume_text = read_resume_file(tmp_path)
+        # Parsed in a resource-limited child process, not in the API process.
+        resume_text = read_resume_file_isolated(tmp_path)
+    except PdfExtractionError as e:
+        log.warning("pdf extraction failed: %s", e)
+        raise HTTPException(status_code=400, detail="Could not read that PDF")
     finally:
         os.remove(tmp_path)
 
-    name = (name or file.filename or "resume.pdf")[:MAX_NAME_CHARS]
+    name = (name or filename or "resume.pdf")[:MAX_NAME_CHARS]
 
     if not resume_text or not resume_text.strip():
         raise HTTPException(status_code=400, detail="Could not extract text from the PDF")
 
     # Cap the extracted text before storing / feeding it to the LLM — a big PDF can
-    # expand into a very large amount of text (memory, LLM cost, latency, DB size).
-    if len(resume_text) > MAX_RESUME_CHARS:
-        log.info("resume text truncated from %d to %d chars", len(resume_text), MAX_RESUME_CHARS)
+    # expand into a very large amount of text. Truncation is never SILENT: the row
+    # records it and the response tells the caller, because skills or experience
+    # after the cut are simply not seen by the matcher.
+    original_chars = len(resume_text)
+    truncated = original_chars > MAX_RESUME_CHARS
+    if truncated:
+        log.info("resume text truncated from %d to %d chars", original_chars, MAX_RESUME_CHARS)
         resume_text = resume_text[:MAX_RESUME_CHARS]
 
     with get_connection() as conn:   # guaranteed release even if the INSERT throws
         cur = conn.cursor()
         cur.execute("""
-            INSERT INTO resumes (name, resume_text, created_at, user_id)
-            VALUES (%s, %s, %s, %s) RETURNING id
-        """, (name, resume_text, utcnow(), user["id"]))
+            INSERT INTO resumes (name, resume_text, created_at, user_id,
+                                 original_chars, truncated)
+            VALUES (%s, %s, %s, %s, %s, %s) RETURNING id
+        """, (name, resume_text, utcnow(), user["id"], original_chars, truncated))
         resume_id = cur.fetchone()[0]
 
+    message = f"Resume stored as #{resume_id}"
+    if truncated:
+        message += (f" — WARNING: the extracted text was {original_chars:,} characters; "
+                    f"only the first {MAX_RESUME_CHARS:,} were kept and will be matched.")
     return {"resume_id": resume_id, "name": name,
-            "chars": len(resume_text), "message": f"Resume stored as #{resume_id}"}
+            "chars": len(resume_text), "truncated": truncated,
+            "original_chars": original_chars, "stored_chars": len(resume_text),
+            "message": message}
 
 
 @app.get("/resumes")
@@ -213,13 +290,14 @@ def list_resumes(user: dict = Depends(require_auth)):
     with get_connection() as conn:
         cur = conn.cursor()
         cur.execute("""
-            SELECT id, name, length(resume_text), created_at
+            SELECT id, name, length(resume_text), created_at, truncated, original_chars
             FROM resumes WHERE is_deleted = FALSE AND user_id = %s ORDER BY id DESC
         """, (user["id"],))
         rows = cur.fetchall()
         return [
             {"id": r[0], "name": r[1], "chars": r[2],
-             "created_at": r[3].isoformat() if r[3] else None}
+             "created_at": r[3].isoformat() if r[3] else None,
+             "truncated": bool(r[4]), "original_chars": r[5]}
             for r in rows
         ]
 
@@ -258,19 +336,66 @@ def list_runs(limit: int = Query(20, ge=1, le=100), user: dict = Depends(require
             {"id": r[0], "status": r[1],
              "started_at": r[2].isoformat() if r[2] else None,
              "total_tokens": r[3], "total_cost": float(r[4]) if r[4] else 0,
+             "cost_basis": "estimated_paid_tier",
              "target_role": r[5], "location": r[6], "work_mode": r[7],
              "error_code": r[8]}
             for r in rows
         ]
 
 
+class StartRunRequest(BaseModel):
+    """
+    JSON body for POST /runs. Run configuration travels in the BODY, not the query
+    string: query strings end up in reverse-proxy/access logs, APM tools and browser
+    history. Unknown fields are rejected (422) so a typo can't be silently ignored.
+    """
+    model_config = ConfigDict(extra="forbid")
+    resume_id: Optional[int] = None
+    target_role: str = ""
+    location: str = ""
+    work_mode: WorkMode = ""
+    employment_type: EmploymentType = ""
+    evaluate: bool = False
+    live_only: bool = False
+
+
+class ResumeRunRequest(BaseModel):
+    """JSON body for POST /runs/{id}/resume (the reviewer's comment is free text and
+    must not travel in the URL either)."""
+    model_config = ConfigDict(extra="forbid")
+    decision: Decision = "Maybe"
+    comment: str = ""
+
+
+@app.get("/reviews/pending")
+def pending_reviews(user: dict = Depends(require_auth)):
+    """
+    Lightweight feed for the "Runs Awaiting Your Review" panel: ONE query returning
+    only what a review card shows (run id, role, status, the pending_review
+    payload). The dashboard polls this every few seconds, so it must not expand the
+    full trace of every paused run the way GET /runs/{id} does.
+    """
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT id, target_role, location, status, pending_review
+            FROM runs
+            WHERE user_id = %s AND status = 'waiting_for_human'
+            ORDER BY id DESC LIMIT 50
+        """, (user["id"],))
+        rows = cur.fetchall()
+    return [{"run_id": r[0], "target_role": r[1], "location": r[2], "status": r[3],
+             "pending_review": r[4] or {}} for r in rows]
+
+
 @app.post("/runs")
 @limiter.limit(settings.rate_limit_runs)
-def start_run(request: Request, resume_id: int = None,
-              target_role: str = "", location: str = "", work_mode: WorkMode = "",
-              employment_type: EmploymentType = "", evaluate: bool = False,
-              live_only: bool = False, user: dict = Depends(require_auth),
+def start_run(request: Request, body: StartRunRequest,
+              user: dict = Depends(require_auth),
               _csrf: None = Depends(require_csrf)):
+    resume_id, target_role, location = body.resume_id, body.target_role, body.location
+    work_mode, employment_type = body.work_mode, body.employment_type
+    evaluate, live_only = body.evaluate, body.live_only
     if resume_id is None:
         raise HTTPException(status_code=400, detail="resume_id is required; upload or pick a resume first")
     if not target_role.strip():
@@ -407,6 +532,10 @@ def get_run(run_id: int, user: dict = Depends(require_auth)):
         if not run:
             raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
 
+        # Bulk-load the whole trace in a CONSTANT number of queries (steps, tool
+        # calls, LLM calls, evaluations — each filtered by run_id and served by the
+        # *_run_idx indexes) and group by step in Python. The previous version ran
+        # three queries PER STEP (~92 queries for a 30-step run).
         cur.execute("""
             SELECT id, step_name, status, match_score, score_decision,
                    llm_decision, needs_human_review, review_status, error_message,
@@ -417,55 +546,61 @@ def get_run(run_id: int, user: dict = Depends(require_auth)):
         """, (run_id,))
         step_rows = cur.fetchall()
 
+        cur.execute("""
+            SELECT step_id, tool_name, status, latency_ms, input_json, output_json,
+                   error_message, operation_name, run_attempt
+            FROM tool_calls WHERE run_id = %s ORDER BY id
+        """, (run_id,))
+        tools_by_step = {}
+        for t in cur.fetchall():
+            tools_by_step.setdefault(t[0], []).append({
+                "tool_name": t[1], "status": t[2], "latency_ms": t[3],
+                "input_json": _redact(t[4]), "output_json": _redact(t[5]),
+                "error_message": _redact(t[6]), "operation": t[7], "run_attempt": t[8]})
+
+        cur.execute("""
+            SELECT step_id, prompt_tokens, completion_tokens, latency_ms, cost_usd, status,
+                   prompt, response, error_message, operation_name, attempt_number,
+                   retry_count, provider_request_id, logical_call_id, pricing_version,
+                   model, run_attempt
+            FROM llm_calls WHERE run_id = %s ORDER BY id
+        """, (run_id,))
+        llm_by_step = {}
+        for l in cur.fetchall():
+            llm_by_step.setdefault(l[0], []).append({
+                "prompt_tokens": l[1], "completion_tokens": l[2], "latency_ms": l[3],
+                # ESTIMATED paid-tier cost (pricing.py); None = model price unknown.
+                "cost_usd": float(l[4]) if l[4] is not None else None,
+                "cost_basis": "estimated_paid_tier",
+                "status": l[5], "prompt": _redact(l[6]), "response": _redact(l[7]),
+                "error_message": _redact(l[8]), "operation": l[9],
+                # retry explainability: logical call -> HTTP attempt -> run attempt
+                "attempt_number": l[10], "retry_count": l[11], "provider_request_id": l[12],
+                "logical_call_id": l[13], "pricing_version": l[14], "model": l[15],
+                "run_attempt": l[16]})
+
+        cur.execute("""
+            SELECT DISTINCT ON (step_id) step_id, relevance_score, faithfulness_score,
+                   completeness_score, hallucination_detected, hallucinated_claims, notes
+            FROM evaluations WHERE run_id = %s ORDER BY step_id, id DESC
+        """, (run_id,))
+        eval_by_step = {}
+        for ev in cur.fetchall():
+            eval_by_step[ev[0]] = {
+                "relevance_score": ev[1], "faithfulness_score": ev[2],
+                "completeness_score": ev[3], "hallucination_detected": ev[4],
+                "hallucinated_claims": _redact(ev[5]), "notes": _redact(ev[6])}
+
         steps = []
         for s in step_rows:
             step_id = s[0]
-            cur.execute("""
-                SELECT tool_name, status, latency_ms, input_json, output_json, error_message, operation_name
-                FROM tool_calls WHERE step_id = %s ORDER BY id
-            """, (step_id,))
-            tool_calls = [
-                {"tool_name": t[0], "status": t[1], "latency_ms": t[2],
-                 "input_json": _REDACTED if REDACT_SENSITIVE else t[3],
-                 "output_json": _REDACTED if REDACT_SENSITIVE else t[4],
-                 "error_message": t[5], "operation": t[6]}
-                for t in cur.fetchall()
-            ]
-            cur.execute("""
-                SELECT prompt_tokens, completion_tokens, latency_ms, cost_usd, status, prompt, response,
-                       error_message, operation_name, attempt_number, retry_count, provider_request_id
-                FROM llm_calls WHERE step_id = %s ORDER BY id
-            """, (step_id,))
-            llm_calls = [
-                {"prompt_tokens": l[0], "completion_tokens": l[1], "latency_ms": l[2],
-                 "cost_usd": float(l[3]) if l[3] is not None else 0, "status": l[4],
-                 "prompt": _REDACTED if REDACT_SENSITIVE else l[5],
-                 "response": _REDACTED if REDACT_SENSITIVE else l[6],
-                 "error_message": l[7], "operation": l[8],
-                 "attempt_number": l[9], "retry_count": l[10], "provider_request_id": l[11]}
-                for l in cur.fetchall()
-            ]
-            cur.execute("""
-                SELECT relevance_score, faithfulness_score, completeness_score,
-                       hallucination_detected, hallucinated_claims, notes
-                FROM evaluations WHERE step_id = %s ORDER BY id DESC LIMIT 1
-            """, (step_id,))
-            ev = cur.fetchone()
-            evaluation = None
-            if ev:
-                evaluation = {
-                    "relevance_score": ev[0], "faithfulness_score": ev[1],
-                    "completeness_score": ev[2], "hallucination_detected": ev[3],
-                    "hallucinated_claims": ev[4], "notes": ev[5]
-                }
-
             steps.append({
                 "id": step_id, "step_name": s[1], "status": s[2],
                 "match_score": float(s[3]) if s[3] is not None else None,
                 "score_decision": s[4], "llm_decision": s[5],
                 "needs_human_review": s[6], "review_status": s[7],
-                "error_message": s[8],
-                "retrieved_context": _REDACTED if REDACT_SENSITIVE else s[9],
+                "error_message": _redact(s[8]),
+                "retrieved_context": _redact(s[9]),
                 "reviewer": s[10], "review_comment": s[11], "review_reason": s[12],
                 "score_breakdown": s[13],
                 "final_decision": s[14],
@@ -473,10 +608,10 @@ def get_run(run_id: int, user: dict = Depends(require_auth)):
                 "security_flag": s[16], "security_reason": s[17],
                 "judge_status": s[18], "judge_skip_reason": s[19],
                 "reviewed_at": s[20].isoformat() if s[20] else None,
-                "tool_calls": tool_calls, "llm_calls": llm_calls,
-                "evaluation": evaluation
+                "tool_calls": tools_by_step.get(step_id, []),
+                "llm_calls": llm_by_step.get(step_id, []),
+                "evaluation": eval_by_step.get(step_id)
             })
-
 
         return {
             "id": run[0], "status": run[1],
@@ -484,6 +619,7 @@ def get_run(run_id: int, user: dict = Depends(require_auth)):
             "ended_at": run[3].isoformat() if run[3] else None,
             "input_summary": run[4],
             "total_tokens": run[5], "total_cost": float(run[6]) if run[6] else 0,
+            "cost_basis": "estimated_paid_tier",
             "resume_id": run[7], "target_role": run[8], "location": run[9],
             "work_mode": run[10], "employment_type": run[11],
             "pending_review": run[12],
@@ -495,11 +631,12 @@ def get_run(run_id: int, user: dict = Depends(require_auth)):
 
 
 @app.post("/runs/{run_id}/resume")
-def resume_run(run_id: int, decision: Decision = "Maybe", comment: str = "",
+def resume_run(run_id: int, body: ResumeRunRequest,
                user: dict = Depends(require_auth),
                _csrf: None = Depends(require_csrf)):
     """Resume a paused (waiting_for_human) run with the human's decision. The
     reviewer's identity travels with the decision into the audit trail."""
+    decision, comment = body.decision, body.comment
     _check_len("comment", comment, MAX_COMMENT_CHARS)
     conn = get_connection()
     try:

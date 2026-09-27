@@ -160,11 +160,15 @@ def ground_skills(skills, skill_evidence, resume_text):
         if skill and ev and _norm_ws(ev) in resume_norm:
             verified.setdefault(skill.lower(), {"skill": skill, "evidence": ev})
 
+    from skills import skill_in_text, text_index
+    idx_low, idx_tokens = text_index(resume_text)
+
     def _literal(skill):
-        s = _norm_ws(skill)
-        if not s:
+        # Alias-aware ("K8s" in the resume grounds a parsed "Kubernetes"), using the
+        # SAME canonical vocabulary the scorer uses — see skills.py.
+        if not _norm_ws(skill):
             return False
-        return s in resume_norm if (" " in s or "-" in s) else s in resume_tokens
+        return skill_in_text(skill, idx_low, idx_tokens)
 
     grounded, ungrounded = [], []
     for sk in skills:

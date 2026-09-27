@@ -1,9 +1,9 @@
-"""
+﻿"""
 Authorization (data-ownership) tests.
 
 Authentication proves WHO you are; these tests prove you can only reach YOUR OWN
 data. Two users each upload a resume and start a run, and we assert neither can
-read, delete, cancel, resume, or fetch rankings for the other's data — every
+read, delete, cancel, resume, or fetch rankings for the other's data â€” every
 cross-user attempt returns 404 (not 403, so existence isn't leaked).
 
 Marked `db` (needs Postgres). Skips cleanly when the DB isn't configured.
@@ -29,7 +29,7 @@ def _db_configured():
 pytestmark = [
     pytest.mark.db,
     pytest.mark.skipif(not _db_configured(),
-                       reason="Postgres env not set — ownership tests need a live DB"),
+                       reason="Postgres env not set â€” ownership tests need a live DB"),
 ]
 
 pytest.importorskip("fastapi.testclient")
@@ -44,7 +44,7 @@ def _fresh_logged_in_client():
     create_user(uname, pw, role="user")
     c = TestClient(api.app)
     # Fetch the session-bound CSRF token FIRST (like the frontend's ensureCsrf before
-    # login) and attach it, so the login POST itself carries the token — /login is no
+    # login) and attach it, so the login POST itself carries the token â€” /login is no
     # longer CSRF-exempt. Every later state-changing request also carries it, so these
     # tests exercise AUTHORIZATION rather than tripping on CSRF.
     token = c.get("/csrf").json()["csrf_token"]
@@ -85,12 +85,12 @@ def _upload_resume(c):
 
 def test_csrf_required_on_state_change():
     """A logged-in client that omits the CSRF token is rejected with 403 on a
-    state-changing request — proving the ownership tests pass because of the token the
+    state-changing request â€” proving the ownership tests pass because of the token the
     helper attaches, not because CSRF protection is off. (require_auth runs first, so
     this 403 is specifically the CSRF check, not a 401.)"""
     c = _fresh_logged_in_client()
     c.headers.pop("X-CSRF-Token", None)   # drop what the helper attached
-    r = c.post("/runs?resume_id=1&target_role=engineer")
+    r = c.post("/runs", json={"resume_id": 1, "target_role": "engineer"})
     assert r.status_code == 403, r.text
 
 
@@ -114,18 +114,18 @@ def test_user_cannot_touch_others_run():
     a = _fresh_logged_in_client()
     b = _fresh_logged_in_client()
     rid_a = _upload_resume(a)
-    run_id = a.post(f"/runs?resume_id={rid_a}&target_role=engineer").json()["run_id"]
+    run_id = a.post("/runs", json={"resume_id": rid_a, "target_role": "engineer"}).json()["run_id"]
     assert b.get(f"/runs/{run_id}").status_code == 404
     assert b.get(f"/runs/{run_id}/rankings").status_code == 404
     assert b.post(f"/runs/{run_id}/cancel").status_code == 404
-    assert b.post(f"/runs/{run_id}/resume?decision=Skip").status_code in (404, 409)
+    assert b.post(f"/runs/{run_id}/resume", json={"decision": "Skip"}).status_code in (404, 409)
     assert run_id not in {row["id"] for row in b.get("/runs").json()}
 
 
 def test_owner_can_read_own_run():
     a = _fresh_logged_in_client()
     rid_a = _upload_resume(a)
-    run_id = a.post(f"/runs?resume_id={rid_a}&target_role=engineer").json()["run_id"]
+    run_id = a.post("/runs", json={"resume_id": rid_a, "target_role": "engineer"}).json()["run_id"]
     assert a.get(f"/runs/{run_id}").status_code == 200
 
 
@@ -133,13 +133,13 @@ def test_start_run_rejects_someone_elses_resume():
     a = _fresh_logged_in_client()
     b = _fresh_logged_in_client()
     rid_a = _upload_resume(a)
-    r = b.post(f"/runs?resume_id={rid_a}&target_role=engineer")
+    r = b.post("/runs", json={"resume_id": rid_a, "target_role": "engineer"})
     assert r.status_code == 404
 
 # --- Additional coverage: unauthenticated rejection + per-endpoint splits ---
 
 def _anon_client():
-    """A client with NO session — every gated endpoint must reject it with 401."""
+    """A client with NO session â€” every gated endpoint must reject it with 401."""
     import api
     return TestClient(api.app)
 
@@ -152,9 +152,9 @@ def test_unauthenticated_requests_are_rejected():
     assert anon.get("/runs").status_code == 401
     assert anon.get("/runs/1").status_code == 401
     assert anon.get("/runs/1/rankings").status_code == 401
-    assert anon.post("/runs?resume_id=1&target_role=x").status_code == 401
+    assert anon.post("/runs", json={"resume_id": 1, "target_role": "x"}).status_code == 401
     assert anon.post("/runs/1/cancel").status_code == 401
-    assert anon.post("/runs/1/resume?decision=Skip").status_code == 401
+    assert anon.post("/runs/1/resume", json={"decision": "Skip"}).status_code == 401
     assert anon.delete("/resumes/1").status_code == 401
     # /me (identity) is also gated.
     assert anon.get("/me").status_code == 401
@@ -164,7 +164,7 @@ def test_cannot_read_others_run_detail():
     a = _fresh_logged_in_client()
     b = _fresh_logged_in_client()
     rid = _upload_resume(a)
-    run_id = a.post(f"/runs?resume_id={rid}&target_role=engineer").json()["run_id"]
+    run_id = a.post("/runs", json={"resume_id": rid, "target_role": "engineer"}).json()["run_id"]
     assert b.get(f"/runs/{run_id}").status_code == 404
 
 
@@ -172,7 +172,7 @@ def test_cannot_read_others_run_rankings():
     a = _fresh_logged_in_client()
     b = _fresh_logged_in_client()
     rid = _upload_resume(a)
-    run_id = a.post(f"/runs?resume_id={rid}&target_role=engineer").json()["run_id"]
+    run_id = a.post("/runs", json={"resume_id": rid, "target_role": "engineer"}).json()["run_id"]
     assert b.get(f"/runs/{run_id}/rankings").status_code == 404
 
 
@@ -180,7 +180,7 @@ def test_cannot_cancel_others_run():
     a = _fresh_logged_in_client()
     b = _fresh_logged_in_client()
     rid = _upload_resume(a)
-    run_id = a.post(f"/runs?resume_id={rid}&target_role=engineer").json()["run_id"]
+    run_id = a.post("/runs", json={"resume_id": rid, "target_role": "engineer"}).json()["run_id"]
     assert b.post(f"/runs/{run_id}/cancel").status_code == 404
 
 
@@ -188,14 +188,14 @@ def test_cannot_resume_others_run():
     a = _fresh_logged_in_client()
     b = _fresh_logged_in_client()
     rid = _upload_resume(a)
-    run_id = a.post(f"/runs?resume_id={rid}&target_role=engineer").json()["run_id"]
-    # 404 (can't see it) — never 200/started.
-    assert b.post(f"/runs/{run_id}/resume?decision=Skip").status_code in (404, 409)
+    run_id = a.post("/runs", json={"resume_id": rid, "target_role": "engineer"}).json()["run_id"]
+    # 404 (can't see it) â€” never 200/started.
+    assert b.post(f"/runs/{run_id}/resume", json={"decision": "Skip"}).status_code in (404, 409)
 
 
 def test_others_run_absent_from_my_run_list():
     a = _fresh_logged_in_client()
     b = _fresh_logged_in_client()
     rid = _upload_resume(a)
-    run_id = a.post(f"/runs?resume_id={rid}&target_role=engineer").json()["run_id"]
+    run_id = a.post("/runs", json={"resume_id": rid, "target_role": "engineer"}).json()["run_id"]
     assert run_id not in {row["id"] for row in b.get("/runs").json()}

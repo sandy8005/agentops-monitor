@@ -30,14 +30,22 @@ def _clean_description(raw):
 
 
 def _map_employment_type(job_type):
+    """Map Remotive's job_type to our vocabulary. An UNKNOWN or unrecognized value
+    returns "" (unknown) — never an invented "full-time". The employment-type search
+    filter is soft and already keeps unknown-type jobs, so nothing is lost by being
+    honest here."""
     jt = (job_type or "").lower().replace("_", "-").strip()
+    if not jt:
+        return ""
     if "intern" in jt:
         return "internship"
-    if "part-time" in jt:
+    if "part-time" in jt or "part time" in jt:
         return "part-time"
     if "contract" in jt or "freelance" in jt:
         return "contract"
-    return "full-time"
+    if "full-time" in jt or "full time" in jt or "permanent" in jt:
+        return "full-time"
+    return ""
 
 
 def _parse_published(value):
@@ -66,26 +74,42 @@ def _external_id(job):
 def fetch_live_jobs(role, location=None, limit=10):
     """
     Fetch live jobs from Remotive matching `role`. Returns (jobs, status, error) —
-    a CLASSIFIED status (success / empty / rate_limited / http_error /
-    network_error), mirroring the Adzuna layer so the run trace shows WHY a fetch
-    produced nothing. `location` is accepted but Remotive is remote-only, so it's
-    informational. Never raises into the agent.
+    a CLASSIFIED status, mirroring the Adzuna layer so the run trace shows WHY a
+    fetch produced nothing:
+      - "rate_limited"     : HTTP 429 (retryable)
+      - "server_error"     : HTTP 5xx — provider outage (retryable)
+      - "http_error"       : any other non-2xx
+      - "network_error"    : connection / timeout / DNS — never got an HTTP answer
+      - "invalid_response" : 2xx, but the body was not the JSON shape we expect
+      - "empty" / "success"
+    `location` is accepted but Remotive is remote-only, so it's informational.
+    Never raises into the agent.
     """
+    params = {"limit": limit}
+    if role and role.strip():
+        params["search"] = role.strip()
+    headers = {"User-Agent": "AgentOpsMonitor/1.0 (educational project)"}
     try:
-        params = {"limit": limit}
-        if role and role.strip():
-            params["search"] = role.strip()
-        headers = {"User-Agent": "AgentOpsMonitor/1.0 (educational project)"}
         resp = requests.get(REMOTIVE_API, params=params, headers=headers, timeout=20)
-        if resp.status_code == 429:
-            return ([], "rate_limited", "Remotive rate limit (HTTP 429)")
-        resp.raise_for_status()
-        raw_jobs = resp.json().get("jobs", [])[:limit]
-    except requests.exceptions.HTTPError as e:
-        return ([], "http_error", str(e))
-    except Exception as e:
-        log.warning("live fetch failed (%s) — continuing with existing pool", e)
-        return ([], "network_error", str(e))
+    except requests.exceptions.RequestException as e:
+        log.warning("remotive fetch failed (network: %s) — continuing with existing pool", e)
+        return ([], "network_error", f"network error: {e}")
+    if resp.status_code == 429:
+        return ([], "rate_limited", "Remotive rate limit (HTTP 429)")
+    if resp.status_code >= 500:
+        return ([], "server_error", f"server error: HTTP {resp.status_code}")
+    if not (200 <= resp.status_code < 300):
+        return ([], "http_error", f"http error: HTTP {resp.status_code}")
+    # The request itself SUCCEEDED from here on: a body we can't parse is a
+    # provider-response problem, not a network failure.
+    try:
+        body = resp.json()
+    except ValueError as e:
+        log.warning("remotive returned malformed JSON (%s)", e)
+        return ([], "invalid_response", f"invalid response: malformed JSON ({e})")
+    if not isinstance(body, dict) or not isinstance(body.get("jobs", []), list):
+        return ([], "invalid_response", "invalid response: unexpected JSON shape")
+    raw_jobs = [j for j in body.get("jobs", []) if isinstance(j, dict)][:limit]
 
     out = []
     for j in raw_jobs:
@@ -101,7 +125,9 @@ def fetch_live_jobs(role, location=None, limit=10):
             "location": (j.get("candidate_required_location") or "").strip(),
             "work_mode": "remote",
             "employment_type": _map_employment_type(j.get("job_type")),
-            "source": "live",
+            # Provider name, consistent with job_searches.source and Adzuna's
+            # "adzuna" — per-provider metrics are a plain GROUP BY source.
+            "source": "remotive",
             # Remotive's posting URL (the apply entry point) and publication date.
             "apply_url": (j.get("url") or "").strip() or None,
             "posted_at": _parse_published(j.get("publication_date")),

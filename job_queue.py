@@ -28,7 +28,7 @@ import json
 import socket
 import os
 import uuid
-from datetime import datetime, timedelta
+from datetime import timedelta
 
 from database import get_connection
 
@@ -52,6 +52,16 @@ def _retry_delay(attempts):
     return min(delay, RETRY_MAX_DELAY)
 
 
+# Job kinds the worker can execute. Mirrored by the job_queue_kind_chk database
+# constraint (migration 0009), so a typo can't create an unprocessable durable job
+# even if some other code path bypasses enqueue_tx.
+JOB_KINDS = frozenset({"start_run", "resume_run"})
+
+
+class UnknownJobKind(ValueError):
+    """enqueue called with a kind the worker cannot execute."""
+
+
 # ---------------------------------------------------------------- enqueue -----
 
 def enqueue_tx(cur, kind, payload, run_id=None, max_attempts=3):
@@ -62,6 +72,8 @@ def enqueue_tx(cur, kind, payload, run_id=None, max_attempts=3):
     together — a run is never left 'running'/'waiting_for_human' with no queue job.
     The caller owns the transaction (commit / rollback / close).
     """
+    if kind not in JOB_KINDS:
+        raise UnknownJobKind(f"unknown job kind {kind!r}; expected one of {sorted(JOB_KINDS)}")
     cur.execute("""
         INSERT INTO job_queue (kind, payload, run_id, status, max_attempts, enqueued_at)
         VALUES (%s, %s, %s, 'queued', %s, %s) RETURNING id
@@ -190,18 +202,19 @@ def mark_failed(job_id, error, attempts, max_attempts, lease_token, terminal=Fal
             available_at = utcnow() + timedelta(seconds=_retry_delay(attempts))
             cur.execute("""
                 UPDATE job_queue
-                SET status = 'queued', last_error = %s, claimed_at = NULL,
-                    heartbeat_at = NULL, worker_id = NULL, lease_token = NULL,
-                    available_at = %s
+                SET status = 'queued', last_error = %s, last_error_at = %s,
+                    claimed_at = NULL, heartbeat_at = NULL, worker_id = NULL,
+                    lease_token = NULL, available_at = %s
                 WHERE id = %s AND status = 'running' AND lease_token = %s
-            """, (str(error)[:2000], available_at, job_id, lease_token))
+            """, (str(error)[:2000], utcnow(), available_at, job_id, lease_token))
             outcome = "requeued" if cur.rowcount == 1 else "lost"
         else:
             cur.execute("""
                 UPDATE job_queue
-                SET status = 'failed', last_error = %s, finished_at = %s, lease_token = NULL
+                SET status = 'failed', last_error = %s, last_error_at = %s,
+                    finished_at = %s, lease_token = NULL
                 WHERE id = %s AND status = 'running' AND lease_token = %s
-            """, (str(error)[:2000], utcnow(), job_id, lease_token))
+            """, (str(error)[:2000], utcnow(), utcnow(), job_id, lease_token))
             outcome = "failed" if cur.rowcount == 1 else "lost"
         return outcome
 
@@ -257,7 +270,11 @@ def reclaim_orphans():
             UPDATE job_queue
             SET status = 'queued', claimed_at = NULL, heartbeat_at = NULL, worker_id = NULL,
                 lease_token = NULL, available_at = NULL,
-                last_error = COALESCE(last_error, '') || ' [reclaimed orphan]'
+                -- Structured bookkeeping: a counter and a REPLACED message, never an
+                -- ever-growing concatenation of markers.
+                orphan_reclaim_count = orphan_reclaim_count + 1,
+                last_error = 'worker stopped heartbeating; job reclaimed as orphan',
+                last_error_at = NOW()
             WHERE status = 'running'
               AND attempts < max_attempts
               AND (heartbeat_at IS NULL OR heartbeat_at < %s)
@@ -279,7 +296,9 @@ def reclaim_orphans():
         cur.execute("""
             UPDATE job_queue
             SET status = 'failed', finished_at = %s, lease_token = NULL,
-                last_error = COALESCE(last_error, '') || ' [orphan, out of attempts]'
+                orphan_reclaim_count = orphan_reclaim_count + 1,
+                last_error = 'worker stopped heartbeating and the job ran out of attempts',
+                last_error_at = NOW()
             WHERE status = 'running'
               AND attempts >= max_attempts
               AND (heartbeat_at IS NULL OR heartbeat_at < %s)

@@ -8,6 +8,12 @@ new. Each migration file is named NNNN_name.py and defines `def upgrade(cur):`.
 Usage:
     python migrate.py           # apply all pending migrations
     python migrate.py --status  # show applied vs pending, don't change anything
+    python migrate.py --skip-checkpointer   # app migrations only
+
+After the app migrations, LangGraph's own checkpoint tables are created/migrated
+(PostgresSaver.setup(), via checkpointing.setup_schema). That DDL used to run on
+EVERY graph start/resume; it is deployment work and now happens here (the worker
+also runs it once at startup as a safety net).
 
 Fresh install:  `python migrate.py` on an EMPTY database applies 0001_baseline and
                 every later migration — this is the only supported way to build the
@@ -117,8 +123,21 @@ def migrate():
     print("All migrations applied.")
 
 
+def setup_checkpointer():
+    """Create/upgrade LangGraph's checkpoint tables (idempotent)."""
+    try:
+        from checkpointing import setup_schema
+        setup_schema()
+        print("LangGraph checkpoint schema is up to date.")
+    except Exception as e:
+        print(f"  FAILED LangGraph checkpoint setup: {e}")
+        sys.exit(1)
+
+
 if __name__ == "__main__":
     if "--status" in sys.argv:
         status()
     else:
         migrate()
+        if "--skip-checkpointer" not in sys.argv:
+            setup_checkpointer()

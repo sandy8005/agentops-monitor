@@ -7,8 +7,8 @@ AI Engineer jobs in Texas. Free tier; requires ADZUNA_APP_ID + ADZUNA_APP_KEY
 in .env. Same fetch → normalize → dedup → upsert shape as live_jobs.py.
 """
 import hashlib
+import time
 import requests
-from datetime import datetime
 from settings import settings
 from logging_config import get_logger
 log = get_logger(__name__)
@@ -46,6 +46,18 @@ def _infer_employment_type(contract_time, contract_type):
     return ""   # no signal → unknown, not a guessed full-time
 
 
+def _parse_created(value):
+    """Adzuna 'created' (e.g. '2026-09-20T14:03:11Z') -> aware UTC datetime, or None."""
+    if not value:
+        return None
+    from datetime import datetime, timezone
+    try:
+        dt = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+
 def fetch_adzuna_jobs(role, location=None, limit=10):
     """
     Fetch REAL jobs from Adzuna matching role + location.
@@ -55,7 +67,9 @@ def fetch_adzuna_jobs(role, location=None, limit=10):
       - "missing_keys"  : ADZUNA_APP_ID / ADZUNA_APP_KEY not configured
       - "auth_error"    : HTTP 401/403 — bad/expired credentials
       - "rate_limited"  : HTTP 429 — quota exhausted (retry later)
+      - "server_error"  : HTTP 5xx — provider outage (retryable)
       - "http_error"    : any other non-2xx HTTP response
+      - "invalid_response": 2xx, but the body is not the expected JSON
       - "network_error" : connection/timeout/DNS — never reached the API
       - "empty"         : API responded OK but returned zero postings
       - "success"       : one or more postings returned
@@ -94,18 +108,25 @@ def fetch_adzuna_jobs(role, location=None, limit=10):
         msg = "rate limited: HTTP 429"
         log.warning("Adzuna %s — quota exhausted, try later", msg)
         return ([], "rate_limited", msg)
+    if resp.status_code >= 500:
+        msg = f"server error: HTTP {resp.status_code}"
+        log.warning("Adzuna %s — continuing with existing pool", msg)
+        return ([], "server_error", msg)
     if not resp.ok:
         msg = f"http error: HTTP {resp.status_code}"
         log.warning("Adzuna %s — continuing with existing pool", msg)
         return ([], "http_error", msg)
 
     try:
-        raw_jobs = resp.json().get("results", [])[:limit]
+        body = resp.json()
     except ValueError as e:
-        # 2xx but unparseable body — treat as an HTTP-level problem, not "empty".
-        msg = f"http error: bad JSON ({e})"
+        # 2xx but unparseable body — the request worked; the RESPONSE is bad.
+        msg = f"invalid response: malformed JSON ({e})"
         log.warning("Adzuna %s — continuing with existing pool", msg)
-        return ([], "http_error", msg)
+        return ([], "invalid_response", msg)
+    if not isinstance(body, dict) or not isinstance(body.get("results", []), list):
+        return ([], "invalid_response", "invalid response: unexpected JSON shape")
+    raw_jobs = [j for j in body.get("results", []) if isinstance(j, dict)][:limit]
 
     out = []
     for j in raw_jobs:
@@ -125,7 +146,7 @@ def fetch_adzuna_jobs(role, location=None, limit=10):
             "employment_type": _infer_employment_type(
                 j.get("contract_time"), j.get("contract_type")),
             "source": "adzuna",
-            "posted_at": j.get("created"),   # Adzuna's posting timestamp (ISO string)
+            "posted_at": _parse_created(j.get("created")),   # aware UTC datetime or None
             "apply_url": j.get("redirect_url"),
         })
 
@@ -143,94 +164,33 @@ def _get_connection():
 
 def upsert_adzuna_jobs(jobs, conn=None):
     """
-    Insert jobs not already in the pool (dedup on external_id); refresh last_seen_at
-    on ones already known. No longer writes a permanent search_location onto the row
-    — the job↔search↔location tie now lives in job_search_results (see job_search.py).
-
-    Returns (inserted, skipped, job_ids) where job_ids are the job_postings.id of
-    EVERY posting touched (inserted or updated), in input order — the caller uses
-    these to associate the postings to the search that produced them.
-
-    Reuses an open connection when given one so fetch+associate is one transaction.
+    Upsert Adzuna postings through the SHARED persistence path
+    (job_persistence.upsert_postings) — the same code Remotive uses, so both live
+    providers get identical freshness semantics (fetched_at / last_seen_at /
+    posted_at / apply_url) and timezone-aware UTC timestamps. Returns
+    (inserted, skipped, job_ids).
     """
-    if not jobs:
-        return (0, 0, [])
-    own = conn is None
-    if own:
-        conn = _get_connection()
-    cur = conn.cursor()
-    now = datetime.now()
-    inserted = 0
-    job_ids = []
-    for j in jobs:
-        cur.execute("""
-            INSERT INTO job_postings
-            (title, company, description, location, work_mode, employment_type,
-             source, external_id, fetched_at, last_seen_at, posted_at, apply_url)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (external_id) WHERE external_id IS NOT NULL
-            DO UPDATE SET
-                -- Refresh mutable fields from the newest fetch, but NEVER overwrite
-                -- an existing good value with a blank/NULL one. NULLIF(...,'') turns
-                -- an empty incoming string into NULL so COALESCE falls back to the
-                -- stored value; a non-empty incoming value wins.
-                title           = COALESCE(NULLIF(EXCLUDED.title, ''),          job_postings.title),
-                company         = COALESCE(NULLIF(EXCLUDED.company, ''),        job_postings.company),
-                description     = COALESCE(NULLIF(EXCLUDED.description, ''),    job_postings.description),
-                location        = COALESCE(NULLIF(EXCLUDED.location, ''),       job_postings.location),
-                work_mode       = COALESCE(NULLIF(EXCLUDED.work_mode, ''),      job_postings.work_mode),
-                employment_type = COALESCE(NULLIF(EXCLUDED.employment_type, ''),job_postings.employment_type),
-                posted_at       = COALESCE(EXCLUDED.posted_at,                  job_postings.posted_at),
-                apply_url       = COALESCE(NULLIF(EXCLUDED.apply_url, ''),      job_postings.apply_url),
-                -- last_seen_at always advances to the newest sighting; fetched_at
-                -- is left untouched so it keeps the ORIGINAL first-seen time.
-                last_seen_at    = EXCLUDED.last_seen_at
-            RETURNING id, (xmax = 0) AS was_inserted
-        """, (j["title"], j["company"], j["description"], j["location"],
-              j["work_mode"], j["employment_type"], j["source"], j["external_id"],
-              now, now, j.get("posted_at"), j.get("apply_url")))
-        row = cur.fetchone()
-        job_ids.append(row[0])
-        if row[1]:                 # xmax = 0 → this row was a fresh INSERT, not an UPDATE
-            inserted += 1
-    if own:
-        conn.commit()
-        cur.close()
-        conn.close()
-    return (inserted, len(jobs) - inserted, job_ids)
+    from job_persistence import upsert_postings
+    return upsert_postings(jobs, conn=conn)
 
 
 def _log_adzuna_call(run_id, step_id, role, location, latency_ms,
                      fetched, inserted, duplicates, status, error_message):
     """
-    Write an AgentOps trace row for the Adzuna external API call — so its latency,
-    jobs returned, inserts, duplicates, and errors are observed like every other
-    tool. No-op if run_id/step_id aren't provided (e.g. standalone CLI use).
+    Write an AgentOps trace row for the Adzuna external API call through the SHARED
+    llm.log_tool_call(), so it is tagged with the run's execution attempt and uses
+    UTC timestamps exactly like every other tool call. No-op without run/step ids
+    (standalone CLI use). Never lets trace logging break the run.
     """
     if run_id is None or step_id is None:
         return
     try:
-        import json
-        from datetime import datetime
-        from llm import get_connection
-        conn = get_connection()
-        cur = conn.cursor()
-        input_json = json.dumps({"role": role, "location": location})
-        output_json = json.dumps({
-            "fetched": fetched, "inserted": inserted, "duplicates": duplicates,
-        })
-        cur.execute("""
-            INSERT INTO tool_calls
-            (run_id, step_id, tool_name, input_json, output_json, latency_ms,
-             status, error_message, created_at, operation_name)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        """, (run_id, step_id, "adzuna_fetch", input_json, output_json, latency_ms,
-              status, error_message, datetime.now(), "live_fetch"))
-        conn.commit()
-        cur.close()
-        conn.close()
+        from llm import log_tool_call
+        log_tool_call(run_id, step_id, "adzuna_fetch", {"role": role, "location": location},
+                      {"fetched": fetched, "inserted": inserted, "duplicates": duplicates,
+                       "location_filter_applied": bool(location and location.strip())},
+                      latency_ms, status, error_message, "live_fetch")
     except Exception as log_err:
-        # Never let trace-logging break the run.
         log.warning("adzuna trace log failed: %s", log_err)
 
 
@@ -242,7 +202,6 @@ def fetch_and_upsert_adzuna(role, location=None, limit=10, run_id=None, step_id=
     than collapsing every non-result into "empty", so the trace shows WHY a fetch
     produced nothing. Returns (inserted, skipped, status).
     """
-    import time
     from job_search import create_search, associate_jobs
     start = time.time()
     status = "success"

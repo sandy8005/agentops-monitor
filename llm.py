@@ -1,7 +1,7 @@
 from timeutil import utcnow
 import time
 import random
-from datetime import datetime
+import uuid
 from database import get_connection
 from google import genai
 import json
@@ -14,13 +14,26 @@ log = get_logger(__name__)
 # Gemini call fails fast (raises) instead of hanging forever — the retry/backoff in
 # logged_llm_call then engages, and if it keeps failing the job degrades to the
 # rule-based fallback rather than freezing the whole run.
-client = genai.Client(
-    api_key=settings.gemini_api_key,
-    http_options={"timeout": 30_000},   # 30 seconds, in ms
-)
+#
+# The client is created LAZILY (first real call), so importing llm — which most
+# modules and tests do — never requires GEMINI_API_KEY.
+_client = None
 
-INPUT_TOKEN_RATE = 0.075 / 1_000_000
-OUTPUT_TOKEN_RATE = 0.30 / 1_000_000
+
+def get_client():
+    global _client
+    if _client is None:
+        _client = genai.Client(
+            api_key=settings.gemini_api_key,
+            http_options={"timeout": 30_000},   # 30 seconds, in ms
+        )
+    return _client
+
+
+class InvalidProviderResponse(RuntimeError):
+    """The provider returned a response without the fields we need (no text, no
+    usage metadata) — typically a blocked / safety-filtered / truncated response.
+    Not transient: retrying the same prompt yields the same block."""
 
 
 class BudgetExceeded(Exception):
@@ -42,20 +55,41 @@ def fake_llm(prompt):
 
 
 def real_llm_once(prompt):
-    """Single LLM attempt — no retry. Raises on failure. Retry lives in logged_llm_call."""
-    response = client.models.generate_content(
+    """Single LLM attempt — no retry. Raises on failure. Retry lives in logged_llm_call.
+
+    Defensive about the SDK response shape: a blocked or abnormal response can have
+    text=None, usage_metadata=None, or None token counts. Those become an explicit
+    InvalidProviderResponse here instead of a confusing None.strip() far downstream.
+    Missing token counts are recorded as 0 (the call still happened)."""
+    response = get_client().models.generate_content(
         model=settings.gemini_model, contents=prompt
     )
-    usage = response.usage_metadata
+    text = getattr(response, "text", None)
+    if not isinstance(text, str) or not text.strip():
+        reason = None
+        try:
+            fb = getattr(response, "prompt_feedback", None)
+            reason = getattr(fb, "block_reason", None)
+            if reason is None:
+                cands = getattr(response, "candidates", None) or []
+                reason = getattr(cands[0], "finish_reason", None) if cands else None
+        except Exception:
+            reason = None
+        raise InvalidProviderResponse(
+            f"provider returned no text (block/finish reason: {reason or 'unknown'})")
+    usage = getattr(response, "usage_metadata", None)
+    prompt_tokens = getattr(usage, "prompt_token_count", None) if usage else None
+    completion_tokens = getattr(usage, "candidates_token_count", None) if usage else None
     request_id = None
     try:
         request_id = getattr(response, "response_id", None) or getattr(response, "_request_id", None)
     except Exception:
         request_id = None
     return {
-        "text": response.text,
-        "prompt_tokens": usage.prompt_token_count,
-        "completion_tokens": usage.candidates_token_count,
+        "text": text,
+        "prompt_tokens": int(prompt_tokens or 0),
+        "completion_tokens": int(completion_tokens or 0),
+        "usage_missing": usage is None or prompt_tokens is None or completion_tokens is None,
         "provider_request_id": request_id
     }
 
@@ -303,7 +337,15 @@ def finish_run(run_id, status="success", stop_reason=None, error_code=None):
 
 def _log_llm_attempt(run_id, step_id, operation, prompt, response_text,
                      prompt_tokens, completion_tokens, latency_ms, cost,
-                     status, error_message, attempt_number, retry_count, provider_request_id):
+                     status, error_message, attempt_number, retry_count, provider_request_id,
+                     logical_call_id=None, pricing_version=None):
+    """One llm_calls row per HTTP attempt. Three counters make retries explainable
+    in the Monitor ("why did this run call Gemini 11 times?"):
+      logical_call_id  groups every HTTP attempt of ONE logical LLM call;
+      attempt_number   which HTTP attempt this is within that logical call;
+      run_attempt      which worker execution attempt of the RUN wrote it.
+    cost_usd is the ESTIMATED paid-tier cost (pricing.py), stamped with the model
+    and pricing_version so it stays interpretable after prices change."""
     with get_connection() as conn:
         cur = conn.cursor()
         cur.execute("""
@@ -311,14 +353,14 @@ def _log_llm_attempt(run_id, step_id, operation, prompt, response_text,
             (run_id, step_id, model, prompt, response,
              prompt_tokens, completion_tokens, latency_ms, cost_usd, created_at,
              status, error_message, operation_name, attempt_number, retry_count, provider_request_id,
-             run_attempt)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+             logical_call_id, pricing_version, run_attempt)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
                     (SELECT attempt FROM runs WHERE id = %s))
         """, (
             run_id, step_id, settings.gemini_model, prompt, response_text,
             prompt_tokens, completion_tokens, latency_ms, cost, utcnow(),
             status, error_message, operation, attempt_number, retry_count, provider_request_id,
-            run_id
+            logical_call_id, pricing_version, run_id
         ))
 
 
@@ -348,6 +390,8 @@ def _backoff_seconds(attempt, exc=None):
 
 def logged_llm_call(prompt, run_id, step_id, operation="llm_call",
                     max_retries=LLM_HTTP_MAX_ATTEMPTS, budget=None):
+    from pricing import estimate_cost
+    logical_call_id = str(uuid.uuid4())
     last_error = None
     for attempt in range(1, max_retries + 1):
         # Budget enforced HERE at the true unit (one HTTP attempt); retries count.
@@ -362,12 +406,17 @@ def logged_llm_call(prompt, run_id, step_id, operation="llm_call",
             latency_ms = int((time.time() - start) * 1000)
             prompt_tokens = result["prompt_tokens"]
             completion_tokens = result["completion_tokens"]
-            cost = (prompt_tokens * INPUT_TOKEN_RATE +
-                    completion_tokens * OUTPUT_TOKEN_RATE)
+            cost, pricing_version = estimate_cost(settings.gemini_model,
+                                                  prompt_tokens, completion_tokens)
+            if result.get("usage_missing"):
+                log.warning("llm %s: provider response had no usage metadata — "
+                            "tokens/cost recorded as 0", operation,
+                            extra={"run_id": run_id, "step_id": step_id})
             _log_llm_attempt(
                 run_id, step_id, operation, prompt, result["text"],
                 prompt_tokens, completion_tokens, latency_ms, cost,
-                "success", None, attempt, attempt - 1, result.get("provider_request_id")
+                "success", None, attempt, attempt - 1, result.get("provider_request_id"),
+                logical_call_id=logical_call_id, pricing_version=pricing_version,
             )
             return result["text"]
         except BudgetExceeded:
@@ -380,7 +429,8 @@ def logged_llm_call(prompt, run_id, step_id, operation="llm_call",
             _log_llm_attempt(
                 run_id, step_id, operation, prompt, None,
                 0, 0, latency_ms, 0,
-                "failed", str(e), attempt, attempt - 1, None
+                "failed", str(e), attempt, attempt - 1, None,
+                logical_call_id=logical_call_id,
             )
             if attempt == max_retries or not transient:
                 raise

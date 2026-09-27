@@ -91,4 +91,7 @@ def extract_requirements_rule_based(job):
         "preferred_skills": _uniq(preferred),
         "min_years_experience": _years_from_text(text_lower),
         "responsibilities": [],
+        # Provenance travels WITH the data, so downstream evaluation can always tell
+        # a crude keyword extraction from an LLM extraction.
+        "extraction_method": "rule_based",
     }

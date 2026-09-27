@@ -65,13 +65,13 @@ def test_logout_requires_csrf():
 def test_closed_vocabularies_are_enforced():
     c, uid = _client()
     rid = _resume(uid)
-    bad = c.post(f"/runs?resume_id={rid}&target_role=engineer&work_mode=whatever-I-want")
+    bad = c.post("/runs", json={"resume_id": rid, "target_role": "engineer", "work_mode": "whatever-I-want"})
     assert bad.status_code == 422
-    bad = c.post(f"/runs?resume_id={rid}&target_role=engineer&employment_type=gig")
+    bad = c.post("/runs", json={"resume_id": rid, "target_role": "engineer", "employment_type": "gig"})
     assert bad.status_code == 422
-    assert c.post("/runs/1/resume?decision=Definitely").status_code == 422
-    ok = c.post(f"/runs?resume_id={rid}&target_role=engineer&work_mode=remote"
-                f"&employment_type=full-time")
+    assert c.post("/runs/1/resume", json={"decision": "Definitely"}).status_code == 422
+    ok = c.post("/runs", json={"resume_id": rid, "target_role": "engineer",
+                               "work_mode": "remote", "employment_type": "full-time"})
     assert ok.status_code == 200
 
 
@@ -118,7 +118,7 @@ def test_resume_review_payload_carries_reviewer_identity():
         cur.execute("INSERT INTO runs (status, input_summary, user_id, resume_id) "
                     "VALUES ('waiting_for_human', 't', %s, %s) RETURNING id", (uid, rid))
         run_id = cur.fetchone()[0]
-    assert c.post(f"/runs/{run_id}/resume?decision=Apply&comment=ok").status_code == 200
+    assert c.post(f"/runs/{run_id}/resume", json={"decision": "Apply", "comment": "ok"}).status_code == 200
     with get_connection() as conn:
         cur = conn.cursor()
         cur.execute("SELECT payload FROM job_queue WHERE run_id = %s", (run_id,))
@@ -132,7 +132,7 @@ def test_resume_review_payload_carries_reviewer_identity():
 def _remotive_job(ext):
     return {"external_id": ext, "title": "Python Engineer", "company": "Remote Co",
             "description": "Python role", "location": "Worldwide", "work_mode": "remote",
-            "employment_type": "full-time", "source": "live",
+            "employment_type": "full-time", "source": "remotive",
             "apply_url": "https://remotive.com/remote-jobs/software-dev/python-engineer-1",
             "posted_at": None}
 
@@ -184,7 +184,7 @@ def test_live_posting_without_last_seen_is_not_fresh_forever():
     with get_connection() as conn:
         conn.cursor().execute(
             "INSERT INTO job_postings (title, company, description, source, external_id) "
-            "VALUES (%s, 'X', 'zyxwv role', 'live', %s)", (title, "remotive:" + uuid.uuid4().hex))
+            "VALUES (%s, 'X', 'zyxwv role', 'remotive', %s)", (title, "remotive:" + uuid.uuid4().hex))
     assert not [j for j in search_jobs("zyxwv") if j["title"] == title]
 
 

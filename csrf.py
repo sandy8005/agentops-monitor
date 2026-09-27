@@ -15,12 +15,13 @@ approach for a stateful app and removes the independent unsigned cookie entirely
   2. The frontend echoes it in 'X-CSRF-Token' on POST/PUT/PATCH/DELETE.
   3. require_csrf compares the header to the session token (constant-time).
 
-Exemptions: safe methods (GET/HEAD/OPTIONS) and POST /login only. Login necessarily
-runs before any session or token exists and is protected by rate limiting instead.
-Logout is NOT exempt — by then the client holds a token, and an attacker-forced
-logout should be rejected like any other state-changing request. The token lifetime
-is the session's (it's stored in the session), so there is no separate max_age to keep
-in sync with settings.session_max_age.
+Exemptions: safe methods (GET/HEAD/OPTIONS) ONLY. No path is exempt
+(_EXEMPT_PATHS is empty): /login is protected too — the frontend fetches GET /csrf
+before signing in, which mints a token into the pre-login session, so login-CSRF
+(an attacker silently signing the victim into the attacker's account) is blocked.
+Logout is protected as well, so a cross-site page can't force a logout. The token
+lifetime is the session's (it's stored in the session), so there is no separate
+max_age to keep in sync with settings.session_max_age.
 """
 import secrets
 from fastapi import Request, HTTPException

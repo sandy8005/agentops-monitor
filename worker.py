@@ -49,7 +49,36 @@ TERMINAL_FAILURE = "terminal_failure"
 # QUOTA does not recover on a 10-40s backoff, so it is terminal (retrying would only
 # burn attempts). Everything else (bad input, parse failure, budget, cancel) is
 # terminal too.
-RETRYABLE_ERROR_CODES = {ErrorCode.LLM_UNAVAILABLE, ErrorCode.LLM_RATE_LIMITED}
+RETRYABLE_ERROR_CODES = {ErrorCode.LLM_UNAVAILABLE, ErrorCode.LLM_RATE_LIMITED,
+                         # An Adzuna/Remotive rate limit or outage is recoverable too;
+                         # bad credentials / malformed responses are not.
+                         ErrorCode.JOB_SOURCE_RATE_LIMITED, ErrorCode.JOB_SOURCE_UNAVAILABLE}
+# Log a repeating background failure (heartbeat, orphan sweep) at most this often,
+# so a DB outage leaves a diagnostic trail without flooding the log.
+WARN_EVERY_SECONDS = 60.0
+
+
+class _RateLimitedWarner:
+    """Emit the first warning immediately, then at most one per interval, reporting
+    how many failures were suppressed in between."""
+
+    def __init__(self, interval=WARN_EVERY_SECONDS):
+        self.interval = interval
+        self._last = 0.0
+        self._suppressed = 0
+        self._lock = threading.Lock()
+
+    def warn(self, msg, *args, **kwargs):
+        with self._lock:
+            now = time.time()
+            if now - self._last < self.interval:
+                self._suppressed += 1
+                return
+            suppressed, self._suppressed, self._last = self._suppressed, 0, now
+        if suppressed:
+            msg = msg + " (%d similar failure(s) suppressed)"
+            args = args + (suppressed,)
+        log.warning(msg, *args, **kwargs)
 
 # How long to wait before re-offering a job whose run is still locked by another
 # worker (not counted as an attempt).
@@ -208,6 +237,7 @@ def _process_locked(job, lock):
     stop = threading.Event()
     lost_lease = threading.Event()
     lease = job["lease_token"]
+    hb_warner = _RateLimitedWarner()
 
     def _lose(reason):
         lost_lease.set()
@@ -230,8 +260,15 @@ def _process_locked(job, lock):
                                 "this worker will stop touching the queue record",
                                 job["id"], extra={"run_id": job["run_id"]})
                     return
-            except Exception:
-                pass  # heartbeat failure shouldn't kill the job
+            except Exception as e:
+                # A transient heartbeat failure must not kill the job — but it MUST be
+                # visible: a DB problem that keeps heartbeats failing makes the job
+                # look stale and triggers orphan recovery, and this is the trail
+                # that explains why.
+                hb_warner.warn("job %s: heartbeat failed (%s: %s) — will retry; "
+                               "job may be reclaimed as an orphan if this persists",
+                               job["id"], type(e).__name__, e,
+                               extra={"run_id": job["run_id"]})
 
     beat = threading.Thread(target=_beat, daemon=True)
     beat.start()
@@ -285,6 +322,14 @@ def _process_locked(job, lock):
 
 def main():
     log.info("worker %s starting", job_queue.WORKER_ID)
+    # LangGraph checkpoint schema: normally created by `python migrate.py`; run once
+    # here as a safety net — NOT on every graph execution (it's DDL).
+    try:
+        from checkpointing import setup_schema
+        setup_schema()
+    except Exception as e:
+        log.error("langgraph checkpoint schema setup failed: %s", e)
+    sweep_warner = _RateLimitedWarner()
     # Startup orphan recovery: a previous worker may have died mid-job.
     try:
         n = job_queue.reclaim_orphans()
@@ -310,9 +355,12 @@ def main():
             # Periodic orphan sweep (in case a sibling worker died).
             if time.time() - last_sweep > ORPHAN_SWEEP_INTERVAL:
                 try:
-                    job_queue.reclaim_orphans()
-                except Exception:
-                    pass
+                    n = job_queue.reclaim_orphans()
+                    if n:
+                        log.info("orphan sweep reclaimed %s job(s)", n)
+                except Exception as e:
+                    sweep_warner.warn("periodic orphan sweep failed (%s: %s)",
+                                      type(e).__name__, e)
                 last_sweep = time.time()
 
             job = job_queue.claim_next()

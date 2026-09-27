@@ -89,20 +89,26 @@ def test_rate_limited_429(monkeypatch):
     jobs, status, err = adzuna_jobs.fetch_adzuna_jobs("ai")
     assert jobs == [] and status == "rate_limited"
 
-def test_http_error_500(monkeypatch):
-    _patch_get(monkeypatch, _FakeResp(status_code=500))
+def test_http_error_400(monkeypatch):
+    _patch_get(monkeypatch, _FakeResp(status_code=400))
     jobs, status, err = adzuna_jobs.fetch_adzuna_jobs("ai")
     assert jobs == [] and status == "http_error"
+
+def test_server_error_500_is_distinct(monkeypatch):
+    _patch_get(monkeypatch, _FakeResp(status_code=500))
+    jobs, status, err = adzuna_jobs.fetch_adzuna_jobs("ai")
+    assert jobs == [] and status == "server_error"
 
 def test_network_error(monkeypatch):
     _patch_get(monkeypatch, exc=requests.exceptions.ConnectionError("boom"))
     jobs, status, err = adzuna_jobs.fetch_adzuna_jobs("ai")
     assert jobs == [] and status == "network_error"
 
-def test_bad_json_is_http_error(monkeypatch):
+def test_bad_json_is_invalid_response(monkeypatch):
+    # The HTTP request succeeded; the BODY is broken — that is not an http_error.
     _patch_get(monkeypatch, _FakeResp(status_code=200, raise_json=True))
     jobs, status, err = adzuna_jobs.fetch_adzuna_jobs("ai")
-    assert jobs == [] and status == "http_error"
+    assert jobs == [] and status == "invalid_response"
 
 def test_empty_when_ok_but_no_results(monkeypatch):
     _patch_get(monkeypatch, _FakeResp(status_code=200, json_data={"results": []}))
@@ -126,6 +132,8 @@ def test_success_returns_jobs(monkeypatch):
     assert j["external_id"] == "adzuna:123"
     assert j["employment_type"] == "full-time"
     assert j["apply_url"] == "https://adzuna.example/123"
+    # posted_at is parsed to a timezone-aware UTC datetime
+    assert j["posted_at"] is not None and j["posted_at"].tzinfo is not None
 
 def test_success_but_unknown_employment_type(monkeypatch):
     # A job with NO contract signal keeps employment_type "" (unknown), not full-time.

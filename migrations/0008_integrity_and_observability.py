@@ -30,8 +30,13 @@ timestamp to TIMESTAMPTZ. Idempotent: safe to re-run.
   Indexes for steps/llm_calls/tool_calls/evaluations/job_queue access paths —
   PostgreSQL does NOT index referencing FK columns automatically.
 
-  TIMESTAMPTZ: existing naive values are interpreted in the session TimeZone (the
-  app wrote datetime.now(), i.e. server-local time), then stored as absolute time.
+  TIMESTAMPTZ: existing naive values were written with datetime.now(), i.e. in the
+  APPLICATION SERVER's local zone. They are interpreted in LEGACY_TIMESTAMP_TZ
+  (falling back to the DB session TimeZone, with a warning), then stored as
+  absolute time.
+
+  Uniqueness constraints are REQUIRED: duplicate legacy rows are remediated and
+  the constraint added, or the migration fails and is not recorded as applied.
 """
 
 # Tables owned by this app (LangGraph's checkpoint tables are left alone).
@@ -70,16 +75,79 @@ def _add_constraint(cur, table, name, definition):
         print(f"  WARNING: {name} added but NOT validated (existing rows violate it): {e}")
 
 
+# How to remediate duplicate legacy rows before a UNIQUE constraint is added:
+# (table, constraint) -> "keep the row with the lowest/highest id in each group".
+# run_rankings keeps its FIRST row per key (the original ranking position); for
+# run_advice the NEWEST row is the one the app would have shown.
+_DEDUP_KEEP = {
+    "run_rankings_run_pos_uniq": "min",
+    "run_rankings_run_job_uniq": "min",
+    "run_advice_run_job_uniq": "max",
+}
+
+
+def _remove_duplicates(cur, table, name, cols):
+    """Delete duplicate rows for `cols`, keeping one per group (see _DEDUP_KEEP).
+    Rows whose key contains NULL are never duplicates for a UNIQUE constraint and are
+    left alone. Returns the number of rows removed."""
+    keep = _DEDUP_KEEP.get(name, "min")
+    col_list = [c.strip() for c in cols.split(",")]
+    not_null = " AND ".join(f"{c} IS NOT NULL" for c in col_list)
+    cur.execute(f"""
+        DELETE FROM {table} t
+        USING (
+            SELECT {cols}, {keep}(id) AS keep_id
+            FROM {table} WHERE {not_null}
+            GROUP BY {cols} HAVING count(*) > 1
+        ) d
+        WHERE {" AND ".join(f"t.{c} = d.{c}" for c in col_list)}
+          AND t.id <> d.keep_id
+    """)
+    return cur.rowcount
+
+
 def _add_unique(cur, table, name, cols):
+    """
+    Add a UNIQUE constraint — and GUARANTEE it exists when this returns.
+
+    Uniqueness is an invariant, so it is never silently skipped: duplicate legacy
+    rows are REMEDIATED first (deterministically, see _DEDUP_KEEP), then the
+    constraint is added. If it still can't be added, the exception propagates and
+    migrate.py rolls the whole migration back WITHOUT recording it as applied — so
+    two databases that both report "0008 applied" really do have the same schema.
+    """
     if _constraint_exists(cur, name):
         return
-    cur.execute("SAVEPOINT u")
-    try:
-        cur.execute(f"ALTER TABLE {table} ADD CONSTRAINT {name} UNIQUE ({cols})")
-        cur.execute("RELEASE SAVEPOINT u")
-    except Exception as e:
-        cur.execute("ROLLBACK TO SAVEPOINT u")
-        print(f"  WARNING: could not add {name} (duplicate legacy rows?): {e}")
+    removed = _remove_duplicates(cur, table, name, cols)
+    if removed:
+        print(f"  {name}: removed {removed} duplicate legacy row(s) from {table}")
+    cur.execute(f"ALTER TABLE {table} ADD CONSTRAINT {name} UNIQUE ({cols})")
+
+
+def _legacy_timezone(cur):
+    """
+    The time zone the legacy NAIVE timestamps were WRITTEN in.
+
+    Old code wrote datetime.now() — the APPLICATION SERVER's local zone, which is
+    not necessarily the database session's TimeZone. Set LEGACY_TIMESTAMP_TZ (an
+    IANA name such as 'America/Detroit' or 'UTC') to the zone the app servers ran
+    in; without it the session TimeZone is assumed and a warning is printed.
+    The value is validated against pg_timezone_names so a typo fails the migration
+    instead of silently shifting every historical timestamp.
+    """
+    import os
+    tz = (os.getenv("LEGACY_TIMESTAMP_TZ") or "").strip()
+    if not tz:
+        cur.execute("SELECT current_setting('TimeZone')")
+        tz = cur.fetchone()[0]
+        print(f"  WARNING: LEGACY_TIMESTAMP_TZ not set — interpreting legacy naive "
+              f"timestamps in the DB session zone '{tz}'. If the app servers ran in "
+              f"a different zone, set LEGACY_TIMESTAMP_TZ before migrating.")
+        return tz
+    cur.execute("SELECT 1 FROM pg_timezone_names WHERE name = %s", (tz,))
+    if cur.fetchone() is None:
+        raise ValueError(f"LEGACY_TIMESTAMP_TZ={tz!r} is not a valid time zone name")
+    return tz
 
 
 def upgrade(cur):
@@ -141,10 +209,13 @@ def upgrade(cur):
         WHERE table_schema = 'public' AND data_type = 'timestamp without time zone'
           AND table_name = ANY(%s)
     """, (list(_APP_TABLES),))
-    for table, col in cur.fetchall():
-        cur.execute(
-            f"ALTER TABLE {table} ALTER COLUMN {col} TYPE TIMESTAMPTZ "
-            f"USING {col} AT TIME ZONE current_setting('TimeZone')")
+    naive_columns = cur.fetchall()
+    if naive_columns:
+        legacy_tz = _legacy_timezone(cur)
+        for table, col in naive_columns:
+            cur.execute(
+                f"ALTER TABLE {table} ALTER COLUMN {col} TYPE TIMESTAMPTZ "
+                f"USING {col} AT TIME ZONE %s", (legacy_tz,))
 
     # ------------------------------------------------------------ constraints --
     # Foreign keys the application relied on but the database didn't enforce.

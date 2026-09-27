@@ -18,7 +18,7 @@
       <label>Password</label>
       <input type="password" id="loginPass" autocomplete="current-password">
       <div style="margin-top:14px;">
-        <button id="loginBtn" onclick="doLogin()">Sign in</button>
+        <button id="loginBtn" data-action="doLogin">Sign in</button>
       </div>
       <div id="loginMsg" class="err"></div>
     </div>
@@ -26,7 +26,7 @@
     <div id="appRoot" style="display:none;">
       <div style="text-align:right; margin-bottom:8px;">
         <span id="whoami" class="note"></span>
-        <button class="btn-sm btn-reject" style="margin-left:8px;" onclick="doLogout()">Sign out</button>
+        <button class="btn-sm btn-reject" style="margin-left:8px;" data-action="doLogout">Sign out</button>
       </div>
 
     <div class="section-title">Upload a Resume <span class="note">— the document only; you set search options when you run it</span></div>
@@ -36,12 +36,12 @@
       <label>Resume label (optional)</label>
       <input type="text" id="resumeName" placeholder="e.g. Backend-focused resume">
       <div style="margin-top:14px;">
-        <button id="uploadBtn" onclick="uploadResume()">&#9654; Upload Resume</button>
+        <button id="uploadBtn" data-action="uploadResume">&#9654; Upload Resume</button>
       </div>
       <div id="uploadMsg" class="err"></div>
     </div>
 
-    <div class="section-title">Saved Resumes <span class="note">— pick one, set this search's options, and run. One resume, many searches. Location is informational only; it doesn't filter or score.</span></div>
+    <div class="section-title">Saved Resumes <span class="note">— pick one, set this search's options, and run. One resume, many searches. Location filters Adzuna results; remote-only sources (Remotive) ignore it except to drop postings whose stated candidate region clearly excludes it. Location never affects the score.</span></div>
     <div id="resumeLibrary"></div>
 
     <div id="graphReviews"></div>

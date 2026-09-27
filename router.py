@@ -13,6 +13,9 @@ import hashlib
 import json
 from datetime import timedelta
 
+from settings import settings
+from error_codes import ErrorCode
+
 from parser import parse_resume
 from job_source import search_jobs
 from job_parser import extract_requirements
@@ -34,10 +37,12 @@ def _hash(text):
     return hashlib.sha256((text or "").encode("utf-8")).hexdigest()[:16]
 
 
-def _resume_cache_key(resume_text):
-    """Versioned parse-cache key: text + parser/schema/model version, so a prompt,
-    schema, or model change makes old cached parses unreachable (never served stale)."""
-    return _hash(f"{resume_text}|{parse_cache_version()}")
+def resume_content_hash(resume_text):
+    """STABLE content identity of a resume: sha256 of the text, independent of any
+    parser/schema/model version. The parse cache is keyed by
+    (content_hash, cache_version), so erasing a resume can delete EVERY cached parse
+    of it — including ones produced by older parser versions (privacy.erase_resume)."""
+    return hashlib.sha256((resume_text or "").encode("utf-8")).hexdigest()
 
 
 def _reqs_cache_key(title, description):
@@ -59,11 +64,14 @@ def load_resume(state, run_id):
         state.resume_text = row[0]
 
 
-def _parse_cache_get(resume_hash):
-    """Look up a previously parsed resume by hash (#1, #12). 0 LLM calls on hit."""
+def _parse_cache_get(content_hash):
+    """Look up a parse of this exact resume text under the CURRENT cache version.
+    0 LLM calls on hit. Parses under older versions are never served (stale)."""
     with get_connection() as conn:
         cur = conn.cursor()
-        cur.execute("SELECT parsed_json FROM parsed_resume_cache WHERE resume_hash = %s", (resume_hash,))
+        cur.execute("SELECT parsed_json FROM parsed_resume_cache "
+                    "WHERE content_hash = %s AND cache_version = %s",
+                    (content_hash, parse_cache_version()))
         row = cur.fetchone()
         if not row:
             return None
@@ -73,20 +81,21 @@ def _parse_cache_get(resume_hash):
         return val if isinstance(val, dict) else None
 
 
-def _parse_cache_put(resume_hash, parsed):
+def _parse_cache_put(content_hash, parsed):
     with get_connection() as conn:
         cur = conn.cursor()
         cur.execute("""
-            INSERT INTO parsed_resume_cache (resume_hash, parsed_json, cache_version)
-            VALUES (%s, %s, %s) ON CONFLICT (resume_hash) DO NOTHING
-        """, (resume_hash, json.dumps(parsed), parse_cache_version()))
+            INSERT INTO parsed_resume_cache (content_hash, cache_version, parsed_json)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (content_hash, cache_version) DO NOTHING
+        """, (content_hash, parse_cache_version(), json.dumps(parsed)))
 
 
 def do_parse_resume(state, run_id):
     """Parse the resume — but reuse the cache if we've parsed this exact text (#1)."""
     step_id = create_step(run_id, "parse_resume", len(state.completed_actions))
     try:
-        rhash = _resume_cache_key(state.resume_text)
+        rhash = resume_content_hash(state.resume_text)
         cached = _parse_cache_get(rhash)
         if cached is not None:
             state.parsed_resume = cached
@@ -155,12 +164,52 @@ def do_search_jobs(state, run_id):
         SUCCEEDED = {"success", "empty"}
         if (state.live_only and not state.jobs
                 and not any(s in SUCCEEDED for s in provider_status.values())):
-            raise RuntimeError(f"live job sources unavailable ({provider_status})")
+            code = provider_failure_code(provider_status)
+            raise RuntimeError(f"{code.value}: live job sources unavailable ({provider_status})")
 
         finish_step(step_id, "success")
     except Exception as e:
         fail_step(step_id, e)
         state.error = f"search failed: {e}"
+
+
+# Provider fetch status -> run error code. Transient failures come first: if ANY
+# provider failed transiently, a retry of the run can still succeed.
+_TRANSIENT_PROVIDER = {
+    "rate_limited": ErrorCode.JOB_SOURCE_RATE_LIMITED,
+    "server_error": ErrorCode.JOB_SOURCE_UNAVAILABLE,
+    "network_error": ErrorCode.JOB_SOURCE_UNAVAILABLE,
+    "failed": ErrorCode.JOB_SOURCE_UNAVAILABLE,   # unexpected error (e.g. DB blip)
+}
+_TERMINAL_PROVIDER = {
+    "auth_error": ErrorCode.JOB_SOURCE_AUTH_FAILED,
+    "missing_keys": ErrorCode.JOB_SOURCE_AUTH_FAILED,
+    "invalid_response": ErrorCode.JOB_SOURCE_INVALID_RESPONSE,
+    "http_error": ErrorCode.JOB_SOURCE_INVALID_RESPONSE,
+}
+
+
+def provider_failure_code(provider_status):
+    """
+    Classify "every live provider failed" into ONE run-level error code:
+      rate limit                  -> JOB_SOURCE_RATE_LIMITED   (retryable)
+      network / 5xx / unexpected  -> JOB_SOURCE_UNAVAILABLE    (retryable)
+      bad credentials / no keys   -> JOB_SOURCE_AUTH_FAILED    (terminal)
+      malformed body / other 4xx  -> JOB_SOURCE_INVALID_RESPONSE (terminal)
+    A provider that answered with zero jobs is NOT a failure (the run ends as
+    no_matches), so this is only consulted when nothing succeeded.
+    """
+    statuses = list((provider_status or {}).values())
+    for st in ("rate_limited",):
+        if st in statuses:
+            return _TRANSIENT_PROVIDER[st]
+    for st in statuses:
+        if st in _TRANSIENT_PROVIDER:
+            return _TRANSIENT_PROVIDER[st]
+    for st in statuses:
+        if st in _TERMINAL_PROVIDER:
+            return _TERMINAL_PROVIDER[st]
+    return ErrorCode.JOB_SOURCE_UNAVAILABLE
 
 
 # --- requirements cache (#2, #12): a job's requirements don't depend on the
@@ -323,6 +372,20 @@ def _step_review_reason(step_id):
         return row[0] if row else None
 
 
+def _evaluation_selection(run_id, step_id, flagged):
+    """'flagged' (always evaluated), 'sampled', or None. Sampling is DETERMINISTIC
+    per (run, step) so a retried attempt makes the same choice."""
+    if flagged:
+        return "flagged"
+    rate = settings.eval_unflagged_sample_rate
+    if rate >= 1.0:
+        return "sampled"
+    if rate <= 0.0:
+        return None
+    h = int(hashlib.sha256(f"{run_id}:{step_id}".encode()).hexdigest()[:8], 16)
+    return "sampled" if (h / 0xFFFFFFFF) < rate else None
+
+
 def do_process_job(state, run_id):
     """
     Process ONE job: cancellation check → requirements (structured) →
@@ -364,22 +427,36 @@ def do_process_job(state, run_id):
             run_id, step_id, operation="score")
         score = score_result["score"]
 
+        # 2b. Experience discrepancy: the scorer already used the CONSERVATIVE years
+        #     (the lower of stated vs. summed). If the questionable stated value would
+        #     have produced a DIFFERENT decision, a human must look — the number that
+        #     decides this job is exactly the one we can't trust.
+        if isinstance((state.parsed_resume or {}).get("experience_discrepancy"), dict):
+            stated_result = calculate_match_score(state.parsed_resume, requirements,
+                                                  state.resume_text, job, user_input,
+                                                  experience_mode="stated")
+            if stated_result["decision"] != score_result["decision"]:
+                flag_for_review(step_id, reason="experience_discrepancy")
+
         # 3. Gemini judge ONLY in the uncertain middle band (#5,6,7).
+        #    judge_status is the single truth about whether the judge RAN:
+        #      ran | invalid_output | unavailable | skipped_budget | not_needed
         result = None
-        judge_status = "skipped"
+        judge_status = "not_needed"
         judge_skip_reason = None
-        if not (20 <= score <= 80):
+        in_uncertain_band = 20 <= score <= 80
+        if not in_uncertain_band:
             # Extreme score — judge adds little; skip it (honest, not faked).
             judge_skip_reason = "score_extreme_low" if score < 20 else "score_extreme_high"
             llm_decision = f"skipped ({judge_skip_reason})"
         elif state.budget_exceeded():
-            # Middle-band, but quota is spent. Keep the score, skip judge cleanly.
+            # Uncertain band BY CONSTRUCTION needs a second opinion — none is
+            # available, so the deterministic score alone must not decide silently.
+            judge_status = "skipped_budget"
             judge_skip_reason = "budget"
             llm_decision = "skipped (budget)"
+            flag_for_review(step_id, reason="judge_unavailable(budget)")
         else:
-            # Middle-band: judge SHOULD run. But if it fails (quota/API/budget) the
-            # job KEEPS its deterministic score instead of being discarded — degrade
-            # to "scored, judge unavailable" rather than failing the whole job.
             from agent import build_prompt
             evidence = {"matched_in_resume": score_result["matched_skills"],
                         "missing_from_resume": score_result["missing_skills"]}
@@ -390,21 +467,25 @@ def do_process_job(state, run_id):
                     llm_decision = _parse_decision(result)
                     judge_status = "ran"
                 except Exception as parse_err:
-                    # The call succeeded but the structured output was invalid. That is
-                    # an AI-quality failure, not a successful judgment: record it as
-                    # such and ask a human (this job is in the uncertain band by
-                    # construction, so there is no trustworthy second opinion).
+                    # The call succeeded but the structured output was invalid — an
+                    # AI-quality failure, not a judgment. Ask a human.
                     judge_status = "invalid_output"
                     judge_skip_reason = "parse_error"
                     llm_decision = "Unknown"
                     result = None          # nothing valid for the evaluator to grade
                     flag_for_review(step_id, reason="judge_invalid_output")
-                    log.warning("judge returned invalid structured output for '%s': %s",
-                                job['title'], parse_err)
+                    log.warning("judge returned invalid structured output: %s", parse_err,
+                                extra={"run_id": run_id, "step_id": step_id})
             except Exception as judge_err:
+                # The job KEEPS its deterministic score (it is not discarded), but the
+                # decision quality is DEGRADED: an uncertain-band job without its
+                # second opinion goes to a human. Other jobs keep processing.
+                judge_status = "unavailable"
                 judge_skip_reason = "judge_unavailable"
                 llm_decision = "skipped (judge_unavailable)"
-                log.warning("judge unavailable for '%s' (%s) — keeping score", job['title'], judge_err)
+                flag_for_review(step_id, reason="judge_unavailable")
+                log.warning("judge unavailable (%s) — keeping score, flagged for review",
+                            judge_err, extra={"run_id": run_id, "step_id": step_id})
 
         # record_score sets the score-vs-LLM DISAGREEMENT review flag (additively) as a
         # side effect. Its return value is only that ONE trigger, so it is deliberately
@@ -419,25 +500,19 @@ def do_process_job(state, run_id):
         final_decision = _compute_final_decision(score_result["decision"], llm_decision)
         _store_final_decision(step_id, final_decision)
 
-        record_context(step_id, {
-            "job_id": job.get("id"), "job_source": job.get("source"),
-            "apply_url": job.get("apply_url"),
-            "matched_skills": score_result["matched_skills"],
-            "missing_skills": score_result["missing_skills"],
-            "judge_skipped": not (20 <= score <= 80),
-            "score_breakdown": score_result["breakdown"],
-        })
-
         # Structured AgentOps signals (queryable columns).
         record_judge_signals(step_id, judge_status, judge_skip_reason, cache_hit)
 
-        # --- Evaluator: on risky (FLAGGED) jobs where the judge ran (so 'result'
-        # exists) and budget allows. "Flagged" is the AUTHORITATIVE DB flag so far
-        # (prompt injection from extract_requirements + score disagreement) — not just
-        # the score-vs-LLM disagreement — so an injection-only job still gets evaluated.
-        if (state.evaluate and _step_needs_review(step_id) and result is not None
-                and not state.budget_exceeded()
+        # --- Evaluator. With evaluate=true, EVERY successful judge result is
+        # eligible — not only already-flagged ones (hallucination in an otherwise
+        # normal-looking decision is exactly what it exists to catch). Flagged
+        # decisions are always evaluated; unflagged ones at
+        # EVAL_UNFLAGGED_SAMPLE_RATE (default 1.0 = all), budget permitting.
+        eval_selection = None
+        if (state.evaluate and result is not None
                 and llm_decision in ("Apply", "Maybe", "Skip")):
+            eval_selection = _evaluation_selection(run_id, step_id, _step_needs_review(step_id))
+        if eval_selection and not state.budget_exceeded():
             try:
                 from evaluator import evaluate_decision
                 from llm import save_evaluation
@@ -450,10 +525,32 @@ def do_process_job(state, run_id):
                     reason = ("hallucination" if eval_result["hallucination_detected"]
                               else "low_evaluation_scores")
                     flag_for_review(step_id, reason=reason)
-                log.info("eval: rel=%s faith=%s complete=%s halluc=%s", rel, faith, comp, eval_result['hallucination_detected'])
+                log.info("eval (%s): rel=%s faith=%s complete=%s halluc=%s", eval_selection,
+                         rel, faith, comp, eval_result['hallucination_detected'],
+                         extra={"run_id": run_id, "step_id": step_id})
             except Exception as eval_err:
                 flag_for_review(step_id, reason="evaluation_failed")
-                log.warning("evaluation requested but failed: %s", eval_err)
+                log.warning("evaluation requested but failed: %s", eval_err,
+                            extra={"run_id": run_id, "step_id": step_id})
+        elif eval_selection:
+            eval_selection = "skipped_budget"
+
+        record_context(step_id, {
+            "job_id": job.get("id"), "job_source": job.get("source"),
+            "apply_url": job.get("apply_url"),
+            "matched_skills": score_result["matched_skills"],
+            "missing_skills": score_result["missing_skills"],
+            # Whether the judge ACTUALLY ran — not whether the score was in the band.
+            "judge_skipped": judge_status != "ran",
+            "judge_status": judge_status,
+            "judge_skip_reason": judge_skip_reason,
+            "score_breakdown": score_result["breakdown"],
+            "experience_basis": score_result.get("experience_basis"),
+            "candidate_years_used": score_result.get("candidate_years_used"),
+            "requirements_method": _method,
+            "geo_eligibility": job.get("geo_eligibility"),
+            "evaluation": eval_selection or "not_requested",
+        })
 
         # AUTHORITATIVE review decision, AFTER every trigger has run (prompt injection,
         # score disagreement, hallucination, evaluation failure). The graph routes on
@@ -536,25 +633,63 @@ def _persist_rankings(run_id, ranked):
         log.exception("persist rankings failed", extra={"run_id": run_id})
 
 
-def _combined_advice(resume_text, job, requirements, missing_skills, run_id, step_id, budget=None):
+def _advice_profile(parsed_resume, score_result):
     """
-    #9 + #10: ONE Gemini call returning BOTH application strategy and resume-edit
-    advice, instead of two separate calls. Used only for top viable jobs.
+    The candidate facts the advice prompt is allowed to use — built from the
+    STRUCTURED, grounded parse instead of an arbitrary slice of the raw resume (the
+    old resume_text[:3000] silently dropped everything after the first 3000 chars).
+    Only GROUNDED skills are included; each list is capped to keep the prompt small.
     """
+    pr = parsed_resume or {}
+    grounded = pr.get("grounded_skills")
+    skills = grounded if isinstance(grounded, list) else (pr.get("skills") or [])
+    evidence = [f"{e.get('skill')}: {e.get('evidence')}" for e in (pr.get("skill_evidence") or [])
+                if isinstance(e, dict) and e.get("skill") and e.get("evidence")]
+    return {
+        "skills": list(skills)[:40],
+        "years_experience_used": score_result.get("candidate_years_used"),
+        "experience": [f"{e.get('title')} at {e.get('company')} ({e.get('years')} yrs)"
+                       for e in (pr.get("experience") or []) if isinstance(e, dict)][:10],
+        "projects": [f"{p.get('name')}: {', '.join(p.get('tech') or [])}"
+                     for p in (pr.get("projects") or []) if isinstance(p, dict)][:10],
+        "education": [f"{e.get('degree')}, {e.get('institution')} {e.get('year') or ''}".strip()
+                      for e in (pr.get("education") or []) if isinstance(e, dict)][:5],
+        "evidence": evidence[:20],
+        "matched_requirements": score_result.get("matched_skills") or [],
+        "missing_requirements": score_result.get("missing_skills") or [],
+        "missing_preferred": score_result.get("missing_preferred") or [],
+    }
+
+
+def _combined_advice(parsed_resume, job, requirements, score_result, run_id, step_id,
+                     budget=None):
+    """
+    ONE Gemini call returning BOTH application strategy and resume-edit advice.
+    Used only for top viable jobs. The candidate side of the prompt is the
+    structured profile (_advice_profile), not the raw resume text.
+    """
+    profile = _advice_profile(parsed_resume, score_result)
     prompt = f"""
 {HARDENING_PREAMBLE}
 
 You are a career advisor. For the job below, give the candidate BOTH:
 1. APPLICATION STRATEGY - how to position themselves for this specific role.
 2. RESUME EDITS - concrete, numbered edits to better match this job.
+Only rely on the candidate facts given; do not invent experience they don't have.
 
-CANDIDATE RESUME:
-{wrap_untrusted(resume_text[:3000], "RESUME")}
+CANDIDATE SKILLS (grounded in the resume): {wrap_untrusted(profile["skills"], "SKILLS")}
+YEARS OF EXPERIENCE USED FOR MATCHING: {profile["years_experience_used"]}
+EXPERIENCE: {wrap_untrusted(profile["experience"], "EXPERIENCE")}
+PROJECTS: {wrap_untrusted(profile["projects"], "PROJECTS")}
+EDUCATION: {wrap_untrusted(profile["education"], "EDUCATION")}
+RESUME EVIDENCE SNIPPETS: {wrap_untrusted(profile["evidence"], "EVIDENCE")}
 
 JOB: {wrap_untrusted(job['title'], "JOB_TITLE")} at {wrap_untrusted(job.get('company',''), "COMPANY")}
 REQUIRED SKILLS: {wrap_untrusted(requirements.get('required_skills', []), "REQUIRED_SKILLS")}
 PREFERRED SKILLS: {wrap_untrusted(requirements.get('preferred_skills', []), "PREFERRED_SKILLS")}
-SKILLS THE RESUME IS MISSING: {wrap_untrusted(missing_skills, "MISSING_SKILLS")}
+REQUIREMENTS THE CANDIDATE MEETS: {wrap_untrusted(profile["matched_requirements"], "MATCHED")}
+REQUIREMENTS THE RESUME IS MISSING: {wrap_untrusted(profile["missing_requirements"], "MISSING_SKILLS")}
+PREFERRED SKILLS THE RESUME IS MISSING: {wrap_untrusted(profile["missing_preferred"], "MISSING_PREFERRED")}
 
 Respond in exactly this format:
 STRATEGY:
@@ -619,11 +754,16 @@ def do_generate_advice(state, run_id, top_n=2):
             }
             sc = calculate_match_score(state.parsed_resume, requirements,
                                        state.resume_text, job, None)
-            advice = _combined_advice(state.resume_text, job, requirements,
-                                      sc["missing_skills"], run_id, step_id,
-                                      budget=state)
+            advice = _combined_advice(state.parsed_resume, job, requirements, sc,
+                                      run_id, step_id, budget=state)
             _persist_advice(run_id, job.get("id"), job["title"], advice)
-            log.info("advice for %s:\n%s", r['title'], advice.strip())
+            # METADATA ONLY. The advice text is derived from the resume and the job
+            # posting; it lives in run_advice (covered by erasure and retention) and
+            # must never leak into application logs, which those controls don't reach.
+            log.info("application advice generated",
+                     extra={"run_id": run_id, "step_id": step_id})
+            log.debug("advice metadata: job_id=%s chars=%d", job.get("id"),
+                      len(advice or ""), extra={"run_id": run_id, "step_id": step_id})
         finish_step(step_id, "success")
         state.advice_done = True
     except Exception as e:

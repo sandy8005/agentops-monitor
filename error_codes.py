@@ -34,6 +34,17 @@ class ErrorCode(str, Enum):
     LLM_RATE_LIMITED = "llm_rate_limited"         # 429 per-minute / burst limit — transient
     LLM_QUOTA_EXHAUSTED = "llm_quota_exhausted"   # 429 daily/project quota spent — terminal
     LLM_UNAVAILABLE = "llm_unavailable"           # 503 / timeout / provider down
+    LLM_INVALID_RESPONSE = "llm_invalid_response" # provider answered without text/usage
+                                                  # (blocked / safety-filtered) — terminal
+
+    # External job-provider failures (Adzuna / Remotive). Same philosophy as the LLM
+    # taxonomy: a rate limit or an outage is worth retrying, bad credentials are not,
+    # and a provider that answered "0 jobs" is not a failure at all (no_matches).
+    JOB_SOURCE_RATE_LIMITED = "job_source_rate_limited"   # provider 429 — transient
+    JOB_SOURCE_UNAVAILABLE = "job_source_unavailable"     # network / timeout / 5xx — transient
+    JOB_SOURCE_AUTH_FAILED = "job_source_auth_failed"     # 401/403 / missing keys — terminal
+    JOB_SOURCE_INVALID_RESPONSE = "job_source_invalid_response"  # malformed body — terminal
+    JOB_SEARCH_EMPTY = "job_search_empty"                 # provider OK, zero postings
 
     # Control / lifecycle.
     CANCELLED = "cancelled"                       # user cancelled
@@ -74,6 +85,14 @@ def classify_exception(exc):
     """
     msg = str(exc)
     low = msg.lower()
+    if type(exc).__name__ == "InvalidProviderResponse" or "provider returned no text" in low:
+        return ErrorCode.LLM_INVALID_RESPONSE
+    # Job-provider failures are tagged by the search stage ("job_source_...:") — honour
+    # the tag before the generic HTTP heuristics below.
+    for code in (ErrorCode.JOB_SOURCE_RATE_LIMITED, ErrorCode.JOB_SOURCE_UNAVAILABLE,
+                 ErrorCode.JOB_SOURCE_AUTH_FAILED, ErrorCode.JOB_SOURCE_INVALID_RESPONSE):
+        if code.value in low:
+            return code
     if _is_429(msg):
         if any(m in low for m in _QUOTA_MARKERS):
             return ErrorCode.LLM_QUOTA_EXHAUSTED
@@ -99,16 +118,48 @@ def provider_retry_after(exc):
     if _RETRY_DELAY_RE is None:
         _RETRY_DELAY_RE = re.compile(r"retry[_ ]?delay['\"]?\s*[:=]\s*['\"]?(\d+(?:\.\d+)?)s",
                                      re.IGNORECASE)
-    # 1. Structured Retry-After header on an HTTP response, if present.
+    # 1. Structured Retry-After header on an HTTP response, if present. HTTP allows
+    #    both delay-seconds ("31") and an HTTP-date ("Wed, 21 Oct 2026 07:28:00 GMT").
     resp = getattr(exc, "response", None)
     headers = getattr(resp, "headers", None)
     if headers:
         try:
             ra = headers.get("Retry-After") or headers.get("retry-after")
-            if ra is not None:
-                return float(ra)
-        except (TypeError, ValueError):
-            pass
+        except (AttributeError, TypeError):
+            ra = None
+        parsed = parse_retry_after(ra)
+        if parsed is not None:
+            return parsed
     # 2. RetryInfo embedded in the error details / message.
     m = _RETRY_DELAY_RE.search(str(getattr(exc, "details", "") or "") + " " + str(exc))
     return float(m.group(1)) if m else None
+
+
+def parse_retry_after(value, now=None):
+    """
+    Parse an HTTP Retry-After value into seconds (>= 0), or None if unusable.
+    Accepts delay-seconds ("31", "2.5") and HTTP-date (RFC 9110 IMF-fixdate and the
+    obsolete forms email.utils understands). A date in the past yields 0.
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        secs = float(text)
+        return max(0.0, secs)
+    except ValueError:
+        pass
+    from email.utils import parsedate_to_datetime
+    from datetime import datetime, timezone
+    try:
+        when = parsedate_to_datetime(text)
+    except (TypeError, ValueError, IndexError):
+        return None
+    if when is None:
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    now = now or datetime.now(timezone.utc)
+    return max(0.0, (when - now).total_seconds())

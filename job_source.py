@@ -20,7 +20,10 @@ STALE_AFTER_DAYS = 14   # jobs not seen in this many days drop out of search
 # Which sources count as LIVE (real-time feeds) vs. practice data (seed/CSV/scraped).
 # Live Mode reads ONLY live sources, so a live search is never polluted by the
 # built-in sample/practice pool.
-LIVE_SOURCES = {"adzuna", "live"}
+# "live" is the LEGACY name Remotive rows were stored under; migration 0009 renames
+# them to "remotive". It stays recognised so an un-migrated row is still classified
+# correctly (never as practice data).
+LIVE_SOURCES = {"adzuna", "remotive", "live"}
 PRACTICE_SOURCES = {"seed", "csv", "scraped", "api"}
 
 
@@ -153,8 +156,9 @@ def _role_matcher(target_role):
 
 
 # Source preference: when two rows are the same posting, keep the better one.
-# Adzuna (real search) > live/api (Remotive) > scraped > csv > seed.
-_SOURCE_RANK = {"adzuna": 5, "live": 4, "api": 3, "scraped": 2, "csv": 1, "seed": 0}
+# Adzuna (real search) > Remotive > api > scraped > csv > seed.
+_SOURCE_RANK = {"adzuna": 5, "remotive": 4, "live": 4, "api": 3, "scraped": 2,
+                "csv": 1, "seed": 0}
 
 # Seniority is BUSINESS-SIGNIFICANT: "Senior AI Engineer" and "Junior AI Engineer" at
 # the same company/location are different requisitions, so seniority stays in the
@@ -336,8 +340,8 @@ def _dedupe_jobs(jobs):
          have no URL — are the same job and merge (higher source-rank wins; apply_url
          etc. salvaged from the losers). Rows with DIFFERENT URLs are DISTINCT
          requisitions and each survive. A url-less row inside a group that has
-         multiple distinct URLs is ambiguous, so it's folded into the highest-rank URL
-         bucket rather than dropped or turned into a phantom row.
+         multiple distinct URLs is ambiguous: it joins a URL bucket only on strong
+         evidence (near-identical description), otherwise it is kept separate.
 
     So "AI Engineer @ Google, NYC" for two different teams (two apply URLs) stays TWO
     rows, while the SAME posting seen on two feeds (same URL, or one feed missing the
@@ -369,12 +373,29 @@ def _dedupe_jobs(jobs):
             result.append(_merge_group(members))
         else:
             # Multiple distinct URLs -> multiple distinct requisitions: one row each.
+            # A URL-less row cannot be PROVEN to be any one of them. It is attached
+            # to a URL bucket only when its description is near-identical to that
+            # bucket's (strong evidence); otherwise it stays a separate row rather
+            # than being arbitrarily merged into (and hidden behind) one of them.
             buckets = list(by_url.values())
-            if urlless:
-                target = max(buckets, key=lambda b: max(_rank(x) for x in b))
-                target.extend(urlless)
+            unresolved = []
+            for u in urlless:
+                best, best_sim = None, 0.0
+                for b in buckets:
+                    sim = max(_desc_similarity(u.get("description"), x.get("description"))
+                              for x in b)
+                    if sim > best_sim:
+                        best, best_sim = b, sim
+                if best is not None and best_sim >= RELAXED_MATCH_MIN_DESC_SIMILARITY:
+                    best.append(u)
+                else:
+                    unresolved.append(u)
             for b in buckets:
                 result.append(_merge_group(b))
+            if unresolved:
+                # URL-less rows that match no URL bucket are still the same content
+                # as EACH OTHER (same strict fingerprint) — collapse among themselves.
+                result.append(_merge_group(unresolved))
     return _merge_relaxed_duplicates(result)
 
 
@@ -407,8 +428,83 @@ def _merge_relaxed_duplicates(rows):
     return out
 
 
+# --- Geographic eligibility of REMOTE postings ---------------------------------
+# A remote-only provider (Remotive) doesn't filter by location, but its postings
+# often restrict WHERE the candidate may live ("USA only", "Europe", "UK"). Work mode
+# (remote) and geographic eligibility are different things. The check below is
+# deliberately CONSERVATIVE: it only reports "ineligible" when both the posting's
+# region and the requested location map to KNOWN, non-overlapping regions. Anything
+# it can't resolve (a city, a state, free text) is "unknown" and kept.
+_WORLDWIDE = {"worldwide", "anywhere", "global", "globally", "international",
+              "any location", "everywhere"}
+_REGION_TERMS = {
+    "us": {"us", "usa", "u.s.", "u.s.a.", "united states", "america",
+           "united states of america"},
+    "canada": {"canada"},          # NOT "ca" — that is California in "San Jose, CA"
+    "north_america": {"north america", "americas"},
+    "latam": {"latam", "latin america", "south america", "brazil", "mexico",
+              "argentina", "colombia", "chile"},
+    "uk": {"uk", "u.k.", "united kingdom", "great britain", "britain", "england",
+           "scotland", "wales"},
+    "europe": {"europe", "eu", "european union", "eea", "emea", "germany", "france",
+               "spain", "italy", "netherlands", "poland", "portugal", "ireland",
+               "sweden", "switzerland", "austria", "belgium", "denmark", "norway",
+               "finland"},
+    "apac": {"apac", "asia", "asia pacific", "india", "japan", "singapore",
+             "australia", "new zealand", "philippines", "indonesia", "vietnam",
+             "china", "korea"},
+    "africa": {"africa", "nigeria", "kenya", "south africa", "egypt"},
+    "middle_east": {"middle east", "uae", "saudi arabia", "israel", "qatar"},
+}
+# Regions that CONTAIN others (a posting open to "North America" accepts a US
+# candidate; "EMEA"/"Europe" accept the UK).
+_REGION_PARENTS = {
+    "us": {"north_america"}, "canada": {"north_america"},
+    "uk": {"europe"}, "middle_east": {"europe"}, "africa": {"europe"},
+}
+
+
+def _regions_in(text):
+    low = f" {' '.join(re.split(r'[^a-z0-9.]+', (text or '').lower()))} "
+    found = set()
+    for region, terms in _REGION_TERMS.items():
+        for t in terms:
+            if f" {t} " in low:
+                found.add(region)
+                break
+    return found
+
+
+def geo_eligibility(job, requested_location):
+    """
+    'eligible' / 'ineligible' / 'unknown' for a remote posting vs. the location the
+    user searched from. Only a clear conflict between KNOWN regions is 'ineligible'.
+    """
+    req = (requested_location or "").strip()
+    if not req:
+        return "unknown"
+    region_text = (job.get("location") or "").strip().lower()
+    if not region_text:
+        return "unknown"
+    job_regions = _regions_in(region_text)
+    if not job_regions:
+        return "eligible" if any(w in region_text for w in _WORLDWIDE) else "unknown"
+    req_regions = _regions_in(req)
+    if not req_regions:
+        return "unknown"
+    expanded_req = set(req_regions)
+    for r in req_regions:
+        expanded_req |= _REGION_PARENTS.get(r, set())
+    expanded_job = set(job_regions)
+    for r in job_regions:
+        expanded_job |= _REGION_PARENTS.get(r, set())
+    if expanded_req & job_regions or req_regions & expanded_job:
+        return "eligible"
+    return "ineligible"
+
+
 def search_jobs(target_role=None, location=None, work_mode=None,
-                employment_type=None, min_results=3, live_only=False, run_id=None):
+                employment_type=None, live_only=False, run_id=None):
     """
     Search the job pool.
 
@@ -424,7 +520,12 @@ def search_jobs(target_role=None, location=None, work_mode=None,
     Location filtering uses the PER-SEARCH ASSOCIATION (job_search_results), not a
     permanent search_location column: a job matches a location if some search for
     that location returned it. Practice jobs (no association) stay location-agnostic
-    in mixed mode.
+    in mixed mode. Remote postings from a provider that doesn't geo-filter are kept
+    unless their stated candidate region clearly excludes the requested location
+    (geo_eligibility); each returned job is annotated with "geo_eligibility".
+
+    target_role is optional: without it, every fresh job passes the role filter, but
+    the location / work-mode / employment-type filters and de-duplication still run.
     """
     with get_connection() as conn:
         cur = conn.cursor()
@@ -492,12 +593,15 @@ def search_jobs(target_role=None, location=None, work_mode=None,
             return ls >= cutoff
         all_jobs = [j for j in all_jobs if _is_fresh(j)]
 
-        if not target_role:
-            return all_jobs
-
         # --- role filter: whole-word specializing-term match ---
-        role_matches = _role_matcher(target_role)
-        filtered = [j for j in all_jobs if role_matches(j)]
+        # OPTIONAL: with no target role every (fresh) job is a role match, but the
+        # location / work-mode / employment-type filters and de-duplication below
+        # still apply — the function's contract doesn't change with the role.
+        if target_role and target_role.strip():
+            role_matches = _role_matcher(target_role)
+            filtered = [j for j in all_jobs if role_matches(j)]
+        else:
+            filtered = list(all_jobs)
 
         # --- location filter (via PER-SEARCH association, not a permanent column) ---
         # A job matches the requested location if SOME search for that location
@@ -510,13 +614,18 @@ def search_jobs(target_role=None, location=None, work_mode=None,
 
             def location_ok(job):
                 assoc = job.get("assoc_locations") or set()
-                if not assoc:
-                    # No geo-filtered association: practice data, or a remote-only
-                    # provider that doesn't filter by location — location-agnostic.
-                    return True
-                return loc in assoc      # matched by at least one geo-filtered search
+                if assoc:
+                    return loc in assoc  # matched by at least one geo-filtered search
+                # No geo-filtered association: practice data, or a remote-only
+                # provider that doesn't filter by location. "Remote" is a WORK MODE,
+                # not worldwide eligibility: exclude only when the posting's stated
+                # candidate region clearly excludes the requested location.
+                return geo_eligibility(job, location) != "ineligible"
 
             filtered = [j for j in filtered if location_ok(j)]
+            for j in filtered:
+                j["geo_eligibility"] = ("matched_search" if j.get("assoc_locations")
+                                        else geo_eligibility(j, location))
 
         # --- work_mode filter (compatibility, not "remote is always OK") ---
         # A job matches if: its mode is unknown (soft — don't exclude), OR equals the

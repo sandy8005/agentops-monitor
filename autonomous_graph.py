@@ -13,7 +13,7 @@ This is the foundation for LangGraph checkpointing + human-in-the-loop interrupt
 from typing import TypedDict, Optional, List
 from langgraph.graph import StateGraph, END
 from langgraph.types import interrupt, Command
-from langgraph.checkpoint.postgres import PostgresSaver
+from checkpointing import open_checkpointer, db_uri as _checkpoint_db_uri
 
 from agent_state import AgentState
 from router import (
@@ -42,7 +42,9 @@ def _stage_error_code(error_text):
     """
     code = classify_exception(error_text)
     if code in (ErrorCode.LLM_UNAVAILABLE, ErrorCode.LLM_RATE_LIMITED,
-                ErrorCode.LLM_QUOTA_EXHAUSTED):
+                ErrorCode.LLM_QUOTA_EXHAUSTED, ErrorCode.LLM_INVALID_RESPONSE,
+                ErrorCode.JOB_SOURCE_RATE_LIMITED, ErrorCode.JOB_SOURCE_UNAVAILABLE,
+                ErrorCode.JOB_SOURCE_AUTH_FAILED, ErrorCode.JOB_SOURCE_INVALID_RESPONSE):
         return code
     t = (error_text or "").lower()
     if t.startswith("parse") or "parse failed" in t:
@@ -53,20 +55,8 @@ def _stage_error_code(error_text):
 
 
 def _db_uri():
-    """
-    libpq connection string for the LangGraph Postgres checkpointer, built from the
-    centralized settings.
-
-    Built with psycopg's make_conninfo(), NOT by string interpolation: libpq
-    keyword/value syntax needs values containing spaces, quotes or backslashes to be
-    quoted and escaped, and a hand-built f-string gets that wrong (a password like
-    `p@ss w"ord` produced an unparseable conninfo). make_conninfo quotes/escapes each
-    value correctly and validates the result.
-    """
-    from psycopg.conninfo import make_conninfo
-    from settings import settings
-    p = {k: v for k, v in settings.db_kwargs().items() if v is not None}
-    return make_conninfo(**p)
+    """Kept for callers/tests; the single definition lives in checkpointing.db_uri."""
+    return _checkpoint_db_uri()
 
 
 # --- Flat, serializable graph state. Every field is JSON-serializable so the
@@ -344,8 +334,9 @@ def run_agent_graph(resume_id, target_role=None, location=None,
         # latency reflects real execution, not time spent waiting in the queue.
         # Every start_run execution is a NEW attempt (a retry replays from the start).
         _mark_run_running(run_id, new_attempt=True)
-        with PostgresSaver.from_conn_string(_db_uri()) as checkpointer:
-            checkpointer.setup()
+        # Strict-serde checkpointer; schema setup happens at deploy time
+        # (migrate.py / worker startup), not on every execution.
+        with open_checkpointer() as checkpointer:
             graph = build_graph(checkpointer=checkpointer)
             config = {"configurable": {"thread_id": str(run_id)},
                       "recursion_limit": 100}
@@ -506,8 +497,9 @@ def resume_agent_graph(run_id, decision, comment="", reviewer_user_id=None,
         # running (started_at is preserved via COALESCE, since this run already
         # started earlier before it paused).
         _mark_run_running(run_id, new_attempt=(queue_attempt or 1) > 1)
-        with PostgresSaver.from_conn_string(_db_uri()) as checkpointer:
-            checkpointer.setup()
+        # Strict-serde checkpointer; schema setup happens at deploy time
+        # (migrate.py / worker startup), not on every execution.
+        with open_checkpointer() as checkpointer:
             graph = build_graph(checkpointer=checkpointer)
             config = {"configurable": {"thread_id": str(run_id)},
                       "recursion_limit": 100}

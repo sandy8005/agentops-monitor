@@ -85,7 +85,9 @@ var NL = String.fromCharCode(10);
         const up = await csrfFetch('/upload', { method: 'POST', body: fd });
         if (!up.ok) { const e = await up.json(); throw new Error(e.detail || 'upload failed'); }
         const upData = await up.json();
-        msg.textContent = 'Stored resume #' + upData.resume_id + ' (' + upData.chars + ' chars). Set search options below and run it.';
+        msg.textContent = upData.truncated
+          ? upData.message
+          : 'Stored resume #' + upData.resume_id + ' (' + upData.chars + ' chars). Set search options below and run it.';
         loadResumes();
       } catch (err) {
         msg.textContent = 'Error: ' + err.message;
@@ -120,11 +122,11 @@ var NL = String.fromCharCode(10);
                 '</select></div>' +
               '</div>' +
               '<div style="margin-top:8px;">' +
-                '<label style="color:#e4e6eb;"><input type="checkbox" id="eval_' + r.id + '" style="width:auto;margin-right:6px;">Run LLM evaluator (extra API calls)</label>' +
+                '<label style="color:#e4e6eb;"><input type="checkbox" id="eval_' + r.id + '" style="width:auto;margin-right:6px;">Evaluate judged decisions with an LLM (extra API calls)</label>' +
               '</div>' +
               '<div style="margin-top:8px;">' +
-                '<button class="btn-sm btn-approve" onclick="runResume(' + r.id + ')">Run Search</button>' +
-                '<button class="btn-sm btn-reject" onclick="deleteResume(' + r.id + ')">Delete</button>' +
+                '<button class="btn-sm btn-approve" data-action="runResume" data-id="' + r.id + '">Run Search</button>' +
+                '<button class="btn-sm btn-reject" data-action="deleteResume" data-id="' + r.id + '">Delete</button>' +
               '</div>' +
             '</div>';
           div.appendChild(el);
@@ -140,15 +142,16 @@ var NL = String.fromCharCode(10);
       const loc = (document.getElementById('loc_' + id).value || '').trim();
       const mode = document.getElementById('mode_' + id).value;
       const emp = document.getElementById('emp_' + id).value;
-      const doEval = document.getElementById('eval_' + id).checked ? 'true' : 'false';
-      const qs = '?resume_id=' + id +
-                 '&target_role=' + encodeURIComponent(role) +
-                 '&location=' + encodeURIComponent(loc) +
-                 '&work_mode=' + encodeURIComponent(mode) +
-                 '&employment_type=' + encodeURIComponent(emp) +
-                 '&evaluate=' + doEval;
+      const doEval = document.getElementById('eval_' + id).checked;
+      // Run configuration goes in a JSON BODY — never in the URL, where it would end
+      // up in proxy/access logs and browser history.
+      const payload = { resume_id: Number(id), target_role: role, location: loc,
+                        work_mode: mode, employment_type: emp, evaluate: doEval };
       try {
-        const run = await csrfFetch('/runs' + qs, { method: 'POST' });
+        const run = await csrfFetch('/runs', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
         if (!run.ok) { const e = await run.json(); throw new Error(e.detail || 'run failed'); }
         const runData = await run.json();
         setTimeout(function() { loadRuns(); loadDetail(runData.run_id); }, 1500);
@@ -189,7 +192,7 @@ var NL = String.fromCharCode(10);
             '<td style="font-size:12px;color:#b0b4c0;">' + escapeHtml(searchDesc) + '</td>' +
             '<td>' + escapeHtml((r.started_at || '').replace('T', ' ').slice(0, 16)) + '</td>' +
             '<td>' + escapeHtml(r.total_tokens || 0) + '</td>' +
-            '<td>~$' + escapeHtml((r.total_cost || 0).toFixed(6)) + '</td>';
+            '<td title="estimated paid-tier cost">est. $' + escapeHtml((r.total_cost || 0).toFixed(6)) + '</td>';
           tr.onclick = function() { loadDetail(r.id); };
           tbody.appendChild(tr);
         }
@@ -231,7 +234,7 @@ var NL = String.fromCharCode(10);
             escapeHtml(String(run.status).toUpperCase()) + '</strong> &nbsp; ' +
             (run.status === 'retrying' ? 'the last attempt failed with a transient error; waiting to retry'
                                        : 'waiting for a worker to pick this run up') +
-            ' &nbsp; <button class="btn-sm btn-reject" onclick="cancelRun(' + run.id + ')">Cancel</button></div>';
+            ' &nbsp; <button class="btn-sm btn-reject" data-action="cancelRun" data-id="' + run.id + '">Cancel</button></div>';
         }
 
         if (running) {
@@ -240,7 +243,7 @@ var NL = String.fromCharCode(10);
           html += '<div class="step progress">' +
             '<strong style="color:#60a5fa;">&#9679; RUNNING</strong> &nbsp; ' +
             done + '/' + total + ' steps done &nbsp; | &nbsp; current: ' + escapeHtml(current) +
-            ' &nbsp; <button class="btn-sm btn-reject" onclick="cancelRun(' + run.id + ')">Cancel</button>' +
+            ' &nbsp; <button class="btn-sm btn-reject" data-action="cancelRun" data-id="' + run.id + '">Cancel</button>' +
             '</div>';
         }
 
@@ -298,7 +301,8 @@ var NL = String.fromCharCode(10);
             let io = 'PROMPT:' + NL + escapeHtml(l.prompt || '') + NL + NL + 'RESPONSE:' + NL + escapeHtml(l.response || '');
             if (l.error_message) io += NL + NL + 'ERROR: ' + escapeHtml(l.error_message);
             if (l.provider_request_id) io += NL + NL + 'REQUEST_ID: ' + escapeHtml(l.provider_request_id);
-            html += '<div class="call ' + fc + '"><span class="op">' + escapeHtml(l.operation || 'llm') + '</span> &middot; llm' + attemptLabel + ': ' + escapeHtml(l.prompt_tokens) + '+' + escapeHtml(l.completion_tokens) + ' tok, ' + escapeHtml(l.latency_ms) + 'ms, ~$' + escapeHtml(l.cost_usd) + ' [' + escapeHtml(l.status) + ']' +
+            html += '<div class="call ' + fc + '"><span class="op">' + escapeHtml(l.operation || 'llm') + '</span> &middot; llm' + attemptLabel + ': ' + escapeHtml(l.prompt_tokens) + '+' + escapeHtml(l.completion_tokens) + ' tok, ' + escapeHtml(l.latency_ms) + 'ms, ' + (l.cost_usd == null ? 'cost unknown' : 'est. $' + escapeHtml(l.cost_usd)) + ' [' + escapeHtml(l.status) + ']' +
+              (l.logical_call_id ? ' <span class="note" title="logical call ' + escapeHtml(l.logical_call_id) + '">call ' + escapeHtml(String(l.logical_call_id).slice(0, 8)) + ' / run attempt ' + escapeHtml(l.run_attempt) + '</span>' : '') +
               '<details><summary>view prompt/response</summary><pre class="io">' + io + '</pre></details></div>';
           }
           if (s.evaluation) {
@@ -327,14 +331,16 @@ var NL = String.fromCharCode(10);
       const box = document.getElementById('graphReviews');
       if (!box) return;
       try {
-        const res = await fetch('/runs');
-        const runs = await res.json();
-        const waiting = runs.filter(function(r){ return r.status === 'waiting_for_human'; });
-        if (!waiting.length) { box.innerHTML = ''; return; }
+        // One lightweight request: only what a review card needs. (This panel polls
+        // every few seconds; it must not pull the full trace of every paused run.)
+        const res = await fetch('/reviews/pending');
+        if (!res.ok) throw new Error('failed to load reviews');
+        const cards = await res.json();
+        if (!cards.length) { box.innerHTML = ''; return; }
         let html = '<div class="section-title">Runs Awaiting Your Review</div>';
-        for (const r of waiting) {
-          const detail = await (await fetch('/runs/' + r.id)).json();
-          const pr = detail.pending_review || {};
+        for (const card of cards) {
+          const r = { id: card.run_id };
+          const pr = card.pending_review || {};
           html += '<div class="step review">' +
             '<strong>Run #' + escapeHtml(r.id) + '</strong> &mdash; ' +
             escapeHtml(pr.job_title || '(job)') +
@@ -346,9 +352,9 @@ var NL = String.fromCharCode(10);
               '<input id="grc_' + r.id + '" class="rev-input" placeholder="comment (optional)" style="width:260px;">' +
             '</div>' +
             '<div style="margin-top:8px;">' +
-              '<button class="btn-sm btn-approve" onclick="resumeRun(' + r.id + ', \'Apply\')">Apply</button>' +
-              '<button class="btn-sm" onclick="resumeRun(' + r.id + ', \'Maybe\')">Maybe</button>' +
-              '<button class="btn-sm btn-reject" onclick="resumeRun(' + r.id + ', \'Skip\')">Skip</button>' +
+              '<button class="btn-sm btn-approve" data-action="resumeRun" data-id="' + r.id + '" data-decision="Apply">Apply</button>' +
+              '<button class="btn-sm" data-action="resumeRun" data-id="' + r.id + '" data-decision="Maybe">Maybe</button>' +
+              '<button class="btn-sm btn-reject" data-action="resumeRun" data-id="' + r.id + '" data-decision="Skip">Skip</button>' +
             '</div></div>';
         }
         box.innerHTML = html;
@@ -360,9 +366,11 @@ var NL = String.fromCharCode(10);
     async function resumeRun(runId, decision) {
       const el = document.getElementById('grc_' + runId);
       const comment = el ? el.value : '';
-      const qs = '?decision=' + decision + '&comment=' + encodeURIComponent(comment);
       try {
-        const res = await csrfFetch('/runs/' + runId + '/resume' + qs, { method: 'POST' });
+        const res = await csrfFetch('/runs/' + runId + '/resume', {
+          method: 'POST', headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ decision: decision, comment: comment })
+        });
         if (!res.ok) { const e = await res.json(); throw new Error(e.detail || 'resume failed'); }
         setTimeout(function() { loadRuns(); renderGraphReviews(); }, 1200);
       } catch (err) { alert('Error: ' + err.message); }
@@ -407,7 +415,24 @@ var NL = String.fromCharCode(10);
     }
 
     async function doLogout() {
-      try { await csrfFetch('/logout', { method: 'POST' }); } catch (e) {}
+      // Only show the signed-out UI once the SERVER has actually cleared the session.
+      // A failed request (network error, expired CSRF token, 5xx) leaves the session
+      // cookie valid, so pretending to be logged out would be misleading.
+      let res;
+      try {
+        res = await csrfFetch('/logout', { method: 'POST' });
+        if (res.status === 403) {            // stale CSRF token: refresh once and retry
+          _csrfToken = null;
+          res = await csrfFetch('/logout', { method: 'POST' });
+        }
+      } catch (e) {
+        alert('Sign out failed (network error). You are still signed in — please try again.');
+        return;
+      }
+      if (!res.ok && res.status !== 401) {   // 401 = the session was already gone
+        alert('Sign out failed (HTTP ' + res.status + '). You are still signed in — please try again.');
+        return;
+      }
       _csrfToken = null;   // drop the old session's token; next session fetches a fresh one
       if (_reviewTimer) { clearInterval(_reviewTimer); _reviewTimer = null; }
       showLogin('Signed out.');
@@ -425,5 +450,25 @@ var NL = String.fromCharCode(10);
         showLogin();
       }
     }
+
+    // --- Event wiring ---------------------------------------------------------
+    // No inline on* handlers anywhere: the Content-Security-Policy (script-src 'self')
+    // blocks inline script, so buttons carry data-action attributes and ONE delegated
+    // listener dispatches them.
+    var ACTIONS = {
+      doLogin: function() { doLogin(); },
+      doLogout: function() { doLogout(); },
+      uploadResume: function() { uploadResume(); },
+      runResume: function(el) { runResume(el.dataset.id); },
+      deleteResume: function(el) { deleteResume(el.dataset.id); },
+      cancelRun: function(el) { cancelRun(el.dataset.id); },
+      resumeRun: function(el) { resumeRun(el.dataset.id, el.dataset.decision); }
+    };
+    document.addEventListener('click', function(ev) {
+      var el = ev.target.closest('[data-action]');
+      if (!el) return;
+      var fn = ACTIONS[el.dataset.action];
+      if (fn) { ev.preventDefault(); fn(el); }
+    });
 
     initApp();

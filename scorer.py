@@ -1,31 +1,59 @@
-import re
+from skills import (canonical_skill, canonical_set, normalize_requirements,
+                    skill_in_text, text_index)
 
 
 def _skill_present(skill, resume_text_lower, resume_tokens):
-    """Whole-word skill match. Avoids 'go' matching inside 'django'."""
-    s = skill.lower().strip()
-    if not s:
+    """Whole-word, ALIAS-AWARE skill match ('go' never matches inside 'django';
+    'Kubernetes' matches 'K8s'). See skills.py for the canonical vocabulary."""
+    if not (skill or "").strip():
         return False
-    if " " in s:
-        return s in resume_text_lower
-    return s in resume_tokens
+    return skill_in_text(skill, resume_text_lower, resume_tokens)
 
 
-def calculate_match_score(parsed_resume, requirements, resume_text, job=None, user_input=None):
-    resume_text_lower = resume_text.lower()
-    resume_tokens = set(re.findall(r"[a-z0-9\+\#\.]+", resume_text_lower))
+def effective_years(parsed_resume, mode="conservative"):
+    """
+    Candidate years used for the experience category, and the basis for it.
+
+    The parser keeps the LLM's STATED total but flags experience_discrepancy when
+    it diverges from the sum of itemized roles by more than a year. A questionable
+    total must not silently drive the deterministic score, so in "conservative" mode
+    (the default) the LOWER of stated vs. summed is used whenever a discrepancy was
+    flagged. mode="stated" reproduces the raw stated value (used by the router to
+    check whether the discrepancy actually changes the decision).
+
+    Returns (years, basis) with basis in {"stated", "conservative_min"}.
+    """
+    parsed_resume = parsed_resume or {}
+    stated = parsed_resume.get("years_experience") or 0
+    disc = parsed_resume.get("experience_discrepancy")
+    if mode == "conservative" and isinstance(disc, dict):
+        summed = disc.get("summed")
+        try:
+            summed = float(summed)
+        except (TypeError, ValueError):
+            summed = None
+        if summed is not None and summed < stated:
+            return summed, "conservative_min"
+    return stated, "stated"
+
+
+def calculate_match_score(parsed_resume, requirements, resume_text, job=None, user_input=None,
+                          experience_mode="conservative"):
+    resume_text_lower, resume_tokens = text_index(resume_text)
 
     parsed_resume = parsed_resume or {}
     projects = parsed_resume.get("projects") or []
-    project_tech = [t.lower() for p in projects if isinstance(p, dict) for t in (p.get("tech") or [])]
-    project_tech_set = set(project_tech)
-    candidate_years = parsed_resume.get("years_experience") or 0
+    project_tech_set = canonical_set(
+        t for p in projects if isinstance(p, dict) for t in (p.get("tech") or []))
+    candidate_years, experience_basis = effective_years(parsed_resume, experience_mode)
 
-    required = [s.lower() for s in requirements["required_skills"]]
-    any_of_groups = [[s.lower() for s in group]
-                     for group in requirements.get("required_any_of", [])]
-    preferred = [s.lower() for s in requirements["preferred_skills"]]
-    min_years = requirements["min_years_experience"]
+    # Canonicalize + DEDUPLICATE first: "K8s"/"Kubernetes" is one requirement, and a
+    # flat skill that also appears in an any-of group is not counted twice.
+    requirements = normalize_requirements(requirements)
+    required = list(requirements["required_skills"])
+    any_of_groups = [list(g) for g in requirements.get("required_any_of", [])]
+    preferred = list(requirements["preferred_skills"])
+    min_years = requirements.get("min_years_experience") or 0
 
     insufficient = (len(required) == 0 and len(any_of_groups) == 0 and len(preferred) == 0)
 
@@ -93,10 +121,13 @@ def calculate_match_score(parsed_resume, requirements, resume_text, job=None, us
         (candidate_years or 0) > 0 or (parsed_resume.get("experience") or []))
     projects_category_applies = bool(projects) or not has_professional_experience
     def _in_projects(skill):
-        s = skill.lower().strip()
-        if " " in s:
-            return any(s in t for t in project_tech_set)
-        return s in project_tech_set
+        c = canonical_skill(skill)
+        if not c:
+            return False
+        if c in project_tech_set:
+            return True
+        # multi-word canonical skill mentioned inside a longer tech label
+        return " " in c and any(c in t for t in project_tech_set)
 
     total_project_units = len(required) + len(any_of_groups)
     if not projects_category_applies:
@@ -165,6 +196,8 @@ def calculate_match_score(parsed_resume, requirements, resume_text, job=None, us
         "breakdown": breakdown,
         "breakdown_max": breakdown_max,
         "projects_counted": projects_category_applies,
+        "candidate_years_used": candidate_years,
+        "experience_basis": experience_basis,
         "insufficient_requirements": insufficient,
         # Accurate, requirements-based evidence (whole-word, optional-aware).
         # 'missing_skills' is REQUIRED-only — so an optional skill is never a gap.
