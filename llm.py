@@ -8,6 +8,7 @@ import json
 from settings import settings
 from error_codes import ErrorCode, classify_exception, provider_retry_after
 from logging_config import get_logger
+from sanitize import redact_secrets
 log = get_logger(__name__)
 
 # timeout is in MILLISECONDS in google-genai's http_options. 30s means a stalled
@@ -157,7 +158,7 @@ def fail_step(step_id, error_message):
     with get_connection() as conn:
         cur = conn.cursor()
         cur.execute("UPDATE steps SET ended_at = %s, status = %s, error_message = %s WHERE id = %s",
-                    (utcnow(), "failed", str(error_message), step_id))
+                    (utcnow(), "failed", redact_secrets(error_message), step_id))
 
 
 def _breakdown_for_storage(breakdown, breakdown_max=None):
@@ -329,10 +330,10 @@ def finish_run(run_id, status="success", stop_reason=None, error_code=None):
                 stop_reason = %s, error_code = %s,
                 total_tokens = (SELECT COALESCE(SUM(prompt_tokens + completion_tokens), 0)
                                 FROM llm_calls WHERE run_id = %s),
-                total_cost = (SELECT COALESCE(SUM(cost_usd), 0)
-                              FROM llm_calls WHERE run_id = %s)
+                -- R15: NULL when no call has a known price (unknown is not $0).
+                total_cost = (SELECT SUM(cost_usd) FROM llm_calls WHERE run_id = %s)
             WHERE id = %s
-        """, (utcnow(), status, stop_reason, error_code_val, run_id, run_id, run_id))
+        """, (utcnow(), status, redact_secrets(stop_reason), error_code_val, run_id, run_id, run_id))
 
 
 def _log_llm_attempt(run_id, step_id, operation, prompt, response_text,
@@ -429,7 +430,7 @@ def logged_llm_call(prompt, run_id, step_id, operation="llm_call",
             _log_llm_attempt(
                 run_id, step_id, operation, prompt, None,
                 0, 0, latency_ms, 0,
-                "failed", str(e), attempt, attempt - 1, None,
+                "failed", redact_secrets(e), attempt, attempt - 1, None,
                 logical_call_id=logical_call_id,
             )
             if attempt == max_retries or not transient:
@@ -456,7 +457,7 @@ def log_tool_call(run_id, step_id, tool_name, tool_input, output, latency_ms,
         """, (
             run_id, step_id, tool_name, json.dumps(tool_input, default=str),
             json.dumps(output, default=str) if output is not None else None,
-            latency_ms, status, error_message, utcnow(), operation_name, run_id
+            latency_ms, status, redact_secrets(error_message), utcnow(), operation_name, run_id
         ))
 
 

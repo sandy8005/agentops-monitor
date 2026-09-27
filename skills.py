@@ -99,16 +99,72 @@ def _variant_present(variant, low, tokens):
     return variant in tokens             # whole-word match ('go' never hits 'django')
 
 
-def skill_in_text(skill, low, tokens):
-    """True if ANY alias of `skill` occurs in the indexed text (whole word / phrase).
-    Ambiguous short aliases count only when they are the requested term itself."""
-    asked = _norm(skill)
-    for v in skill_variants(skill):
-        if v in AMBIGUOUS_VARIANTS and v != asked:
-            continue
+def _allowed_variants(skill, surface_forms=None):
+    """Aliases that may be searched for `skill`. An ambiguous short alias ('go',
+    'node', 'rest') is allowed only when it is the requested term itself OR one of
+    the ORIGINAL surface forms the requirement was written with — canonicalization
+    ('Go' -> 'golang') must not throw away the fact that the job said 'Go' (R11)."""
+    asked = {_norm(skill)} | {_norm(f) for f in (surface_forms or []) if _norm(f)}
+    return [v for v in skill_variants(skill)
+            if not (v in AMBIGUOUS_VARIANTS and v not in asked)]
+
+
+def skill_in_text(skill, low, tokens, surface_forms=None):
+    """True if ANY allowed alias of `skill` occurs in the indexed text (whole word /
+    phrase). See _allowed_variants for the ambiguous-alias rule."""
+    for v in _allowed_variants(skill, surface_forms):
         if _variant_present(v, low, tokens):
             return True
     return False
+
+
+# --- Negation-aware evidence (R08) -------------------------------------------
+# "No Python experience" must not count as Python evidence. A mention is NEGATED
+# when a negation cue appears shortly before it in the same clause. Clause
+# boundaries: sentence punctuation, semicolons, newlines, and contrastive "but".
+_NEG_CUE_RE = re.compile(
+    r"(?<![a-z0-9\-])(no|not|never|without|lacking|lacks|lack|none|zero|"
+    r"unfamiliar with|no prior|no professional)(?![a-z0-9\-])")
+_CLAUSE_SPLIT_RE = re.compile(r"[.!?;\n\u2022|]|\bbut\b|\bhowever\b")
+_MAX_CUE_DISTANCE_WORDS = 4
+
+
+def _variant_regex(variant):
+    parts = [re.escape(p) for p in variant.split(" ")]
+    return re.compile(r"(?<![a-z0-9])" + r"\s+".join(parts) + r"(?![a-z0-9+#])")
+
+
+def _mention_is_negated(raw_lower, start):
+    """True if the mention starting at `start` is inside a negated phrase."""
+    clause_start = 0
+    for m in _CLAUSE_SPLIT_RE.finditer(raw_lower, 0, start):
+        clause_start = m.end()
+    prefix = raw_lower[clause_start:start]
+    cues = list(_NEG_CUE_RE.finditer(prefix))
+    if not cues:
+        return False
+    between = prefix[cues[-1].end():]
+    return len(between.split()) <= _MAX_CUE_DISTANCE_WORDS
+
+
+def skill_mentions(skill, raw_text, surface_forms=None):
+    """(affirmative_count, negated_count) for mentions of `skill` in raw text."""
+    raw_lower = str(raw_text or "").lower()
+    aff = neg = 0
+    for v in _allowed_variants(skill, surface_forms):
+        for m in _variant_regex(v).finditer(raw_lower):
+            if _mention_is_negated(raw_lower, m.start()):
+                neg += 1
+            else:
+                aff += 1
+    return aff, neg
+
+
+def affirmative_skill_in_text(skill, raw_text, surface_forms=None):
+    """True only if the text contains at least one NON-negated mention of the skill.
+    'Experienced Java engineer. No Python experience.' -> Python is False."""
+    aff, _neg = skill_mentions(skill, raw_text, surface_forms)
+    return aff > 0
 
 
 def skill_in_set(skill, canonical_set):
@@ -137,6 +193,22 @@ def normalize_requirements(requirements):
     that is both required and preferred stays only in required. Returns a NEW dict.
     """
     req = dict(requirements or {})
+    # Keep every ORIGINAL surface form per canonical skill (R11): 'Go' canonicalizes
+    # to 'golang', but matching must still be allowed to look for the word 'go'.
+    surface = {k: list(v) for k, v in (req.get("_surface_forms") or {}).items()}
+    def _remember(raw):
+        c = canonical_skill(raw)
+        if c:
+            forms = surface.setdefault(c, [])
+            n = _norm(raw)
+            if n and n not in forms:
+                forms.append(n)
+    for raw in list(req.get("required_skills") or []) + list(req.get("preferred_skills") or []):
+        _remember(raw)
+    for g in req.get("required_any_of") or []:
+        for raw in (g or []):
+            _remember(raw)
+    req["_surface_forms"] = surface
     required = _uniq([canonical_skill(s) for s in req.get("required_skills") or []])
     groups, seen_groups = [], set()
     for g in req.get("required_any_of") or []:

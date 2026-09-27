@@ -28,6 +28,25 @@ import run_lock
 log = get_logger(__name__)
 
 
+class StaleReviewDecision(RuntimeError):
+    """A resume value does not belong to the interrupt the graph is paused on."""
+
+
+def pending_interrupt_value(graph, config):
+    """The value of the interrupt this run's checkpoint is paused on, or None."""
+    snap = graph.get_state(config)
+    intr = getattr(snap, "interrupts", None) or ()
+    if not intr:
+        for t in getattr(snap, "tasks", ()) or ():
+            if getattr(t, "interrupts", None):
+                intr = t.interrupts
+                break
+    if not intr:
+        return None
+    v = intr[0].value
+    return v if isinstance(v, dict) else {"payload": v}
+
+
 def _stage_error_code(error_text):
     """
     Map a state.error string (set by a router stage) to an ErrorCode.
@@ -153,9 +172,15 @@ def node_human_review(state: GraphState) -> dict:
     """
     s = _hydrate(state)
     payload = s.last_review_info or {"step_id": s.last_review_step_id}
+    # Immutable review identity (R01): the decision must name THIS review. step ids
+    # are unique per job evaluation, so the id can never refer to another job.
+    review_id = f"{state['run_id']}:job:{s.last_review_step_id}"
     # --- PAUSE HERE. Resumes with the human's decision. ---
-    human = interrupt({"type": "review_request", **payload})
+    human = interrupt({"type": "review_request", "review_id": review_id, **payload})
     human = human or {}
+    if human.get("review_id") not in (None, review_id):
+        raise StaleReviewDecision(
+            f"decision for {human.get('review_id')!r} cannot answer {review_id!r}")
     decision = human.get("decision", "Maybe")
     comment = human.get("comment", "")
     apply_human_decision(s, state["run_id"], s.last_review_step_id, decision, comment,
@@ -199,11 +224,23 @@ def route_after_search(state: GraphState) -> str:
         return "no_matches"
     return "process_job"
 
+def _cancel_now(state) -> bool:
+    """R13: re-check cancellation at every boundary that would start NEW work
+    (ranking, advice, the next review pause) — not only before each job."""
+    if state.get("cancelled"):
+        return True
+    try:
+        from llm import is_cancel_requested
+        return bool(state.get("run_id")) and is_cancel_requested(state["run_id"])
+    except Exception:
+        return False
+
+
 def route_after_process_job(state: GraphState) -> str:
     """Per-job LOOP with human-in-the-loop: a flagged job pauses for review.
     NO budget short-circuit — over-budget jobs still get scored and skip the
     judge cleanly (budget gates Gemini, not work)."""
-    if state.get("cancelled"):
+    if _cancel_now(state):
         return "cancelled"
     if state.get("last_job_needs_review"):
         return "human_review"                 # PAUSE for a human
@@ -214,13 +251,15 @@ def route_after_process_job(state: GraphState) -> str:
 
 def route_after_human_review(state: GraphState) -> str:
     """After the human decides: continue the job loop, or rank if done."""
-    if state.get("cancelled"):
+    if _cancel_now(state):
         return "cancelled"
     if state.get("current_job_index", 0) < len(state.get("jobs") or []):
         return "process_job"
     return "rank_jobs"
 
 def route_after_rank(state: GraphState) -> str:
+    if _cancel_now(state):
+        return "cancelled"
     return "generate_advice"
 
 
@@ -249,7 +288,7 @@ def build_graph(checkpointer=None):
     g.add_conditional_edges("human_review", route_after_human_review,
                             {"process_job": "process_job", "rank_jobs": "rank_jobs", "cancelled": END})
     g.add_conditional_edges("rank_jobs", route_after_rank,
-                            {"generate_advice": "generate_advice"})
+                            {"generate_advice": "generate_advice", "cancelled": END})
     g.add_edge("generate_advice", END)
 
     # Compile WITH the checkpointer if provided — that's what enables state
@@ -355,6 +394,10 @@ def run_agent_graph(resume_id, target_role=None, location=None,
             return result
         final_state = result
         final_status, error_code = _final_status(final_state)
+        if final_status != "cancelled" and _cancel_now({"run_id": run_id}):
+            # A route ended the graph because of a cancel that arrived after the last
+            # job (R13): report it as cancelled, never as success.
+            final_status, error_code = "cancelled", ErrorCode.CANCELLED
         finish_run(run_id, final_status, error_code=error_code,
                    stop_reason=(final_state.get("error") if final_status == "failed" else None))
         _clear_pending_review(run_id)   # run completed → no outstanding review
@@ -465,7 +508,7 @@ def _clear_pending_review(run_id):
 
 
 def resume_agent_graph(run_id, decision, comment="", reviewer_user_id=None,
-                       reviewer=None, queue_attempt=1):
+                       reviewer=None, queue_attempt=1, review_id=None):
     """
     Resume a paused run with the human's decision. Reopens the checkpointer,
     loads the checkpoint by thread_id, and continues via Command(resume=...).
@@ -503,10 +546,23 @@ def resume_agent_graph(run_id, decision, comment="", reviewer_user_id=None,
             graph = build_graph(checkpointer=checkpointer)
             config = {"configurable": {"thread_id": str(run_id)},
                       "recursion_limit": 100}
+            # R01: bind the decision to the interrupt the checkpoint is ACTUALLY paused
+            # on. A retried or stale-tab job whose review_id differs must not decide
+            # the next job; restore a consistent status from the checkpoint instead.
+            pending = pending_interrupt_value(graph, config)
+            if not cancel_requested and review_id is not None and (
+                    not pending or pending.get("review_id") != review_id):
+                if pending:
+                    _mark_run_status(run_id, "waiting_for_human", pending_review=pending)
+                log.warning("stale resume for review %s ignored (checkpoint waits on %s)",
+                            review_id, (pending or {}).get("review_id"), extra={"run_id": run_id})
+                return {"stale": True}
             result = graph.invoke(
                 Command(resume={"decision": decision, "comment": comment,
                                 "reviewer_user_id": reviewer_user_id,
-                                "reviewer": reviewer}),
+                                "reviewer": reviewer,
+                                "review_id": (pending or {}).get("review_id") if cancel_requested
+                                             else review_id}),
                 config=config)
 
         if _abandon_if_lost(run_id, "resume"):

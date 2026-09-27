@@ -92,8 +92,10 @@ def fetch_live_jobs(role, location=None, limit=10):
     try:
         resp = requests.get(REMOTIVE_API, params=params, headers=headers, timeout=20)
     except requests.exceptions.RequestException as e:
-        log.warning("remotive fetch failed (network: %s) — continuing with existing pool", e)
-        return ([], "network_error", f"network error: {e}")
+        from sanitize import safe_exception_summary
+        msg = "network error: " + safe_exception_summary(e)
+        log.warning("remotive fetch failed (%s) — continuing with existing pool", msg)
+        return ([], "network_error", msg)
     if resp.status_code == 429:
         return ([], "rate_limited", "Remotive rate limit (HTTP 429)")
     if resp.status_code >= 500:
@@ -212,7 +214,8 @@ def fetch_and_upsert_remotive(role, location=None, limit=10, run_id=None, step_i
                 conn.close()
     except Exception as e:
         status = "failed"
-        error_message = str(e)
+        from sanitize import redact_secrets
+        error_message = redact_secrets(e)
     latency_ms = int((time.time() - start) * 1000)
     _log_remotive_call(run_id, step_id, role, location, latency_ms,
                        fetched, inserted, skipped, status, error_message)
@@ -230,5 +233,5 @@ if __name__ == "__main__":
     for j in jobs:
         print(f"  - {j['title']} @ {j['company']} [{j['employment_type']}] ({j['external_id']})")
     if len(sys.argv) > 2 and sys.argv[2] == "--upsert":
-        ins, skip = upsert_live_jobs(jobs)
+        ins, skip, _ids = upsert_live_jobs(jobs)
         print(f"\nUpsert: {ins} inserted, {skip} skipped (already in pool)")

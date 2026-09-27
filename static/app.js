@@ -36,7 +36,7 @@ var NL = String.fromCharCode(10);
     var STATUS_CLASS = {
       success: 'success', failed: 'failed', running: 'running', queued: 'queued',
       retrying: 'retrying', waiting_for_human: 'waiting', cancelled: 'cancelled',
-      no_matches: 'no_matches', completed_with_errors: 'errors'
+      no_matches: 'no_matches', completed_with_errors: 'errors', partial_success: 'errors'
     };
     function statusClass(status) { return STATUS_CLASS[status] || 'errors'; }
 
@@ -124,6 +124,17 @@ var NL = String.fromCharCode(10);
               '<div style="margin-top:8px;">' +
                 '<label style="color:#e4e6eb;"><input type="checkbox" id="eval_' + r.id + '" style="width:auto;margin-right:6px;">Evaluate judged decisions with an LLM (extra API calls)</label>' +
               '</div>' +
+              '<div class="agent-opts">' +
+                '<label style="color:#e4e6eb;"><input type="checkbox" id="agent_' + r.id + '" style="width:auto;margin-right:6px;">Autonomous agent mode (adapts titles and providers until the goal is met or limits are reached)</label>' +
+                '<div class="row" style="margin-top:6px;">' +
+                  '<div><label>Target matches</label><br><input type="number" id="count_' + r.id + '" value="10" min="1" max="50" style="width:90%;"></div>' +
+                  '<div><label>Seniority (fixed)</label><br><select id="sen_' + r.id + '" style="width:100%;">' +
+                    '<option value="">(any)</option><option value="intern">intern</option><option value="entry">entry</option><option value="junior">junior</option><option value="mid">mid</option><option value="senior">senior</option>' +
+                  '</select></div>' +
+                '</div>' +
+                '<label style="color:#e4e6eb;"><input type="checkbox" id="maybe_' + r.id + '" style="width:auto;margin-right:6px;">Count "Maybe" matches toward the goal</label><br>' +
+                '<label style="color:#e4e6eb;"><input type="checkbox" id="llmadv_' + r.id + '" style="width:auto;margin-right:6px;">Use Gemini to improve suggestion wording (optional; rules are always used)</label>' +
+              '</div>' +
               '<div style="margin-top:8px;">' +
                 '<button class="btn-sm btn-approve" data-action="runResume" data-id="' + r.id + '">Run Search</button>' +
                 '<button class="btn-sm btn-reject" data-action="deleteResume" data-id="' + r.id + '">Delete</button>' +
@@ -147,6 +158,15 @@ var NL = String.fromCharCode(10);
       // up in proxy/access logs and browser history.
       const payload = { resume_id: Number(id), target_role: role, location: loc,
                         work_mode: mode, employment_type: emp, evaluate: doEval };
+      if (document.getElementById('agent_' + id).checked) {
+        payload.mode = 'agent';
+        payload.goal = {
+          target_count: Math.max(1, Math.min(50, Number(document.getElementById('count_' + id).value) || 10)),
+          seniority: document.getElementById('sen_' + id).value,
+          include_maybe: document.getElementById('maybe_' + id).checked,
+          use_llm_advice: document.getElementById('llmadv_' + id).checked
+        };
+      }
       try {
         const run = await csrfFetch('/runs', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -154,7 +174,7 @@ var NL = String.fromCharCode(10);
         });
         if (!run.ok) { const e = await run.json(); throw new Error(e.detail || 'run failed'); }
         const runData = await run.json();
-        setTimeout(function() { loadRuns(); loadDetail(runData.run_id); }, 1500);
+        setTimeout(function() { loadRuns(); selectRun(runData.run_id); }, 1500);
       } catch (err) { alert('Error: ' + err.message); }
     }
 
@@ -192,8 +212,8 @@ var NL = String.fromCharCode(10);
             '<td style="font-size:12px;color:#b0b4c0;">' + escapeHtml(searchDesc) + '</td>' +
             '<td>' + escapeHtml((r.started_at || '').replace('T', ' ').slice(0, 16)) + '</td>' +
             '<td>' + escapeHtml(r.total_tokens || 0) + '</td>' +
-            '<td title="estimated paid-tier cost">est. $' + escapeHtml((r.total_cost || 0).toFixed(6)) + '</td>';
-          tr.onclick = function() { loadDetail(r.id); };
+            '<td title="estimated paid-tier cost">' + (r.total_cost == null ? 'unknown' : 'est. $' + escapeHtml(Number(r.total_cost).toFixed(6))) + '</td>';
+          tr.onclick = function() { selectRun(r.id); };
           tbody.appendChild(tr);
         }
       } catch (err) {
@@ -201,12 +221,102 @@ var NL = String.fromCharCode(10);
       }
     }
 
-    async function loadDetail(id) {
+    // R21: every loadDetail call gets a generation number; a slower response for a
+    // previously selected run is dropped instead of overwriting the current view.
+    var _detailGen = 0;
+    var _selectedRun = null;
+    var _detailAbort = null;
+
+    function selectRun(id) {
+      _selectedRun = id;
+      _detailGen += 1;
+      if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+      return loadDetail(id, _detailGen);
+    }
+
+    function renderResults(data) {
+      var rows = (data && data.rankings) || [];
+      if (!rows.length) return '<div class="step note">No ranked results were persisted for this run.</div>';
+      var html = '<div class="section-title">Ranked results</div>';
+      for (const r of rows) {
+        html += '<div class="step result">' +
+          '<strong>#' + escapeHtml(r.rank) + ' ' + escapeHtml(r.final_decision || '') + '</strong> &nbsp; ' +
+          escapeHtml(r.title) + ' <span class="note">@ ' + escapeHtml(r.company || '') + '</span>' +
+          ' <span class="call">score ' + escapeHtml(r.score) + '</span>';
+        if (r.apply_url) {
+          html += ' <a href="' + escapeHtml(r.apply_url) + '" target="_blank" rel="noopener noreferrer">apply &#8599;</a>';
+        }
+        var sug = r.suggestions || [];
+        if (sug.length) {
+          html += '<details><summary>' + escapeHtml(sug.length) + ' resume suggestion(s)</summary>';
+          for (const sg of sug) {
+            html += '<div class="sugg ' + escapeHtml(sg.status) + '">' +
+              '<span class="op">' + escapeHtml(sg.kind) + '</span> <span class="note">[' + escapeHtml(sg.method) + ', ' + escapeHtml(sg.status) + ']</span>' +
+              (sg.original_text ? '<div class="call">original: ' + escapeHtml(sg.original_text) + '</div>' : '') +
+              '<div>' + escapeHtml(sg.suggested_text) + '</div>' +
+              '<div class="note">why: ' + escapeHtml(sg.reason) + '</div>' +
+              (sg.validation_notes ? '<div class="reason">check: ' + escapeHtml(sg.validation_notes) + '</div>' : '') +
+              '</div>';
+          }
+          html += '</details>';
+        } else if (r.advice) {
+          html += '<details><summary>advice</summary><pre class="io">' + escapeHtml(r.advice) + '</pre></details>';
+        }
+        html += '</div>';
+      }
+      return html;
+    }
+
+    function renderAgent(a) {
+      if (!a || a.mode !== 'agent') return '';
+      var p = a.progress || {};
+      var html = '<div class="section-title">Agent progress</div><div class="step">' +
+        'Goal: ' + escapeHtml((a.goal && a.goal.description) || '') +
+        '<div>Qualified: <strong>' + escapeHtml(p.qualified == null ? '?' : p.qualified) + '/' + escapeHtml(p.target_count) + '</strong>' +
+        ' &nbsp; discovered ' + escapeHtml(p.discovered) + ' &nbsp; evaluated ' + escapeHtml(p.evaluated) +
+        ' &nbsp; searches ' + escapeHtml(p.searches) + '</div>' +
+        '<div>Controller: <strong>' + escapeHtml(a.controller_mode || '-') + '</strong>' +
+        (p.controller_note ? ' <span class="reason">(' + escapeHtml(p.controller_note) + ')</span>' : '') + '</div>' +
+        '<div class="note">LLM calls reserved ' + escapeHtml(a.llm_calls.reserved) + '/' + escapeHtml(a.llm_calls.budget) +
+        ' &nbsp; est. cost $' + escapeHtml((a.cost.known_estimated_usd || 0).toFixed(6)) +
+        (a.cost.complete ? '' : ' (+' + escapeHtml(a.cost.calls_with_unknown_cost) + ' call(s) with unknown cost)') + '</div>' +
+        '<div class="note">Fixed constraints: ' + escapeHtml(JSON.stringify((a.goal && a.goal.constraints) || {})) + '</div></div>';
+      for (const act of (a.actions || [])) {
+        var cls = act.status === 'executed' ? '' : (act.status === 'rejected' ? 'review' : 'call-failed');
+        html += '<div class="step ' + cls + '"><span class="op">#' + escapeHtml(act.iteration) + ' ' + escapeHtml(act.action) + '</span> ' +
+          '<span class="note">[' + escapeHtml(act.decided_by) + ' &rarr; ' + escapeHtml(act.status) + ']</span> ' +
+          escapeHtml(act.reason || '') +
+          '<details><summary>arguments / observation</summary><pre class="io">' +
+          escapeHtml(JSON.stringify(act.arguments || {}, null, 1)) + NL + NL +
+          escapeHtml(JSON.stringify(act.observation || {}, null, 1)) +
+          (act.error ? NL + NL + 'ERROR: ' + escapeHtml(act.error) : '') + '</pre></details></div>';
+      }
+      return html;
+    }
+
+    async function loadDetail(id, gen) {
+      if (gen === undefined) { return selectRun(id); }
       const d = document.getElementById('detail');
+      if (_detailAbort) { try { _detailAbort.abort(); } catch (e) {} }
+      _detailAbort = new AbortController();
+      const signal = _detailAbort.signal;
       try {
-        const res = await fetch('/runs/' + id);
+        const res = await fetch('/runs/' + id, { signal: signal });
         if (!res.ok) throw new Error('failed to load run ' + id);
         const run = await res.json();
+        if (gen !== _detailGen) return;       // a newer selection superseded this one
+        var extras = '';
+        if (!isActive(run.status) && run.status !== 'waiting_for_human') {
+          try {
+            const rr = await fetch('/runs/' + id + '/rankings', { signal: signal });
+            if (rr.ok) extras += renderResults(await rr.json());
+          } catch (e) { if (e.name === 'AbortError') return; }
+        }
+        try {
+          const ar = await fetch('/runs/' + id + '/agent', { signal: signal });
+          if (ar.ok) extras += renderAgent(await ar.json());
+        } catch (e) { if (e.name === 'AbortError') return; }
+        if (gen !== _detailGen) return;
 
         const total = run.steps.length;
         const done = run.steps.filter(function(s) {
@@ -247,6 +357,8 @@ var NL = String.fromCharCode(10);
             '</div>';
         }
 
+        html += extras;
+        html += '<div class="section-title">Execution trace</div>';
         var lastAttempt = null;
         for (const s of run.steps) {
           // Group trace rows by execution attempt, so a retried run's second pass
@@ -315,12 +427,16 @@ var NL = String.fromCharCode(10);
         d.innerHTML = html;
 
         if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
-        if (active) {
-          pollTimer = setTimeout(function() { loadDetail(id); }, 3000);
+        // Keep polling while the run can still change — including while it waits for
+        // a human, so the view follows the run after the review is submitted.
+        if (active || run.status === 'waiting_for_human') {
+          pollTimer = setTimeout(function() { if (gen === _detailGen) loadDetail(id, gen); }, 3000);
         } else {
           loadRuns();
         }
       } catch (err) {
+        if (err.name === 'AbortError') return;
+        if (gen !== _detailGen) return;
         d.innerHTML = '<div style="color:#f87171;">Could not load run detail: ' + escapeHtml(err.message) + '</div>';
       }
     }
@@ -336,44 +452,70 @@ var NL = String.fromCharCode(10);
         const res = await fetch('/reviews/pending');
         if (!res.ok) throw new Error('failed to load reviews');
         const cards = await res.json();
+        // R21: only rebuild the panel when the SET of pending reviews changed, so a
+        // half-typed comment and input focus survive the 4-second poll.
+        var signature = cards.map(function(c) { return c.run_id + '|' + ((c.pending_review || {}).review_id || ''); }).join(',');
+        if (signature === _reviewSignature) return;
+        var drafts = {};
+        box.querySelectorAll('input.rev-input').forEach(function(el) { drafts[el.id] = el.value; });
+        _reviewSignature = signature;
         if (!cards.length) { box.innerHTML = ''; return; }
         let html = '<div class="section-title">Runs Awaiting Your Review</div>';
         for (const card of cards) {
           const r = { id: card.run_id };
           const pr = card.pending_review || {};
+          const rid = escapeHtml(pr.review_id || '');
+          if (pr.type === 'input_request') {
+            html += '<div class="step review"><strong>Run #' + escapeHtml(r.id) + '</strong> &mdash; the agent needs your input' +
+              '<div style="margin-top:6px;">' + escapeHtml(pr.question) + '</div><div style="margin-top:8px;">';
+            for (const opt of (pr.options || [])) {
+              html += '<button class="btn-sm" data-action="answerRun" data-id="' + r.id + '" data-review="' + rid + '" data-answer="' + escapeHtml(opt) + '">' + escapeHtml(opt) + '</button>';
+            }
+            html += '</div></div>';
+            continue;
+          }
           html += '<div class="step review">' +
             '<strong>Run #' + escapeHtml(r.id) + '</strong> &mdash; ' +
-            escapeHtml(pr.job_title || '(job)') +
+            escapeHtml(pr.job_title || '(job)') + (pr.company ? ' @ ' + escapeHtml(pr.company) : '') +
             ' | score ' + escapeHtml(pr.score) + ' (' + escapeHtml(pr.score_decision) + ')' +
             ' | LLM: ' + escapeHtml(pr.llm_decision) +
             '<div class="reason" style="margin-top:6px;">Why this paused: ' +
               escapeHtml(pr.review_reason || 'flagged for review') + '</div>' +
             '<div style="margin-top:8px;">' +
-              '<input id="grc_' + r.id + '" class="rev-input" placeholder="comment (optional)" style="width:260px;">' +
+              '<input id="grc_' + r.id + '_' + rid.replace(/[^a-zA-Z0-9_]/g, '_') + '" class="rev-input" placeholder="comment (optional)" style="width:260px;">' +
             '</div>' +
             '<div style="margin-top:8px;">' +
-              '<button class="btn-sm btn-approve" data-action="resumeRun" data-id="' + r.id + '" data-decision="Apply">Apply</button>' +
-              '<button class="btn-sm" data-action="resumeRun" data-id="' + r.id + '" data-decision="Maybe">Maybe</button>' +
-              '<button class="btn-sm btn-reject" data-action="resumeRun" data-id="' + r.id + '" data-decision="Skip">Skip</button>' +
+              '<button class="btn-sm btn-approve" data-action="resumeRun" data-id="' + r.id + '" data-review="' + rid + '" data-decision="Apply">Apply</button>' +
+              '<button class="btn-sm" data-action="resumeRun" data-id="' + r.id + '" data-review="' + rid + '" data-decision="Maybe">Maybe</button>' +
+              '<button class="btn-sm btn-reject" data-action="resumeRun" data-id="' + r.id + '" data-review="' + rid + '" data-decision="Skip">Skip</button>' +
             '</div></div>';
         }
         box.innerHTML = html;
+        Object.keys(drafts).forEach(function(k) { var el = document.getElementById(k); if (el) el.value = drafts[k]; });
       } catch (err) {
         box.innerHTML = '<div class="step" style="color:#f87171;">Could not load reviews: ' + escapeHtml(err.message) + '</div>';
       }
     }
 
-    async function resumeRun(runId, decision) {
-      const el = document.getElementById('grc_' + runId);
+    var _reviewSignature = null;
+
+    async function resumeRun(runId, decision, reviewId, answer) {
+      const el = document.getElementById('grc_' + runId + '_' + String(reviewId || '').replace(/[^a-zA-Z0-9_]/g, '_'));
       const comment = el ? el.value : '';
+      const body = { decision: decision || 'Maybe', comment: comment, review_id: reviewId || null };
+      if (answer !== undefined) body.answer = answer;
       try {
         const res = await csrfFetch('/runs/' + runId + '/resume', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ decision: decision, comment: comment })
+          body: JSON.stringify(body)
         });
         if (!res.ok) { const e = await res.json(); throw new Error(e.detail || 'resume failed'); }
-        setTimeout(function() { loadRuns(); renderGraphReviews(); }, 1200);
-      } catch (err) { alert('Error: ' + err.message); }
+        _reviewSignature = null;
+        setTimeout(function() {
+          loadRuns(); renderGraphReviews();
+          if (_selectedRun === Number(runId) || String(_selectedRun) === String(runId)) selectRun(runId);
+        }, 1200);
+      } catch (err) { alert('Error: ' + err.message); _reviewSignature = null; renderGraphReviews(); }
     }
 
     // --- Auth gate -----------------------------------------------------------
@@ -435,6 +577,15 @@ var NL = String.fromCharCode(10);
       }
       _csrfToken = null;   // drop the old session's token; next session fetches a fresh one
       if (_reviewTimer) { clearInterval(_reviewTimer); _reviewTimer = null; }
+      // R21: clear every piece of the previous user's rendered data and timers.
+      if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
+      if (_detailAbort) { try { _detailAbort.abort(); } catch (e) {} }
+      _detailGen += 1; _selectedRun = null; _reviewSignature = null;
+      ['detail', 'graphReviews', 'resumeLibrary'].forEach(function(i) {
+        var el = document.getElementById(i); if (el) el.innerHTML = '';
+      });
+      var tb = document.querySelector('#runs tbody'); if (tb) tb.innerHTML = '';
+      var pw = document.getElementById('loginPass'); if (pw) pw.value = '';
       showLogin('Signed out.');
     }
 
@@ -462,7 +613,8 @@ var NL = String.fromCharCode(10);
       runResume: function(el) { runResume(el.dataset.id); },
       deleteResume: function(el) { deleteResume(el.dataset.id); },
       cancelRun: function(el) { cancelRun(el.dataset.id); },
-      resumeRun: function(el) { resumeRun(el.dataset.id, el.dataset.decision); }
+      resumeRun: function(el) { resumeRun(el.dataset.id, el.dataset.decision, el.dataset.review); },
+      answerRun: function(el) { resumeRun(el.dataset.id, 'Maybe', el.dataset.review, el.dataset.answer); }
     };
     document.addEventListener('click', function(ev) {
       var el = ev.target.closest('[data-action]');

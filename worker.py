@@ -130,7 +130,7 @@ def _run_outcome(run_id):
     if not row:
         return TERMINAL_FAILURE, None   # run vanished — nothing to retry into
     status, error_code = row
-    if status in ("success", "no_matches", "completed_with_errors",
+    if status in ("success", "partial_success", "no_matches", "completed_with_errors",
                   "cancelled", "waiting_for_human"):
         return SUCCESS, error_code
     if status == "failed":
@@ -147,6 +147,15 @@ def _run_job(job):
     the worker (this is the worker's whole purpose)."""
     kind = job["kind"]
     p = job["payload"]
+    if _run_mode(job.get("run_id") or p.get("run_id")) == "agent":
+        import agent_loop
+        if kind == "start_run":
+            agent_loop.run_agent_loop(p["run_id"], queue_attempt=job.get("attempts", 1))
+        elif kind == "resume_run":
+            agent_loop.resume_agent_loop(p["run_id"], p, queue_attempt=job.get("attempts", 1))
+        else:
+            raise ValueError(f"unknown job kind: {kind}")
+        return
     if kind == "start_run":
         run_agent_graph(
             resume_id=p["resume_id"],
@@ -162,9 +171,24 @@ def _run_job(job):
         resume_agent_graph(p["run_id"], p["decision"], p.get("comment", ""),
                            reviewer_user_id=p.get("reviewer_user_id"),
                            reviewer=p.get("reviewer"),
-                           queue_attempt=job.get("attempts", 1))
+                           queue_attempt=job.get("attempts", 1),
+                           review_id=p.get("review_id"))
     else:
         raise ValueError(f"unknown job kind: {kind}")
+
+
+def _run_mode(run_id):
+    """'agent' or 'pipeline' (pre-0010 databases have no mode column -> pipeline)."""
+    if run_id is None:
+        return "pipeline"
+    try:
+        with get_connection() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT mode FROM runs WHERE id = %s", (run_id,))
+            row = cur.fetchone()
+        return (row[0] if row else None) or "pipeline"
+    except Exception:
+        return "pipeline"
 
 
 def _job_is_stale(job):
@@ -181,12 +205,20 @@ def _job_is_stale(job):
         return False
     with get_connection() as conn:
         cur = conn.cursor()
-        cur.execute("SELECT status FROM runs WHERE id = %s", (run_id,))
+        cur.execute("SELECT status, error_code FROM runs WHERE id = %s", (run_id,))
         row = cur.fetchone()
     if not row:
         return True
-    # A start_run or resume_run is only meaningful while the run is still active.
-    return row[0] not in ("queued", "retrying", "running")
+    status, error_code = row
+    if status in ("queued", "retrying", "running"):
+        return False
+    # R02: a run left 'failed' with a RETRYABLE code by an older (non-atomic) crash
+    # still has a legitimate retry pending — do not close it without executing.
+    if status == "failed" and error_code in RETRYABLE_ERROR_CODES:
+        return False
+    # Anything else (finished, cancelled, paused for a human) means the run moved on.
+    # (resume_run decisions are additionally bound to their review_id in the graph.)
+    return True
 
 
 def _process(job):
@@ -299,23 +331,14 @@ def _process_locked(job, lock):
                             job["id"], extra={"run_id": job["run_id"]})
         else:
             terminal = (outcome == TERMINAL_FAILURE)
-            res = job_queue.mark_failed(job["id"], code or outcome, job["attempts"],
-                                        job["max_attempts"], lease, terminal=terminal)
+            # R02: queue row + run status change in ONE lease-guarded transaction.
+            res = job_queue.fail_job_and_run(job["id"], lease, job.get("run_id"),
+                                             code or outcome, job["attempts"],
+                                             job["max_attempts"], terminal=terminal,
+                                             error_code=code)
             log.error("job %s (%s) failed [%s, code=%s] — %s",
                       job["id"], job["kind"], "terminal" if terminal else "retryable",
                       code, res, extra={"run_id": job["run_id"]})
-            # Keep the RUN's status consistent with the QUEUE outcome.
-            if job.get("run_id") is not None:
-                if res == "requeued":
-                    # Will retry after backoff — show 'retrying', not the graph's
-                    # 'failed', while keeping the last attempt's error_code.
-                    _mark_run_retrying(job["run_id"])
-                elif res == "failed":
-                    # Terminal/exhausted — make sure the run is finalized too (it may
-                    # still be queued/running if _run_job raised before the graph
-                    # could finalize). No-op if already terminal.
-                    _finalize_run_failed_if_active(job["run_id"], code)
-                # res == "lost": another worker owns it now — don't touch the run.
     finally:
         stop.set()
 

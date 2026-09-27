@@ -56,3 +56,7 @@ h2 { font-size: 16px; margin: 8px 0 16px; }
 .rev-input { background: #0d0f15; border: 1px solid #2a2e3a; border-radius: 4px; padding: 5px; color: #e4e6eb; font-size: 12px; margin-right: 6px; }
 .note { text-transform: none; color: #8b8f9c; font-weight: normal; font-size: 12px; }
 .retry { color: #fbbf24; font-size: 11px; }
+.agent-opts { margin-top: 8px; padding: 8px; border: 1px dashed #3a3f4b; border-radius: 6px; }
+.step.result a { color: #60a5fa; margin-left: 6px; }
+.sugg { margin: 6px 0; padding: 6px 8px; border-left: 3px solid #34d399; background: #1b1f27; }
+.sugg.needs_confirmation { border-left-color: #fbbf24; }

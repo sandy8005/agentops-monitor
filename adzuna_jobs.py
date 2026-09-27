@@ -95,7 +95,8 @@ def fetch_adzuna_jobs(role, location=None, limit=10):
         resp = requests.get(url, params=params, timeout=20)
     except requests.exceptions.RequestException as e:
         # DNS / connection refused / timeout — request never got an HTTP response.
-        msg = f"network error: {e}"
+        from sanitize import safe_exception_summary
+        msg = "network error: " + safe_exception_summary(e)
         log.warning("Adzuna fetch failed (%s) — continuing with existing pool", msg)
         return ([], "network_error", msg)
 
@@ -229,8 +230,9 @@ def fetch_and_upsert_adzuna(role, location=None, limit=10, run_id=None, step_id=
     except Exception as e:
         # Only reaches here for UNEXPECTED errors (e.g. DB failure during upsert);
         # fetch-level problems are already classified and returned as status above.
+        from sanitize import redact_secrets
         status = "failed"
-        error_message = str(e)
+        error_message = redact_secrets(e)
     latency_ms = int((time.time() - start) * 1000)
 
     _log_adzuna_call(run_id, step_id, role, location, latency_ms,

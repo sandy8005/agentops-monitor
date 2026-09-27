@@ -58,6 +58,21 @@ def _scrub_run_payloads(cur, run_ids):
                 "WHERE run_id = ANY(%s)", (run_ids,))
     cur.execute("UPDATE run_advice SET advice = %s WHERE run_id = ANY(%s)", (ERASED, run_ids))
     cur.execute("UPDATE runs SET pending_review = NULL WHERE id = ANY(%s)", (run_ids,))
+    # R04: error text can embed resume/job content; review comments are user-authored.
+    cur.execute("UPDATE llm_calls SET error_message = NULL WHERE run_id = ANY(%s)", (run_ids,))
+    cur.execute("UPDATE tool_calls SET error_message = NULL WHERE run_id = ANY(%s)", (run_ids,))
+    cur.execute("UPDATE steps SET error_message = NULL WHERE run_id = ANY(%s)", (run_ids,))
+    cur.execute("UPDATE runs SET stop_reason = CASE WHEN stop_reason IS NULL THEN NULL "
+                "ELSE '[erased]' END, goal_progress = NULL WHERE id = ANY(%s)", (run_ids,))
+    cur.execute("UPDATE job_queue SET payload = payload - 'comment' - 'answer', last_error = NULL "
+                "WHERE run_id = ANY(%s)", (run_ids,))
+    # Agent-controller tables (migration 0010): observations can quote job titles,
+    # review requests carry comments/answers, suggestions quote the resume.
+    cur.execute("UPDATE agent_actions SET arguments = NULL, observation = NULL, reason = NULL, "
+                "error = NULL WHERE run_id = ANY(%s)", (run_ids,))
+    cur.execute("UPDATE review_requests SET payload = NULL, comment = NULL, answer = NULL "
+                "WHERE run_id = ANY(%s)", (run_ids,))
+    cur.execute("DELETE FROM resume_suggestions WHERE run_id = ANY(%s)", (run_ids,))
     threads = [str(r) for r in run_ids]
     for t in _existing_checkpoint_tables(cur):
         cur.execute(f"DELETE FROM {t} WHERE thread_id = ANY(%s)", (threads,))
@@ -116,7 +131,9 @@ def delete_run(run_id, user_id):
         if row[0] in ACTIVE_RUN_STATUSES:
             raise ErasureConflict("run is still in progress; cancel it first")
         _scrub_run_payloads(cur, [run_id])       # checkpoints live outside the FK graph
-        for table in ("evaluations", "llm_calls", "tool_calls", "run_rankings", "run_advice"):
+        for table in ("evaluations", "llm_calls", "tool_calls", "run_rankings", "run_advice",
+                      "agent_actions", "agent_searches", "review_requests",
+                      "resume_suggestions"):
             cur.execute(f"DELETE FROM {table} WHERE run_id = %s", (run_id,))
         cur.execute("DELETE FROM steps WHERE run_id = %s", (run_id,))
         cur.execute("DELETE FROM job_searches WHERE run_id = %s", (run_id,))  # results cascade

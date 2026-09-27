@@ -1,13 +1,25 @@
 from skills import (canonical_skill, canonical_set, normalize_requirements,
-                    skill_in_text, text_index)
+                    skill_in_text, text_index, affirmative_skill_in_text)
 
 
-def _skill_present(skill, resume_text_lower, resume_tokens):
-    """Whole-word, ALIAS-AWARE skill match ('go' never matches inside 'django';
-    'Kubernetes' matches 'K8s'). See skills.py for the canonical vocabulary."""
+def _skill_present(skill, resume_text_lower, resume_tokens, raw_text=None,
+                   surface_forms=None, negated_out=None):
+    """Whole-word, ALIAS-AWARE, NEGATION-AWARE skill match ('go' never matches inside
+    'django'; 'Kubernetes' matches 'K8s'; 'No Python experience' is NOT Python
+    evidence). A skill that is only mentioned in negated form is recorded in
+    `negated_out` so the caller can surface it for review (R08)."""
     if not (skill or "").strip():
         return False
-    return skill_in_text(skill, resume_text_lower, resume_tokens)
+    forms = (surface_forms or {}).get(canonical_skill(skill))
+    if not skill_in_text(skill, resume_text_lower, resume_tokens, forms):
+        return False
+    if raw_text is None:
+        return True
+    if affirmative_skill_in_text(skill, raw_text, forms):
+        return True
+    if negated_out is not None and skill not in negated_out:
+        negated_out.append(skill)
+    return False
 
 
 def effective_years(parsed_resume, mode="conservative"):
@@ -50,6 +62,13 @@ def calculate_match_score(parsed_resume, requirements, resume_text, job=None, us
     # Canonicalize + DEDUPLICATE first: "K8s"/"Kubernetes" is one requirement, and a
     # flat skill that also appears in an any-of group is not counted twice.
     requirements = normalize_requirements(requirements)
+    surface = requirements.get("_surface_forms") or {}
+    negated = []
+    raw = resume_text or ""
+
+    def present(skill):
+        return _skill_present(skill, resume_text_lower, resume_tokens, raw, surface, negated)
+
     required = list(requirements["required_skills"])
     any_of_groups = [list(g) for g in requirements.get("required_any_of", [])]
     preferred = list(requirements["preferred_skills"])
@@ -78,13 +97,13 @@ def calculate_match_score(parsed_resume, requirements, resume_text, job=None, us
     if total_required_items > 0:
         met = 0
         for s in required:
-            if _skill_present(s, resume_text_lower, resume_tokens):
+            if present(s):
                 met += 1
                 matched_required.append(s)
             else:
                 missing_required.append(s)
         for group in any_of_groups:
-            if any(_skill_present(s, resume_text_lower, resume_tokens) for s in group):
+            if any(present(s) for s in group):
                 met += 1
                 matched_required.append(" / ".join(group))
             else:
@@ -99,7 +118,7 @@ def calculate_match_score(parsed_resume, requirements, resume_text, job=None, us
     missing_preferred = []
     if preferred:
         for s in preferred:
-            if _skill_present(s, resume_text_lower, resume_tokens):
+            if present(s):
                 matched_preferred.append(s)
             else:
                 missing_preferred.append(s)
@@ -205,4 +224,7 @@ def calculate_match_score(parsed_resume, requirements, resume_text, job=None, us
         "missing_skills": missing_required,
         "matched_preferred": matched_preferred,
         "missing_preferred": missing_preferred,
+        # Skills the resume mentions ONLY in negated form ("no Python experience").
+        # They are scored as absent; the router forces a review when any appear.
+        "negated_skills": negated,
     }

@@ -335,12 +335,33 @@ def list_runs(limit: int = Query(20, ge=1, le=100), user: dict = Depends(require
         return [
             {"id": r[0], "status": r[1],
              "started_at": r[2].isoformat() if r[2] else None,
-             "total_tokens": r[3], "total_cost": float(r[4]) if r[4] else 0,
+             "total_tokens": r[3], "total_cost": float(r[4]) if r[4] is not None else None,
              "cost_basis": "estimated_paid_tier",
              "target_role": r[5], "location": r[6], "work_mode": r[7],
              "error_code": r[8]}
             for r in rows
         ]
+
+
+class AgentGoalRequest(BaseModel):
+    """Goal options for mode='agent'. Location, work mode and employment type come
+    from the run's own fields and become FIXED constraints the controller cannot
+    change."""
+    model_config = ConfigDict(extra="forbid")
+    target_count: int = Field(10, ge=1, le=50)
+    alternative_titles: list[str] = Field(default_factory=list, max_length=8)
+    seniority: Literal["", "intern", "entry", "junior", "mid", "senior"] = ""
+    include_maybe: bool = False
+    providers: list[Literal["adzuna", "remotive", "pool"]] = Field(
+        default_factory=lambda: ["adzuna", "remotive"])
+    max_iterations: int = Field(20, ge=1, le=60)
+    max_searches: int = Field(6, ge=1, le=20)
+    max_llm_calls: int = Field(40, ge=0, le=200)
+    max_runtime_seconds: int = Field(1800, ge=60, le=14400)
+    max_cost_usd: float = Field(0.5, ge=0.0, le=20.0)
+    use_llm_controller: bool = True
+    use_llm_advice: bool = False
+    on_model_unavailable: Literal["rules", "pause"] = "rules"
 
 
 class StartRunRequest(BaseModel):
@@ -357,14 +378,47 @@ class StartRunRequest(BaseModel):
     employment_type: EmploymentType = ""
     evaluate: bool = False
     live_only: bool = False
+    mode: Literal["pipeline", "agent"] = "pipeline"
+    goal: Optional[AgentGoalRequest] = None
 
 
 class ResumeRunRequest(BaseModel):
     """JSON body for POST /runs/{id}/resume (the reviewer's comment is free text and
-    must not travel in the URL either)."""
+    must not travel in the URL either). review_id binds the decision to the exact
+    review card that was shown (R01): a stale tab gets 409, never another job."""
     model_config = ConfigDict(extra="forbid")
     decision: Decision = "Maybe"
     comment: str = ""
+    review_id: Optional[str] = Field(None, max_length=100)
+    answer: Optional[str] = Field(None, max_length=60)
+
+
+def _build_agent_goal(body):
+    """Validated AgentGoal from the request (raises HTTPException 422 on conflict)."""
+    from agent_goal import AgentGoal
+    g = body.goal or AgentGoalRequest()
+    try:
+        return AgentGoal(
+            description=f"Find {g.target_count} suitable {g.seniority + ' ' if g.seniority else ''}"
+                        f"{body.target_role.strip()} roles",
+            target_role=body.target_role.strip(),
+            alternative_titles=g.alternative_titles,
+            target_count=g.target_count,
+            qualifying_decisions=["Apply", "Maybe"] if g.include_maybe else ["Apply"],
+            providers=g.providers,
+            constraints={"location": body.location.strip(), "work_mode": body.work_mode,
+                         "employment_type": body.employment_type, "seniority": g.seniority},
+            limits={"max_iterations": g.max_iterations, "max_searches": g.max_searches,
+                    "max_llm_calls": g.max_llm_calls,
+                    "max_runtime_seconds": g.max_runtime_seconds,
+                    "max_cost_usd": g.max_cost_usd},
+            evaluate_quality=body.evaluate,
+            use_llm_controller=g.use_llm_controller,
+            use_llm_advice=g.use_llm_advice,
+            on_model_unavailable=g.on_model_unavailable,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=422, detail=f"invalid agent goal: {e}")
 
 
 @app.get("/reviews/pending")
@@ -402,6 +456,9 @@ def start_run(request: Request, body: StartRunRequest,
         raise HTTPException(status_code=400, detail="target_role is required for a search")
     _check_len("target_role", target_role, MAX_ROLE_CHARS)
     _check_len("location", location, MAX_LOCATION_CHARS)
+    agent_goal = _build_agent_goal(body) if body.mode == "agent" else None
+    if body.mode != "agent" and body.goal is not None:
+        raise HTTPException(status_code=422, detail="goal is only valid with mode='agent'")
 
     conn = get_connection()
     try:
@@ -417,6 +474,16 @@ def start_run(request: Request, body: StartRunRequest,
         if row[0]:
             raise HTTPException(status_code=400, detail="That resume was deleted; upload it again to run new searches")
 
+        # R22: lock the resume row (compatible with erase_resume's FOR UPDATE) and
+        # re-check deletion under the lock, so a concurrent erase either wins (and
+        # this start is rejected) or waits until the run exists (and the erase then
+        # sees an active run and returns 409).
+        cur.execute("SELECT is_deleted FROM resumes WHERE id = %s AND user_id = %s FOR SHARE",
+                    (resume_id, user["id"]))
+        locked = cur.fetchone()
+        if not locked or locked[0]:
+            raise HTTPException(status_code=409, detail="That resume was deleted; upload it again")
+
         # ATOMIC: create the run AND enqueue its worker job in ONE transaction, so
         # they commit or roll back together. Previously create_run() and enqueue()
         # committed on separate connections: if enqueue failed, the run was left
@@ -426,10 +493,17 @@ def start_run(request: Request, body: StartRunRequest,
                                target_role=target_role, location=location,
                                work_mode=work_mode, employment_type=employment_type,
                                user_id=user["id"])
+        if agent_goal is not None:
+            import json as _json
+            cur.execute("UPDATE runs SET mode = 'agent', goal_json = %s, llm_call_budget = %s "
+                        "WHERE id = %s",
+                        (_json.dumps(agent_goal.model_dump()), agent_goal.limits.max_llm_calls,
+                         run_id))
         job_id = enqueue_tx(cur, "start_run", {
             "resume_id": resume_id, "target_role": target_role, "location": location,
             "work_mode": work_mode, "employment_type": employment_type,
             "evaluate": evaluate, "run_id": run_id, "live_only": live_only,
+            "mode": body.mode,
         }, run_id=run_id)
         conn.commit()
     except HTTPException:
@@ -442,7 +516,7 @@ def start_run(request: Request, body: StartRunRequest,
     finally:
         conn.close()
     return {"run_id": run_id, "resume_id": resume_id, "target_role": target_role,
-            "live_only": live_only, "job_id": job_id,
+            "live_only": live_only, "job_id": job_id, "mode": body.mode,
             "message": f"Run {run_id} enqueued (job {job_id})."}
 
 
@@ -618,12 +692,15 @@ def get_run(run_id: int, user: dict = Depends(require_auth)):
             "started_at": run[2].isoformat() if run[2] else None,
             "ended_at": run[3].isoformat() if run[3] else None,
             "input_summary": run[4],
-            "total_tokens": run[5], "total_cost": float(run[6]) if run[6] else 0,
+            "total_tokens": run[5],
+            # NULL total = no call had a known price (R15) — never shown as $0.
+            "total_cost": float(run[6]) if run[6] is not None else None,
             "cost_basis": "estimated_paid_tier",
             "resume_id": run[7], "target_role": run[8], "location": run[9],
             "work_mode": run[10], "employment_type": run[11],
             "pending_review": run[12],
-            "stop_reason": run[13], "error_code": run[14],
+            # R04: stop_reason can embed exception text derived from user input.
+            "stop_reason": _redact(run[13]), "error_code": run[14],
             "attempt": run[15],
             "last_attempt_ended_at": run[16].isoformat() if run[16] else None,
             "steps": steps
@@ -645,14 +722,33 @@ def resume_run(run_id: int, body: ResumeRunRequest,
         # resume / double-click serializes behind this lock, so exactly one request
         # flips the run — the equivalent of the old rowcount compare-and-swap, but
         # now the flip and the enqueue live in the SAME transaction.
-        cur.execute("SELECT status FROM runs WHERE id = %s AND user_id = %s FOR UPDATE",
-                    (run_id, user["id"]))
+        cur.execute("SELECT status, pending_review, mode FROM runs "
+                    "WHERE id = %s AND user_id = %s FOR UPDATE", (run_id, user["id"]))
         row = cur.fetchone()
         if not row:
             raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
         if row[0] != "waiting_for_human":
             raise HTTPException(status_code=409,
                                 detail=f"Run {run_id} is not awaiting review (already {row[0]})")
+        pending = row[1] or {}
+        expected = pending.get("review_id")
+        # R01: the decision must name the review card currently pending. A stale tab
+        # (the run moved on to another job) is rejected instead of deciding that job.
+        if expected is not None and body.review_id != expected:
+            raise HTTPException(status_code=409,
+                                detail="This review is no longer current; refresh and try again")
+        if pending.get("type") == "input_request":
+            if body.answer not in (pending.get("options") or []):
+                raise HTTPException(status_code=422, detail="answer must be one of the offered options")
+        if row[2] == "agent":
+            cur.execute("""
+                UPDATE review_requests SET status = 'submitted', decision = %s, answer = %s,
+                       comment = %s, reviewer_user_id = %s, reviewer = %s, submitted_at = NOW()
+                WHERE review_id = %s AND run_id = %s AND status = 'pending'
+            """, (decision if pending.get("type") != "input_request" else None, body.answer,
+                  comment, user["id"], user["username"], expected, run_id))
+            if cur.rowcount != 1:
+                raise HTTPException(status_code=409, detail="This review was already answered")
 
         # ATOMIC: move waiting_for_human -> queued AND enqueue the resume job
         # together. The run goes back to 'queued' (not straight to 'running') because
@@ -663,7 +759,8 @@ def resume_run(run_id: int, body: ResumeRunRequest,
         cur.execute("UPDATE runs SET status = 'queued' WHERE id = %s", (run_id,))
         enqueue_tx(cur, "resume_run",
                    {"run_id": run_id, "decision": decision, "comment": comment,
-                    "reviewer_user_id": user["id"], "reviewer": user["username"]},
+                    "reviewer_user_id": user["id"], "reviewer": user["username"],
+                    "review_id": expected, "answer": body.answer},
                    run_id=run_id)
         conn.commit()
     except HTTPException:
@@ -691,15 +788,32 @@ def get_run_rankings(run_id: int, user: dict = Depends(require_auth)):
         if not cur.fetchone():
             raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
 
-        # advice keyed by job_id (and by title as a fallback for legacy rows)
+        # R20: advice joins by (run_id, job_id). A title fallback is used ONLY for
+        # legacy advice rows that have no job_id AND whose title is unambiguous.
         cur.execute("SELECT job_id, title, advice FROM run_advice WHERE run_id = %s", (run_id,))
         advice_by_job = {}
-        advice_by_title = {}
+        legacy_by_title = {}
         for job_id, title, advice in cur.fetchall():
             if job_id is not None:
                 advice_by_job[job_id] = advice
-            if title:
-                advice_by_title[title] = advice
+            elif title:
+                legacy_by_title.setdefault(title, []).append(advice)
+
+        suggestions_by_job = {}
+        try:
+            cur.execute("""
+                SELECT job_id, kind, original_text, suggested_text, reason, evidence, method,
+                       status, validation_notes
+                FROM resume_suggestions WHERE run_id = %s AND status <> 'rejected'
+                ORDER BY job_id, position
+            """, (run_id,))
+            for r in cur.fetchall():
+                suggestions_by_job.setdefault(r[0], []).append({
+                    "kind": r[1], "original_text": r[2], "suggested_text": r[3],
+                    "reason": r[4], "evidence": r[5], "method": r[6], "status": r[7],
+                    "validation_notes": r[8]})
+        except Exception:
+            conn.rollback()          # pre-0010 database: no structured suggestions
 
         cur.execute("""
             SELECT rank_position, job_id, title, company, score, final_decision, apply_url
@@ -707,13 +821,57 @@ def get_run_rankings(run_id: int, user: dict = Depends(require_auth)):
         """, (run_id,))
         rows = cur.fetchall()
 
+    title_counts = {}
+    for r in rows:
+        title_counts[r[2]] = title_counts.get(r[2], 0) + 1
     rankings = []
     for pos, job_id, title, company, score, final_decision, apply_url in rows:
-        advice = advice_by_job.get(job_id) or advice_by_title.get(title)
+        advice = advice_by_job.get(job_id) if job_id is not None else None
+        if advice is None and job_id is None and title_counts.get(title) == 1 \
+                and len(legacy_by_title.get(title, [])) == 1:
+            advice = legacy_by_title[title][0]
         rankings.append({
             "rank": pos, "job_id": job_id, "title": title, "company": company,
             "score": float(score) if score is not None else None,
-            "final_decision": final_decision, "apply_url": apply_url,
+            "final_decision": final_decision, "apply_url": _safe_url(apply_url),
             "advice": advice,
+            "suggestions": suggestions_by_job.get(job_id, []) if job_id is not None else [],
         })
     return {"run_id": run_id, "rankings": rankings}
+
+
+def _safe_url(url):
+    """Only http(s) provider URLs are returned as clickable links (R07)."""
+    u = (url or "").strip()
+    return u if u.lower().startswith(("https://", "http://")) else None
+
+
+@app.get("/runs/{run_id}/agent")
+def get_agent_timeline(run_id: int, user: dict = Depends(require_auth)):
+    """AgentOps view of an autonomous run: goal, fixed constraints, limits, verified
+    progress, which policy chose actions, and every action with its short reason,
+    validation outcome and compact observation."""
+    import agent_store
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("""SELECT mode, goal_json, controller_mode, goal_progress, llm_calls_reserved,
+                              llm_call_budget, status, error_code
+                       FROM runs WHERE id = %s AND user_id = %s""", (run_id, user["id"]))
+        row = cur.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
+    if row[0] != "agent":
+        return {"run_id": run_id, "mode": row[0] or "pipeline", "actions": []}
+    actions = agent_store.list_actions(run_id)
+    if REDACT_TRACE_PAYLOADS:
+        for a in actions:
+            a["error"] = _redact(a["error"])
+    usage = agent_store.run_usage(run_id)
+    return {"run_id": run_id, "mode": "agent", "goal": row[1], "controller_mode": row[2],
+            "progress": row[3], "status": row[6], "error_code": row[7],
+            "llm_calls": {"reserved": row[4], "budget": row[5]},
+            "cost": {"known_estimated_usd": usage["known_cost_usd"],
+                     "calls_with_unknown_cost": usage["unknown_cost_calls"],
+                     "complete": usage["unknown_cost_calls"] == 0,
+                     "basis": "estimated_paid_tier"},
+            "actions": actions}

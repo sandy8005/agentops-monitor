@@ -219,6 +219,61 @@ def mark_failed(job_id, error, attempts, max_attempts, lease_token, terminal=Fal
         return outcome
 
 
+def fail_job_and_run(job_id, lease_token, run_id, error, attempts, max_attempts,
+                     terminal=False, error_code=None):
+    """
+    R02: record a failed attempt on the QUEUE ROW and the RUN in ONE transaction,
+    conditional on the lease. Either both change or neither does, so a crash can no
+    longer leave "run=failed, job=queued" (which the next worker would close as
+    stale without ever retrying).
+
+      retryable & attempts left -> job 'queued' (+backoff) ; run 'retrying'
+      otherwise                 -> job 'failed'            ; run 'failed' if still active
+    Returns "requeued", "failed", or "lost" (lease lost: nothing changed).
+    """
+    from sanitize import redact_secrets
+    err = redact_secrets(error, 2000)
+    with get_connection() as conn:
+        cur = conn.cursor()
+        if not terminal and attempts < max_attempts:
+            available_at = utcnow() + timedelta(seconds=_retry_delay(attempts))
+            cur.execute("""
+                UPDATE job_queue
+                SET status = 'queued', last_error = %s, last_error_at = %s,
+                    claimed_at = NULL, heartbeat_at = NULL, worker_id = NULL,
+                    lease_token = NULL, available_at = %s
+                WHERE id = %s AND status = 'running' AND lease_token = %s
+            """, (err, utcnow(), available_at, job_id, lease_token))
+            if cur.rowcount != 1:
+                conn.rollback()
+                return "lost"
+            if run_id is not None:
+                cur.execute("""
+                    UPDATE runs SET status = 'retrying',
+                        last_attempt_ended_at = COALESCE(ended_at, NOW()), ended_at = NULL
+                    WHERE id = %s AND status IN ('queued', 'running', 'failed', 'retrying')
+                """, (run_id,))
+            return "requeued"
+        cur.execute("""
+            UPDATE job_queue
+            SET status = 'failed', last_error = %s, last_error_at = %s,
+                finished_at = %s, lease_token = NULL
+            WHERE id = %s AND status = 'running' AND lease_token = %s
+        """, (err, utcnow(), utcnow(), job_id, lease_token))
+        if cur.rowcount != 1:
+            conn.rollback()
+            return "lost"
+        if run_id is not None:
+            cur.execute("""
+                UPDATE runs SET status = 'failed', ended_at = NOW(),
+                    error_code = COALESCE(%s, error_code),
+                    stop_reason = COALESCE(stop_reason, 'job failed before the run was finalized'),
+                    pending_review = NULL
+                WHERE id = %s AND status IN ('queued', 'running', 'retrying')
+            """, (str(error_code) if error_code else None, run_id))
+        return "failed"
+
+
 # ------------------------------------------------------- orphan recovery -----
 
 def release(job_id, lease_token, delay_seconds=5):
