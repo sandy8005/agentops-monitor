@@ -1,5 +1,8 @@
 var NL = String.fromCharCode(10);
     var pollTimer = null;
+    // Incremented on logout: any response that started under an older session is
+    // dropped instead of rendering the previous user's data (R21).
+    var _sessionEpoch = 0;
     var _csrfToken = null;
 
     // The CSRF token is bound to the session and returned by GET /csrf in the JSON
@@ -98,10 +101,12 @@ var NL = String.fromCharCode(10);
 
     async function loadResumes() {
       const div = document.getElementById('resumeLibrary');
+      const epoch = _sessionEpoch;
       try {
         const res = await fetch('/resumes');
         if (!res.ok) throw new Error('failed to load resumes');
         const resumes = await res.json();
+        if (epoch !== _sessionEpoch) return;
         if (resumes.length === 0) { div.innerHTML = '<div class="step">No saved resumes yet. Upload one above.</div>'; return; }
         div.innerHTML = '';
         for (const r of resumes) {
@@ -124,6 +129,10 @@ var NL = String.fromCharCode(10);
               '<div style="margin-top:8px;">' +
                 '<label style="color:#e4e6eb;"><input type="checkbox" id="eval_' + r.id + '" style="width:auto;margin-right:6px;">Evaluate judged decisions with an LLM (extra API calls)</label>' +
               '</div>' +
+              '<div style="margin-top:8px;"><label>Model use</label><br><select id="policy_' + r.id + '" style="width:100%;">' +
+                '<option value="auto">Use Gemini when available, rules otherwise</option>' +
+                '<option value="rules_only">Rules only — no Gemini calls</option>' +
+              '</select></div>' +
               '<div class="agent-opts">' +
                 '<label style="color:#e4e6eb;"><input type="checkbox" id="agent_' + r.id + '" style="width:auto;margin-right:6px;">Autonomous agent mode (adapts titles and providers until the goal is met or limits are reached)</label>' +
                 '<div class="row" style="margin-top:6px;">' +
@@ -133,6 +142,7 @@ var NL = String.fromCharCode(10);
                   '</select></div>' +
                 '</div>' +
                 '<label style="color:#e4e6eb;"><input type="checkbox" id="maybe_' + r.id + '" style="width:auto;margin-right:6px;">Count "Maybe" matches toward the goal</label><br>' +
+                '<label style="color:#e4e6eb;"><input type="checkbox" id="verified_' + r.id + '" style="width:auto;margin-right:6px;">Only count matches verified by the model or a human</label><br>' +
                 '<label style="color:#e4e6eb;"><input type="checkbox" id="llmadv_' + r.id + '" style="width:auto;margin-right:6px;">Use Gemini to improve suggestion wording (optional; rules are always used)</label>' +
               '</div>' +
               '<div style="margin-top:8px;">' +
@@ -157,13 +167,15 @@ var NL = String.fromCharCode(10);
       // Run configuration goes in a JSON BODY — never in the URL, where it would end
       // up in proxy/access logs and browser history.
       const payload = { resume_id: Number(id), target_role: role, location: loc,
-                        work_mode: mode, employment_type: emp, evaluate: doEval };
+                        work_mode: mode, employment_type: emp, evaluate: doEval,
+                        model_policy: document.getElementById('policy_' + id).value };
       if (document.getElementById('agent_' + id).checked) {
         payload.mode = 'agent';
         payload.goal = {
           target_count: Math.max(1, Math.min(50, Number(document.getElementById('count_' + id).value) || 10)),
           seniority: document.getElementById('sen_' + id).value,
           include_maybe: document.getElementById('maybe_' + id).checked,
+          require_verified_matches: document.getElementById('verified_' + id).checked,
           use_llm_advice: document.getElementById('llmadv_' + id).checked
         };
       }
@@ -197,10 +209,12 @@ var NL = String.fromCharCode(10);
 
     async function loadRuns() {
       const tbody = document.querySelector('#runs tbody');
+      const epoch = _sessionEpoch;
       try {
         const res = await fetch('/runs');
         if (!res.ok) throw new Error('failed to load runs');
         const runs = await res.json();
+        if (epoch !== _sessionEpoch) return;
         tbody.innerHTML = '';
         for (const r of runs) {
           const cls = statusClass(r.status);
@@ -256,6 +270,7 @@ var NL = String.fromCharCode(10);
               '<div>' + escapeHtml(sg.suggested_text) + '</div>' +
               '<div class="note">why: ' + escapeHtml(sg.reason) + '</div>' +
               (sg.validation_notes ? '<div class="reason">check: ' + escapeHtml(sg.validation_notes) + '</div>' : '') +
+              renderEvidence(sg.evidence) +
               '</div>';
           }
           html += '</details>';
@@ -263,6 +278,16 @@ var NL = String.fromCharCode(10);
           html += '<details><summary>advice</summary><pre class="io">' + escapeHtml(r.advice) + '</pre></details>';
         }
         html += '</div>';
+      }
+      return html;
+    }
+
+    function renderEvidence(ev) {
+      if (!ev || !ev.length) return '<div class="note">evidence: none found in your resume</div>';
+      var html = '<div class="note">evidence from your resume:</div>';
+      for (const e of ev) {
+        html += '<div class="call">&ldquo;' + escapeHtml(e.text) + '&rdquo;' +
+          (e.offset != null && e.offset >= 0 ? ' <span class="note">(char ' + escapeHtml(e.offset) + ')</span>' : '') + '</div>';
       }
       return html;
     }
@@ -275,6 +300,8 @@ var NL = String.fromCharCode(10);
         '<div>Qualified: <strong>' + escapeHtml(p.qualified == null ? '?' : p.qualified) + '/' + escapeHtml(p.target_count) + '</strong>' +
         ' &nbsp; discovered ' + escapeHtml(p.discovered) + ' &nbsp; evaluated ' + escapeHtml(p.evaluated) +
         ' &nbsp; searches ' + escapeHtml(p.searches) + '</div>' +
+        (p.unverified_matches ? '<div class="reason">' + escapeHtml(p.unverified_matches) + ' match(es) rest only on rule-based requirement extraction' +
+          (p.verified_only ? ' (not counted)' : ' (counted)') + '</div>' : '') +
         '<div>Controller: <strong>' + escapeHtml(a.controller_mode || '-') + '</strong>' +
         (p.controller_note ? ' <span class="reason">(' + escapeHtml(p.controller_note) + ')</span>' : '') + '</div>' +
         '<div class="note">LLM calls reserved ' + escapeHtml(a.llm_calls.reserved) + '/' + escapeHtml(a.llm_calls.budget) +
@@ -310,7 +337,11 @@ var NL = String.fromCharCode(10);
           try {
             const rr = await fetch('/runs/' + id + '/rankings', { signal: signal });
             if (rr.ok) extras += renderResults(await rr.json());
-          } catch (e) { if (e.name === 'AbortError') return; }
+            else extras += '<div class="step call-failed">Could not load results (HTTP ' + escapeHtml(rr.status) + ')</div>';
+          } catch (e) {
+            if (e.name === 'AbortError') return;
+            extras += '<div class="step call-failed">Could not load results: ' + escapeHtml(e.message) + '</div>';
+          }
         }
         try {
           const ar = await fetch('/runs/' + id + '/agent', { signal: signal });
@@ -449,9 +480,11 @@ var NL = String.fromCharCode(10);
       try {
         // One lightweight request: only what a review card needs. (This panel polls
         // every few seconds; it must not pull the full trace of every paused run.)
+        const epoch = _sessionEpoch;
         const res = await fetch('/reviews/pending');
         if (!res.ok) throw new Error('failed to load reviews');
         const cards = await res.json();
+        if (epoch !== _sessionEpoch) return;
         // R21: only rebuild the panel when the SET of pending reviews changed, so a
         // half-typed comment and input focus survive the 4-second poll.
         var signature = cards.map(function(c) { return c.run_id + '|' + ((c.pending_review || {}).review_id || ''); }).join(',');
@@ -580,7 +613,7 @@ var NL = String.fromCharCode(10);
       // R21: clear every piece of the previous user's rendered data and timers.
       if (pollTimer) { clearTimeout(pollTimer); pollTimer = null; }
       if (_detailAbort) { try { _detailAbort.abort(); } catch (e) {} }
-      _detailGen += 1; _selectedRun = null; _reviewSignature = null;
+      _detailGen += 1; _selectedRun = null; _reviewSignature = null; _sessionEpoch += 1;
       ['detail', 'graphReviews', 'resumeLibrary'].forEach(function(i) {
         var el = document.getElementById(i); if (el) el.innerHTML = '';
       });

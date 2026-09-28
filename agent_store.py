@@ -1,7 +1,15 @@
 """
-Persistence for the controller loop. Output writes are FENCED by
-runs.execution_generation (R28): a worker that lost the run raises ExecutionLost
-instead of overwriting the newer execution's results.
+Persistence for the autonomous controller loop.
+
+Every function here is a small, explicit transaction. Writes that record agent
+OUTPUT (actions, searches, rankings, suggestions, final status) are FENCED by the
+run's execution_generation: they run inside a transaction that first locks the run
+row (FOR SHARE / FOR UPDATE) and checks the generation. A worker that lost the run
+— lease reclaimed, lock connection dropped — raises ExecutionLost instead of
+overwriting the newer execution's results (R28).
+
+Kept separate from the loop logic so the loop is unit-testable with an in-memory
+fake (tests/test_agent_review_fixes.py).
 """
 import json
 
@@ -11,7 +19,7 @@ from sanitize import redact_secrets
 
 
 class ExecutionLost(RuntimeError):
-    pass
+    """This worker's execution generation is no longer the run's current one."""
 
 
 def _check_generation(cur, run_id, generation, lock="FOR SHARE"):
@@ -22,7 +30,11 @@ def _check_generation(cur, run_id, generation, lock="FOR SHARE"):
                             f"(current {row[0] if row else 'missing'})")
 
 
+# ------------------------------------------------------------------ lifecycle --
+
 def begin_execution(run_id, new_attempt):
+    """Mark the run running and take a NEW execution generation in one statement.
+    Returns the generation this worker must present on every guarded write."""
     with get_connection() as conn:
         cur = conn.cursor()
         cur.execute("""
@@ -42,6 +54,7 @@ def begin_execution(run_id, new_attempt):
 
 
 def load_run_config(run_id):
+    """(goal_json, resume_id, user_id, cancel_requested, status)."""
     with get_connection() as conn:
         cur = conn.cursor()
         cur.execute("SELECT goal_json, resume_id, user_id, cancel_requested, status "
@@ -63,8 +76,9 @@ def is_cancel_requested(run_id):
 
 
 def run_usage(run_id):
-    """Elapsed time, reserved LLM calls, KNOWN estimated cost, and the count of
-    calls with unknown cost (R15 — unknown is never summed as zero)."""
+    """Durable usage snapshot used by the guard: elapsed seconds since the run first
+    started, LLM requests reserved, the KNOWN estimated cost and how many calls have
+    unknown cost (R15 — unknown is never summed as zero)."""
     with get_connection() as conn:
         cur = conn.cursor()
         cur.execute("""
@@ -85,7 +99,9 @@ def run_usage(run_id):
 
 
 def reserve_llm_call(run_id, default_budget):
-    """Atomically reserve ONE request against the run-wide budget (R16)."""
+    """Atomically reserve ONE LLM request against the run-wide budget (R16).
+    Returns True if reserved, False if the budget is spent. Called before every
+    provider HTTP attempt, including retries; a crash after reserving still counts."""
     with get_connection() as conn:
         cur = conn.cursor()
         cur.execute("""
@@ -104,7 +120,10 @@ def set_controller_mode(run_id, generation, mode, progress):
                     (mode, json.dumps(progress, default=str), run_id))
 
 
+# -------------------------------------------------------------------- actions --
+
 def get_action(run_id, iteration):
+    """The recorded action for (run, iteration), or None. Used for replay safety."""
     with get_connection() as conn:
         cur = conn.cursor()
         cur.execute("""SELECT action, arguments, reason, decided_by, status, observation, error
@@ -113,7 +132,6 @@ def get_action(run_id, iteration):
         row = cur.fetchone()
     if not row:
         return None
-
     def _j(v):
         return v if (v is None or isinstance(v, (dict, list))) else json.loads(v)
     return {"action": row[0], "arguments": _j(row[1]) or {}, "reason": row[2],
@@ -122,6 +140,8 @@ def get_action(run_id, iteration):
 
 
 def record_proposed_action(run_id, generation, iteration, action, arguments, reason, decided_by):
+    """Insert the proposal. ON CONFLICT DO NOTHING: a replayed iteration keeps the
+    ORIGINAL proposal (and its outcome) rather than recording a second decision."""
     with get_connection() as conn:
         cur = conn.cursor()
         _check_generation(cur, run_id, generation)
@@ -155,11 +175,16 @@ def list_actions(run_id):
                               observation, error, created_at, finished_at
                        FROM agent_actions WHERE run_id = %s ORDER BY iteration""", (run_id,))
         rows = cur.fetchall()
-    return [{"iteration": r[0], "action": r[1], "arguments": r[2], "reason": r[3],
-             "decided_by": r[4], "status": r[5], "observation": r[6], "error": r[7],
-             "created_at": r[8].isoformat() if r[8] else None,
-             "finished_at": r[9].isoformat() if r[9] else None} for r in rows]
+    out = []
+    for r in rows:
+        out.append({"iteration": r[0], "action": r[1], "arguments": r[2], "reason": r[3],
+                    "decided_by": r[4], "status": r[5], "observation": r[6], "error": r[7],
+                    "created_at": r[8].isoformat() if r[8] else None,
+                    "finished_at": r[9].isoformat() if r[9] else None})
+    return out
 
+
+# ------------------------------------------------------------------- searches --
 
 def get_search(run_id, provider, query_norm):
     with get_connection() as conn:
@@ -189,8 +214,11 @@ def record_search(run_id, generation, iteration, provider, query_norm, location,
               obs.get("eligible_jobs", 0), json.dumps(obs.get("rejection_summary") or {})))
 
 
+# ------------------------------------------------------------------- postings --
+
 def load_postings(job_ids):
-    """Descriptions are loaded on demand, never kept in the checkpoint (R14)."""
+    """Full posting rows (including description) for evaluation. Descriptions are
+    NOT kept in the checkpointed state (R14) — they are loaded on demand."""
     ids = [int(i) for i in job_ids]
     if not ids:
         return {}
@@ -205,11 +233,23 @@ def load_postings(job_ids):
                    "source": r[7], "external_id": r[8], "apply_url": r[9]} for r in rows}
 
 
-def qualified_job_ids(run_id, qualifying_decisions):
-    """BACKEND-VERIFIED progress from persisted steps; pending reviews don't count."""
+# -------------------------------------------------------------------- progress --
+
+_UNVERIFIED_SQL = """(retrieved_context->>'requirements_method' = 'rule_based'
+                      AND COALESCE(judge_status, '') <> 'ran'
+                      AND review_status IS NULL)"""
+
+
+def qualified_job_ids(run_id, qualifying_decisions, verified_only=False):
+    """BACKEND-VERIFIED progress: distinct jobs whose persisted AUTHORITATIVE final
+    decision qualifies and which are not still awaiting a human review. With
+    verified_only, matches that rest ONLY on rule-based requirement extraction (no
+    judge, no human) are excluded. Raises on database errors — an unknown count is
+    never reported as zero (N07)."""
+    extra = f" AND NOT {_UNVERIFIED_SQL}" if verified_only else ""
     with get_connection() as conn:
         cur = conn.cursor()
-        cur.execute("""
+        cur.execute(f"""
             SELECT DISTINCT (retrieved_context->>'job_id')::int
             FROM steps
             WHERE run_id = %s
@@ -218,11 +258,41 @@ def qualified_job_ids(run_id, qualifying_decisions):
               AND final_decision = ANY(%s)
               AND status = 'success'
               AND NOT (COALESCE(needs_human_review, FALSE) AND review_status IS NULL)
+              {extra}
         """, (run_id, list(qualifying_decisions)))
         return sorted(r[0] for r in cur.fetchall())
 
 
+def unverified_qualified_count(run_id, qualifying_decisions):
+    """How many qualifying matches rest only on rule-based requirement extraction."""
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute(f"""
+            SELECT COUNT(DISTINCT retrieved_context->>'job_id')
+            FROM steps
+            WHERE run_id = %s AND retrieved_context ? 'job_id'
+              AND final_decision = ANY(%s) AND status = 'success'
+              AND NOT (COALESCE(needs_human_review, FALSE) AND review_status IS NULL)
+              AND {_UNVERIFIED_SQL}
+        """, (run_id, list(qualifying_decisions)))
+        return int(cur.fetchone()[0] or 0)
+
+
+def advised_job_ids(run_id):
+    """Jobs that already have persisted advice in this run (durable idempotency for
+    generate_advice across checkpoints and crashes — N10)."""
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT DISTINCT job_id FROM run_advice WHERE run_id = %s AND job_id IS NOT NULL",
+                    (run_id,))
+        return sorted(r[0] for r in cur.fetchall())
+
+
+# --------------------------------------------------------------------- reviews --
+
 def create_review_request(run_id, generation, review_id, kind, payload, step_id=None, job_id=None):
+    """Create (idempotently) the immutable review identity for an interrupt. Any
+    OTHER open request for the run is superseded first (one open request per run)."""
     with get_connection() as conn:
         cur = conn.cursor()
         _check_generation(cur, run_id, generation, lock="FOR UPDATE")
@@ -249,6 +319,7 @@ def review_status(review_id):
 
 
 def mark_review_consumed(review_id, generation, run_id):
+    """Exactly-once consumption. Returns True if THIS call consumed it."""
     with get_connection() as conn:
         cur = conn.cursor()
         _check_generation(cur, run_id, generation)
@@ -258,8 +329,10 @@ def mark_review_consumed(review_id, generation, run_id):
         return cur.fetchone() is not None
 
 
+# ---------------------------------------------------------------------- output --
+
 def persist_rankings(run_id, generation, ranked):
-    """ONE fenced transaction; raises on failure (R03)."""
+    """Replace the run's ranking in ONE fenced transaction; raises on failure (R03)."""
     with get_connection() as conn:
         cur = conn.cursor()
         _check_generation(cur, run_id, generation, lock="FOR UPDATE")
@@ -276,6 +349,8 @@ def persist_rankings(run_id, generation, ranked):
 
 def persist_advice(run_id, generation, job_id, title, advice_text, suggestions,
                    resume_id, resume_hash):
+    """Advice summary (run_advice) + structured suggestions, bound to (run, job,
+    resume version), in ONE fenced transaction. Idempotent replace (R03, R20)."""
     with get_connection() as conn:
         cur = conn.cursor()
         _check_generation(cur, run_id, generation, lock="FOR UPDATE")
@@ -296,6 +371,7 @@ def persist_advice(run_id, generation, job_id, title, advice_text, suggestions,
 
 
 def finalize(run_id, generation, status, stop_reason, error_code, progress):
+    """Terminal transition, fenced. Totals keep unknown cost visible (R15)."""
     code = error_code.value if hasattr(error_code, "value") else error_code
     with get_connection() as conn:
         cur = conn.cursor()

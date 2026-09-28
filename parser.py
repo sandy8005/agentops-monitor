@@ -149,6 +149,7 @@ def ground_skills(skills, skill_evidence, resume_text):
     Returns {"skill_evidence": [...verified...], "grounded_skills": [...],
              "ungrounded_skills": [...]}.
     """
+    from skills import affirmative_skill_in_text
     resume_norm = _norm_ws(resume_text)
     resume_tokens = set(re.findall(r"[a-z0-9\+\#\.]+", resume_norm))
     verified = {}
@@ -157,7 +158,11 @@ def ground_skills(skills, skill_evidence, resume_text):
             continue
         skill = str(item.get("skill") or "").strip()
         ev = str(item.get("evidence") or "").strip()
-        if skill and ev and _norm_ws(ev) in resume_norm:
+        # The snippet must (a) occur verbatim in the resume AND (b) itself
+        # AFFIRMATIVELY mention the claimed skill. A real quote about something else
+        # ("Python engineer" offered as evidence for "Kubernetes") grounds nothing (R10).
+        if skill and ev and _norm_ws(ev) in resume_norm \
+                and affirmative_skill_in_text(skill, ev):
             verified.setdefault(skill.lower(), {"skill": skill, "evidence": ev})
 
     from skills import skill_in_text, text_index
@@ -165,10 +170,12 @@ def ground_skills(skills, skill_evidence, resume_text):
 
     def _literal(skill):
         # Alias-aware ("K8s" in the resume grounds a parsed "Kubernetes"), using the
-        # SAME canonical vocabulary the scorer uses — see skills.py.
+        # SAME canonical vocabulary the scorer uses — and only AFFIRMATIVE mentions:
+        # "no Kubernetes experience" does not ground Kubernetes.
         if not _norm_ws(skill):
             return False
-        return skill_in_text(skill, idx_low, idx_tokens)
+        return (skill_in_text(skill, idx_low, idx_tokens)
+                and affirmative_skill_in_text(skill, resume_text))
 
     grounded, ungrounded = [], []
     for sk in skills:
@@ -229,7 +236,7 @@ RULES:
   that shows it. Never paraphrase. Omit a skill here if no such text exists.
 - If a value is unknown, use an empty string "" or 0 — never omit a key.
 """
-    raw = logged_llm_call(prompt, run_id, step_id, budget=budget)
+    raw = logged_llm_call(prompt, run_id, step_id, operation="parse_resume", budget=budget)
     cleaned = raw.strip().replace("```json", "").replace("```", "").strip()
 
     # --- Parse model output -----------------------------------------------

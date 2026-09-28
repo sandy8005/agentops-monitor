@@ -165,6 +165,10 @@ class Settings:
         # --- LLM ---
         self.gemini_api_key = r.str("GEMINI_API_KEY")
         self.gemini_model = r.str("GEMINI_MODEL", "gemini-3.6-flash")
+        # After the provider reports an exhausted quota, skip LLM calls in this worker
+        # for this long (llm.py quota circuit breaker).
+        self.llm_quota_cooldown_seconds = r.int("LLM_QUOTA_COOLDOWN_SECONDS", 3600,
+                                                min_value=60, max_value=86400)
         # Optional explicit prices (USD per 1M tokens). Both must be set to apply.
         self.llm_input_price_per_million = r.float("LLM_INPUT_PRICE_PER_MILLION",
                                                    None, min_value=0.0)

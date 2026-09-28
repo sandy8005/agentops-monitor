@@ -43,6 +43,63 @@ class BudgetExceeded(Exception):
     pass
 
 
+class QuotaCircuitOpen(RuntimeError):
+    """The provider already reported an exhausted (daily/project) quota for this
+    model. Calls are refused locally — no HTTP request, no budget reservation —
+    until the cooldown passes. Classified as LLM_QUOTA_EXHAUSTED (message says so)."""
+
+
+# --- Quota circuit breaker ----------------------------------------------------
+# A spent DAILY quota does not recover in the provider's 'retryDelay' (Gemini sends
+# ~17s even for a per-day limit). Without a breaker every remaining job makes one
+# more doomed request, each failing with the same 429. After the first quota
+# exhaustion the breaker opens for LLM_QUOTA_COOLDOWN_SECONDS (per worker process);
+# callers then take their existing no-LLM fallbacks immediately.
+import threading as _threading
+_quota_lock = _threading.Lock()
+_quota_blocked_until = {}          # model -> epoch seconds
+
+
+def _quota_cooldown_seconds():
+    return float(getattr(settings, "llm_quota_cooldown_seconds", 3600) or 3600)
+
+
+def quota_blocked(model=None):
+    """Seconds remaining on an open quota breaker for `model` (0 if closed)."""
+    model = model or settings.gemini_model
+    with _quota_lock:
+        until = _quota_blocked_until.get(model, 0)
+    return max(0.0, until - time.time())
+
+
+def _open_quota_breaker(model):
+    with _quota_lock:
+        _quota_blocked_until[model] = time.time() + _quota_cooldown_seconds()
+    log.warning("llm quota exhausted for %s — skipping LLM calls for %.0f min (rules fallback)",
+                model, _quota_cooldown_seconds() / 60)
+
+
+class ModelNotConfigured(RuntimeError):
+    """No model credentials configured. Terminal for the model path; every caller
+    has (or is given) a rules fallback."""
+
+
+def llm_available():
+    """True only if a model call could be attempted now: credentials are configured
+    AND the quota breaker is closed. Callers use this to take their rules path
+    directly instead of making a doomed request."""
+    return bool(settings.gemini_api_key) and quota_blocked() <= 0
+
+
+def reset_quota_breaker(model=None):
+    """For tests / operators."""
+    with _quota_lock:
+        if model is None:
+            _quota_blocked_until.clear()
+        else:
+            _quota_blocked_until.pop(model, None)
+
+
 
 # get_connection is imported (pooled) from database at the top of this module, so
 # every `from llm import get_connection` (router.py, autonomous_graph.py, ...) now
@@ -394,6 +451,13 @@ def logged_llm_call(prompt, run_id, step_id, operation="llm_call",
     from pricing import estimate_cost
     logical_call_id = str(uuid.uuid4())
     last_error = None
+    if not settings.gemini_api_key:
+        raise ModelNotConfigured("GEMINI_API_KEY is not set — model call skipped")
+    remaining = quota_blocked()
+    if remaining > 0:
+        # Refused locally: no HTTP request and no budget reservation.
+        raise QuotaCircuitOpen(
+            f"quota exhausted (circuit open for {remaining:.0f}s more) — {operation} skipped")
     for attempt in range(1, max_retries + 1):
         # Budget enforced HERE at the true unit (one HTTP attempt); retries count.
         if budget is not None:
@@ -433,6 +497,8 @@ def logged_llm_call(prompt, run_id, step_id, operation="llm_call",
                 "failed", redact_secrets(e), attempt, attempt - 1, None,
                 logical_call_id=logical_call_id,
             )
+            if code == ErrorCode.LLM_QUOTA_EXHAUSTED:
+                _open_quota_breaker(settings.gemini_model)
             if attempt == max_retries or not transient:
                 raise
             wait = _backoff_seconds(attempt, e)

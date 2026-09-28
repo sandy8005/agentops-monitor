@@ -147,17 +147,54 @@ def _mention_is_negated(raw_lower, start):
     return len(between.split()) <= _MAX_CUE_DISTANCE_WORDS
 
 
-def skill_mentions(skill, raw_text, surface_forms=None):
-    """(affirmative_count, negated_count) for mentions of `skill` in raw text."""
+# Negation AFTER the mention (N05): "Python: none", "Python experience: none",
+# "Python - no", "Python (none)", "Python: not yet", "Python — n/a".
+_NEG_SUFFIX_RE = re.compile(
+    r"^\s*(?:experience|skills?|knowledge|exposure|proficiency|level)?\s*"
+    r"(?:[:=\-\u2013\u2014(]\s*)"
+    r"(?:none|no|nil|n/?a|zero|0(?!\.\d|\s*\+|\d)|not\b|never\b|no experience)")
+# Aspirational / uncertain mentions are NOT evidence of competency.
+_UNCERTAIN_CUE_RE = re.compile(
+    r"(?<![a-z0-9\-])(currently learning|learning|want to learn|plan to learn|planning to learn|"
+    r"interested in|aspiring|hoping to|eager to learn|self-studying|studying)(?![a-z0-9\-])")
+
+
+def _mention_state(raw_lower, start, end):
+    """'negated' | 'uncertain' | 'affirmative' for one mention."""
+    if _mention_is_negated(raw_lower, start):
+        return "negated"
+    # a ':' or '-' after the skill is part of the same clause; look ~40 chars ahead
+    suffix = raw_lower[end:min(len(raw_lower), end + 40)]
+    nl = suffix.find("\n")
+    if nl >= 0:
+        suffix = suffix[:nl]
+    if _NEG_SUFFIX_RE.match(suffix):
+        return "negated"
+    clause_start = 0
+    for m in _CLAUSE_SPLIT_RE.finditer(raw_lower, 0, start):
+        clause_start = m.end()
+    prefix = raw_lower[clause_start:start]
+    cues = list(_UNCERTAIN_CUE_RE.finditer(prefix))
+    if cues and len(prefix[cues[-1].end():].split()) <= _MAX_CUE_DISTANCE_WORDS:
+        return "uncertain"
+    return "affirmative"
+
+
+def skill_mention_states(skill, raw_text, surface_forms=None):
+    """{'affirmative': n, 'negated': n, 'uncertain': n} for mentions of `skill`."""
     raw_lower = str(raw_text or "").lower()
-    aff = neg = 0
+    out = {"affirmative": 0, "negated": 0, "uncertain": 0}
     for v in _allowed_variants(skill, surface_forms):
         for m in _variant_regex(v).finditer(raw_lower):
-            if _mention_is_negated(raw_lower, m.start()):
-                neg += 1
-            else:
-                aff += 1
-    return aff, neg
+            out[_mention_state(raw_lower, m.start(), m.end())] += 1
+    return out
+
+
+def skill_mentions(skill, raw_text, surface_forms=None):
+    """(affirmative_count, non_affirmative_count). Negated AND uncertain mentions are
+    both non-affirmative: neither is evidence of the skill."""
+    st = skill_mention_states(skill, raw_text, surface_forms)
+    return st["affirmative"], st["negated"] + st["uncertain"]
 
 
 def affirmative_skill_in_text(skill, raw_text, surface_forms=None):

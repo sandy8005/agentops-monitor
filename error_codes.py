@@ -36,6 +36,8 @@ class ErrorCode(str, Enum):
     LLM_UNAVAILABLE = "llm_unavailable"           # 503 / timeout / provider down
     LLM_INVALID_RESPONSE = "llm_invalid_response" # provider answered without text/usage
                                                   # (blocked / safety-filtered) — terminal
+    LLM_NOT_CONFIGURED = "llm_not_configured"     # no GEMINI_API_KEY — terminal; callers
+                                                  # take their rules fallback
 
     # External job-provider failures (Adzuna / Remotive). Same philosophy as the LLM
     # taxonomy: a rate limit or an outage is worth retrying, bad credentials are not,
@@ -51,6 +53,8 @@ class ErrorCode(str, Enum):
     BUDGET_EXCEEDED = "budget_exceeded"           # per-run LLM request budget spent
     WORKER_LOST = "worker_lost"                   # worker died / stopped heartbeating
                                                   # and the job ran out of attempts
+    DATABASE_UNAVAILABLE = "database_unavailable" # connection / operational DB error —
+                                                  # transient, the job is retried
 
     # Catch-all.
     INTERNAL = "internal_error"                   # unclassified exception
@@ -85,7 +89,13 @@ def classify_exception(exc):
     """
     msg = str(exc)
     low = msg.lower()
-    if type(exc).__name__ == "InvalidProviderResponse" or "provider returned no text" in low:
+    name = type(exc).__name__
+    if name == "ModelNotConfigured" or "gemini_api_key is not set" in low:
+        return ErrorCode.LLM_NOT_CONFIGURED
+    if name in ("OperationalError", "InterfaceError", "DatabaseUnavailable", "PoolError") \
+            or "database_unavailable" in low:
+        return ErrorCode.DATABASE_UNAVAILABLE
+    if name == "InvalidProviderResponse" or "provider returned no text" in low:
         return ErrorCode.LLM_INVALID_RESPONSE
     # Job-provider failures are tagged by the search stage ("job_source_...:") — honour
     # the tag before the generic HTTP heuristics below.
@@ -93,6 +103,8 @@ def classify_exception(exc):
                  ErrorCode.JOB_SOURCE_AUTH_FAILED, ErrorCode.JOB_SOURCE_INVALID_RESPONSE):
         if code.value in low:
             return code
+    if type(exc).__name__ == "QuotaCircuitOpen" or "circuit open" in low:
+        return ErrorCode.LLM_QUOTA_EXHAUSTED
     if _is_429(msg):
         if any(m in low for m in _QUOTA_MARKERS):
             return ErrorCode.LLM_QUOTA_EXHAUSTED
@@ -102,6 +114,27 @@ def classify_exception(exc):
     if "budget" in low:
         return ErrorCode.BUDGET_EXCEEDED
     return ErrorCode.INTERNAL
+
+
+_QUOTA_ID_RE = None
+
+
+def summarize_error(exc, max_len=160):
+    """One short, log-friendly line for a provider error: the classified code, the
+    violated quota id when Gemini reports one, and a truncated message. Provider
+    bodies can be kilobytes of JSON; logging them per job floods the console."""
+    global _QUOTA_ID_RE
+    import re
+    if _QUOTA_ID_RE is None:
+        _QUOTA_ID_RE = re.compile(r"quotaId['\"]?\s*:\s*['\"]([A-Za-z0-9_\-]+)")
+    code = classify_exception(exc)
+    text = str(exc)
+    m = _QUOTA_ID_RE.search(text)
+    first = text.split("{", 1)[0].strip() or type(exc).__name__
+    out = f"{code}: {first}"
+    if m:
+        out += f" [quota={m.group(1)}]"
+    return out if len(out) <= max_len else out[:max_len] + "…"
 
 
 _RETRY_DELAY_RE = None

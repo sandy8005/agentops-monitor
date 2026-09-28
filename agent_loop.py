@@ -1,8 +1,23 @@
 """
-Bounded autonomous job-search agent (LangGraph):
-    setup -> decide -> act -> (review)* -> decide -> ... -> finalize
-Ends on verified goal, accepted finish, hard limit, stalled progress, cancel, or
-needed input. Guarded writes are fenced by execution generation (agent_store).
+Bounded autonomous job-search agent.
+
+    Goal -> controller chooses an action -> backend validates -> tool executes ->
+    compact observation -> controller chooses again
+
+Graph:   setup -> decide -> act -> (review)* -> decide -> ... -> finalize
+
+  setup     load + parse the resume (predictable, not a controller decision)
+  decide    guard (cancel / limits) -> reuse a recorded proposal on replay, else
+            ask the controller (LLM, or the deterministic rules policy)
+  act       guard again, validate + execute ONE tool, record the observation
+  review    interrupt() for a flagged job or an input request; the resume value
+            must carry the matching immutable review_id (R01)
+  finalize  ensure the ranking is persisted, then classify the outcome from
+            PERSISTED results (backend-verified completion)
+
+The loop ends when the goal is verified, the controller finishes (and the backend
+accepts), a hard limit is hit, progress stalls, the user cancels, or input is needed.
+Every guarded write is fenced by the execution generation (agent_store).
 """
 import copy
 from typing import Optional, TypedDict
@@ -22,14 +37,14 @@ from logging_config import get_logger
 log = get_logger(__name__)
 
 MAX_OBSERVATIONS = 12
-MAX_REJECTION_STREAK = 3
-MAX_FAILURE_STREAK = 3
+MAX_REJECTION_STREAK = 3     # invalid/rejected LLM proposals before switching to rules
+MAX_FAILURE_STREAK = 3       # consecutive tool failures before stopping the run
 _LLM_OUTAGE_CODES = {ErrorCode.LLM_UNAVAILABLE, ErrorCode.LLM_RATE_LIMITED,
                      ErrorCode.LLM_QUOTA_EXHAUSTED, ErrorCode.LLM_INVALID_RESPONSE}
 
 
 class StaleReviewDecision(RuntimeError):
-    pass
+    """A resume value does not belong to the interrupt the graph is paused on."""
 
 
 class LoopState(TypedDict, total=False):
@@ -58,13 +73,20 @@ class LoopState(TypedDict, total=False):
     no_progress: int
     output_failures: int
     cancel_seen: bool
+    limit_stop: Optional[dict]
     stop: Optional[dict]
     final: Optional[dict]
 
 
+# ------------------------------------------------------------------ budget ----
+
 class DurableBudget:
-    """Run-wide budget (R16). can_spend() reserves atomically right before each HTTP
-    attempt; spend() is a no-op; exhausted() is a read-only gate."""
+    """Run-wide LLM request budget stored in runs.llm_calls_reserved (R16).
+
+    logged_llm_call() calls can_spend() immediately before EVERY HTTP attempt and
+    then spend(). can_spend() performs the atomic reservation, so a crash after it
+    still counts and a retry/replay can never reset the allowance; spend() is a
+    no-op. exhausted() is a read-only check for gating decisions."""
 
     def __init__(self, run_id, limit):
         self.run_id = run_id
@@ -82,16 +104,21 @@ class DurableBudget:
         return u["llm_calls_reserved"] >= cap
 
 
-def _ctx(state, config):
+def _ctx(state, config, iteration=None):
     run_id = state["run_id"]
-    run_lock.check_owner(run_id)
+    run_lock.check_owner(run_id)                        # node-boundary ownership check
     goal = AgentGoal(**state["goal"])
     gen = config["configurable"]["generation"]
-    return run_id, goal, gen, DurableBudget(run_id, goal.limits.max_llm_calls)
+    budget = DurableBudget(run_id, goal.limits.max_llm_calls)
+    return run_id, goal, gen, budget
 
+
+# ------------------------------------------------------------------- guard ----
 
 def check_limits(run_id, goal, state):
-    """Called before EVERY decision and EVERY tool execution (R13)."""
+    """None, or a stop dict. Called before EVERY controller decision and EVERY tool
+    execution (R13), so an accepted cancellation or an exhausted limit is honoured
+    at each side-effect boundary."""
     if state.get("cancel_seen") or store.is_cancel_requested(run_id):
         return {"by": "user", "reason": "cancelled by user", "cancel": True}
     lim = goal.limits
@@ -110,16 +137,15 @@ def check_limits(run_id, goal, state):
     return None
 
 
-def qualified_count_safe(run_id, goal):
-    try:
-        return len(store.qualified_job_ids(run_id, goal.qualifying_decisions))
-    except Exception:
-        return None
-
-
 def _progress(run_id, goal, state):
     ev = state.get("evaluated") or {}
+    try:
+        unverified = store.unverified_qualified_count(run_id, goal.qualifying_decisions)
+    except Exception:
+        unverified = None
     return {"qualified": qualified_count_safe(run_id, goal),
+            "unverified_matches": unverified,
+            "verified_only": goal.require_verified_matches,
             "target_count": goal.target_count,
             "discovered": len(state.get("discovered") or {}),
             "evaluated": sum(1 for v in ev.values() if v.get("status") == "ok"),
@@ -130,7 +156,19 @@ def _progress(run_id, goal, state):
             "controller_note": state.get("controller_note")}
 
 
+def qualified_count_safe(run_id, goal):
+    """For DISPLAY only (None = unknown). Finalization uses the raising variant."""
+    try:
+        return len(store.qualified_job_ids(run_id, goal.qualifying_decisions,
+                                           verified_only=goal.require_verified_matches))
+    except Exception:
+        return None
+
+
+# ------------------------------------------------------------------- nodes ----
+
 def _adapter(run_id, goal, budget, state):
+    """AgentState whose budget is the durable run budget (reuses router tools)."""
     from agent_state import AgentState
 
     class _S(AgentState):
@@ -144,7 +182,7 @@ def _adapter(run_id, goal, budget, state):
             return budget.exhausted()
 
     s = _S(goal=goal.description or "agent", resume_id=state.get("resume_id"),
-           target_role=goal.target_role)
+           target_role=goal.target_role, model_policy=goal.model_policy)
     s.resume_text = state.get("resume_text")
     return s
 
@@ -160,9 +198,22 @@ def node_setup(state: LoopState, config):
         do_parse_resume(s, run_id)
     if s.error:
         return {"stop": {"by": "error", "reason": s.error, "setup_failed": True}}
-    mode = "llm" if goal.use_llm_controller else "rules"
+    from llm import llm_available
+    if goal.model_policy == "rules_only":
+        mode, note = "rules", "rules-only run: no model calls by choice"
+    elif goal.use_llm_controller and llm_available():
+        mode, note = "llm", None
+    elif goal.use_llm_controller:
+        mode, note = "rules", "controller uses rules: model not configured or quota exhausted"
+    else:
+        mode, note = "rules", None
+    if (s.parsed_resume or {}).get("extraction_method") == "rule_based":
+        note = ((note + "; ") if note else "") + "resume parsed by rules (degraded)"
     return {"resume_text": s.resume_text, "parsed_resume": s.parsed_resume, "setup_done": True,
-            "iteration": 1, "controller_mode": mode, "discovered": {}, "evaluated": {},
+            "iteration": 1, "controller_mode": mode, "controller_note": note,
+            "stop": None, "final": None, "pending": None, "cancel_seen": False,
+            "limit_stop": None, "advised": [], "advice_attempted": [], "ranked": False,
+            "input_requests": 0, "output_failures": 0, "discovered": {}, "evaluated": {},
             "searches": [], "observations": [], "review_queue": [], "human_inputs": [],
             "rejection_streak": 0, "failure_streak": 0, "no_progress": 0}
 
@@ -175,7 +226,7 @@ def node_decide(state: LoopState, config):
     i = int(state.get("iteration") or 1)
 
     recorded = store.get_action(run_id, i)
-    if recorded is not None:                       # replay: never re-ask the model
+    if recorded is not None:                            # replay: never re-ask the model
         return {"pending": {"action": recorded["action"], "arguments": recorded["arguments"],
                             "reason": recorded["reason"], "decided_by": recorded["decided_by"]}}
 
@@ -186,8 +237,11 @@ def node_decide(state: LoopState, config):
     updates = {}
     decision, decided_by = None, "rules"
 
+    from llm import quota_blocked
     if mode == "llm":
-        if budget.exhausted():
+        if quota_blocked():
+            mode, note = "rules", "controller switched to rules: LLM quota exhausted"
+        elif budget.exhausted():
             mode, note = "rules", "controller switched to rules: LLM budget exhausted"
         else:
             from llm import create_step, finish_step, fail_step
@@ -239,15 +293,22 @@ def node_act(state: LoopState, config):
     pending = state.get("pending") or {}
     work = copy.deepcopy(dict(state))
     stop = check_limits(run_id, goal, work)
-    if stop:
+    if stop:                                            # R13: re-check right before execution
         store.record_action_outcome(run_id, gen, i, "rejected",
                                     {"stopped_before_execution": stop["reason"]})
         return {"stop": stop, "pending": None}
 
     action, args = pending.get("action"), pending.get("arguments") or {}
-    ctx = ToolContext(run_id, gen, goal, work, budget, i)
+    ctx = ToolContext(run_id, gen, goal, work, budget, i,
+                      limit_check=lambda: check_limits(run_id, goal, work))
     obs_entry = {"iteration": i, "action": action, "decided_by": pending.get("decided_by")}
     try:
+        # A model-chosen action must be permitted in the CURRENT state — also on a
+        # replayed iteration — before its tool runs (N10).
+        if pending.get("decided_by") == "llm":
+            allowed = allowed_actions_for(goal, work, qualified_count(ctx))
+            if action not in allowed:
+                raise ToolRejected(f"action {action!r} is not allowed now; allowed: {allowed}")
         obs, step_id, progressed = execute(ctx, action, args)
         store.record_action_outcome(run_id, gen, i, "executed", obs, step_id=step_id)
         obs_entry["result"] = obs
@@ -266,6 +327,8 @@ def node_act(state: LoopState, config):
                 work["controller_mode"] = "rules"
                 work["controller_note"] = "controller switched to rules: repeated rejected actions"
         else:
+            # The rules policy should never be rejected; if it is, count it as no
+            # progress so the run cannot spin.
             work["no_progress"] = int(work.get("no_progress") or 0) + 1
     except (store.ExecutionLost, run_lock.ExecutionLost):
         raise
@@ -278,7 +341,12 @@ def node_act(state: LoopState, config):
         if action == "rank_jobs":
             work["output_failures"] = int(work.get("output_failures") or 0) + 1
 
-    work["observations"] = ((work.get("observations") or []) + [obs_entry])[-MAX_OBSERVATIONS:]
+    if work.get("limit_stop"):                     # a limit/cancel hit INSIDE the tool
+        work["stop"] = work.pop("limit_stop")
+    elif work.get("cancel_seen"):
+        work["stop"] = {"by": "user", "reason": "cancelled by user", "cancel": True}
+    observations = (work.get("observations") or []) + [obs_entry]
+    work["observations"] = observations[-MAX_OBSERVATIONS:]
     work["iteration"] = i + 1
     work["pending"] = None
     try:
@@ -296,6 +364,9 @@ def node_review(state: LoopState, config):
     queue = list(state.get("review_queue") or [])
     if not queue:
         return {}
+    if state.get("cancel_seen") or store.is_cancel_requested(run_id):
+        # N06: never open a human pause after a cancel.
+        return {"stop": {"by": "user", "reason": "cancelled by user", "cancel": True}}
     item = queue[0]
     rid = item["review_id"]
     if item.get("kind") == "input_request":
@@ -315,7 +386,8 @@ def node_review(state: LoopState, config):
     store.create_review_request(run_id, gen, rid, kind, payload,
                                 step_id=item.get("step_id"), job_id=item.get("job_id"))
 
-    value = interrupt(payload) or {}                  # ---- PAUSE ----
+    value = interrupt(payload)                          # ---- PAUSE ----
+    value = value or {}
     if value.get("review_id") != rid:
         raise StaleReviewDecision(f"decision for {value.get('review_id')!r} cannot answer {rid!r}")
     rec = store.review_status(rid)
@@ -370,9 +442,17 @@ def node_finalize(state: LoopState, config):
             rank_error = safe_exception_summary(e)
 
     progress = _progress(run_id, goal, work)
-    q = progress["qualified"] or 0
+    # N07: the authoritative count RAISES on a database error (-> run failed with a
+    # classified error); an unknown count is never treated as zero matches.
+    q = len(store.qualified_job_ids(run_id, goal.qualifying_decisions,
+                                    verified_only=goal.require_verified_matches))
+    progress["qualified"] = q
     searches = work.get("searches") or []
     all_failed = bool(searches) and all(s.get("provider_status") == "failed" for s in searches)
+    eval_failures = progress["evaluation_failures"]
+    # N06: a cancel requested after the last action still wins.
+    if not stop.get("cancel") and (work.get("cancel_seen") or store.is_cancel_requested(run_id)):
+        stop = {"by": "user", "reason": "cancelled by user", "cancel": True}
 
     if stop.get("cancel"):
         status, code = "cancelled", ErrorCode.CANCELLED
@@ -380,7 +460,7 @@ def node_finalize(state: LoopState, config):
         from autonomous_graph import _stage_error_code
         status, code = "failed", _stage_error_code(stop.get("reason"))
     elif rank_error:
-        status, code = "failed", ErrorCode.INTERNAL
+        status, code = "failed", ErrorCode.INTERNAL          # deliverable not persisted (R03)
         stop = {**stop, "reason": f"ranking could not be persisted: {rank_error}"}
     elif stop.get("by") == "error":
         status, code = ("partial_success" if q else "failed"), (None if q else ErrorCode.INTERNAL)
@@ -390,15 +470,27 @@ def node_finalize(state: LoopState, config):
         status, code = "partial_success", None
     elif all_failed:
         status, code = "failed", ErrorCode.JOB_SOURCE_UNAVAILABLE
+    elif eval_failures and not evaluated_ok:
+        # Jobs were found but NONE could be evaluated: that is a failure, not
+        # evidence that no suitable job exists.
+        status, code = "failed", ErrorCode.INTERNAL
+        stop = {**stop, "reason": f"{eval_failures} job evaluation(s) failed; none completed"}
+    elif eval_failures:
+        status, code = "completed_with_errors", None      # some coverage missing
     else:
         status, code = "no_matches", ErrorCode.NO_MATCHES
     reason = f"{stop.get('reason')} — {q}/{goal.target_count} qualified"
+    if progress.get("unverified_matches"):
+        reason += (f" ({progress['unverified_matches']} rest only on rule-based requirement "
+                   f"extraction{'; excluded' if goal.require_verified_matches else ''})")
     if status == "success" and (work.get("output_failures") or progress["evaluation_failures"]):
         reason += " (some evaluations or advice failed; see trace)"
     work["final"] = {"status": status, "reason": reason,
                      "error_code": code.value if code else None, "progress": progress}
     return work
 
+
+# ----------------------------------------------------------------- routing ----
 
 def route_after_setup(state):
     return "finalize" if state.get("stop") else "decide"
@@ -410,7 +502,7 @@ def route_after_decide(state):
 
 def route_after_act(state):
     stop = state.get("stop") or {}
-    if stop.get("cancel"):
+    if stop.get("cancel") or state.get("cancel_seen"):
         return "finalize"              # never pause for a human after a cancel (R13)
     if state.get("review_queue"):
         return "review"
@@ -420,6 +512,8 @@ def route_after_act(state):
 
 
 def route_after_review(state):
+    if (state.get("stop") or {}).get("cancel"):
+        return "finalize"
     if state.get("review_queue"):
         return "review"
     return "finalize" if state.get("stop") else "decide"
@@ -447,7 +541,10 @@ def _recursion_limit(goal: AgentGoal):
     return goal.limits.max_iterations * 3 + 40
 
 
+# -------------------------------------------------------------- entrypoints ---
+
 def pending_interrupt_value(graph, config):
+    """The value of the interrupt the checkpoint is currently paused on, or None."""
     snap = graph.get_state(config)
     intr = getattr(snap, "interrupts", None) or ()
     if not intr:
@@ -476,6 +573,16 @@ def _handle_result(run_id, gen, result):
     return result
 
 
+def _repair_from_checkpoint(run_id, gen, final):
+    """Idempotently write the terminal outcome recorded in a completed checkpoint.
+    No tool, model or human-decision effect is repeated."""
+    store.finalize(run_id, gen, final["status"], final["reason"], final.get("error_code"),
+                   final.get("progress") or {})
+    log.warning("run finalized from its completed checkpoint (previous worker stopped "
+                "before recording it): %s", final["status"], extra={"run_id": run_id})
+    return {"repaired": True, "status": final["status"]}
+
+
 def _fail(run_id, gen, e):
     if isinstance(e, (store.ExecutionLost, run_lock.ExecutionLost)) or run_lock.is_lost(run_id):
         log.warning("agent execution abandoned: %s", e, extra={"run_id": run_id})
@@ -490,6 +597,7 @@ def _fail(run_id, gen, e):
 
 
 def run_agent_loop(run_id, queue_attempt=1, checkpointer_factory=None):
+    """Worker entrypoint for a queued agent run (start_run with mode='agent')."""
     from checkpointing import open_checkpointer
     cfg = store.load_run_config(run_id)
     if not cfg or not cfg["goal"]:
@@ -499,17 +607,30 @@ def run_agent_loop(run_id, queue_attempt=1, checkpointer_factory=None):
     if cfg["cancel_requested"]:
         store.finalize(run_id, gen, "cancelled", "cancelled before start", ErrorCode.CANCELLED, {})
         return {"cancelled": True}
-    initial = {"run_id": run_id, "goal": goal.model_dump(), "resume_id": cfg["resume_id"]}
+    # A NEW attempt resets every control field explicitly: LangGraph merges input
+    # into the thread's previous state, so a stale stop/final from a failed attempt
+    # would otherwise end the new attempt immediately (N03). Durable facts (recorded
+    # actions, searches, evaluations) live in the database and are reused replay-safely.
+    initial = {"run_id": run_id, "goal": goal.model_dump(), "resume_id": cfg["resume_id"],
+               "setup_done": False, "stop": None, "final": None, "pending": None,
+               "review_queue": [], "cancel_seen": False, "limit_stop": None}
     try:
         with (checkpointer_factory or open_checkpointer)() as cp:
             graph = build_agent_graph(cp)
             config = {"configurable": {"thread_id": str(run_id), "generation": gen},
                       "recursion_limit": _recursion_limit(goal)}
             snap = graph.get_state(config)
-            # A retried attempt CONTINUES from the last checkpoint (replay-safely).
+            values = (snap.values if snap else None) or {}
+            final = values.get("final")
             if snap and snap.next and not pending_interrupt_value(graph, config):
+                # Interrupted mid-graph: CONTINUE (the failed node re-runs replay-safely).
                 result = graph.invoke(None, config=config)
+            elif not (snap and snap.next) and final and final.get("status") != "failed":
+                # N04: the graph already COMPLETED successfully; only the run-row
+                # update was lost. Repair it from the checkpoint — never re-run.
+                return _repair_from_checkpoint(run_id, gen, final)
             else:
+                # Fresh start, or a retry of an attempt that FAILED: new attempt.
                 result = graph.invoke(initial, config=config)
             return _handle_result(run_id, gen, result)
     except Exception as e:
@@ -517,7 +638,9 @@ def run_agent_loop(run_id, queue_attempt=1, checkpointer_factory=None):
 
 
 def resume_agent_loop(run_id, payload, queue_attempt=1, checkpointer_factory=None):
-    """Decision is bound to payload['review_id']; a mismatch is stale (R01)."""
+    """Worker entrypoint for a resume_run job of an agent run. The decision is bound
+    to payload['review_id']; if the checkpoint is paused on a DIFFERENT interrupt the
+    job is stale and nothing is applied (R01)."""
     from checkpointing import open_checkpointer
     cfg = store.load_run_config(run_id)
     goal = AgentGoal(**cfg["goal"])
@@ -530,6 +653,7 @@ def resume_agent_loop(run_id, payload, queue_attempt=1, checkpointer_factory=Non
             pending = pending_interrupt_value(graph, config)
 
             if cfg["cancel_requested"]:
+                # Cancel wins: never apply a decision or run more tools after it.
                 values = graph.get_state(config).values or {}
                 ok = [v for v in (values.get("evaluated") or {}).values() if v.get("status") == "ok"]
                 if ok:
@@ -544,7 +668,15 @@ def resume_agent_loop(run_id, payload, queue_attempt=1, checkpointer_factory=Non
                 return {"cancelled": True}
 
             rid = (payload or {}).get("review_id")
+            snap = graph.get_state(config)
+            final = ((snap.values if snap else None) or {}).get("final")
+            if not pending and final and not snap.next:
+                # N04: the review was consumed and the graph completed, but the process
+                # died before the run row was finalized. Repair from the checkpoint.
+                return _repair_from_checkpoint(run_id, gen, final)
             if not pending or pending.get("review_id") != rid:
+                # Stale job (retry after the graph moved on, or an old tab). Restore
+                # a consistent run status from the CHECKPOINT; apply nothing.
                 if pending:
                     store.mark_waiting(run_id, gen, pending)
                 log.warning("stale resume for review %s ignored (checkpoint waits on %s)",

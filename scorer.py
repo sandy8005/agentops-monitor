@@ -1,13 +1,14 @@
 from skills import (canonical_skill, canonical_set, normalize_requirements,
-                    skill_in_text, text_index, affirmative_skill_in_text)
+                    skill_in_text, text_index, skill_mention_states)
 
 
 def _skill_present(skill, resume_text_lower, resume_tokens, raw_text=None,
-                   surface_forms=None, negated_out=None):
+                   surface_forms=None, negated_out=None, uncertain_out=None):
     """Whole-word, ALIAS-AWARE, NEGATION-AWARE skill match ('go' never matches inside
-    'django'; 'Kubernetes' matches 'K8s'; 'No Python experience' is NOT Python
-    evidence). A skill that is only mentioned in negated form is recorded in
-    `negated_out` so the caller can surface it for review (R08)."""
+    'django'; 'Kubernetes' matches 'K8s'). Only an AFFIRMATIVE mention counts:
+    'No Python experience', 'Python experience: none' (negated) and 'currently
+    learning Python' (uncertain) are not evidence. Skills that are mentioned but only
+    in those forms are recorded so the router routes the job to review (R08/N05)."""
     if not (skill or "").strip():
         return False
     forms = (surface_forms or {}).get(canonical_skill(skill))
@@ -15,10 +16,13 @@ def _skill_present(skill, resume_text_lower, resume_tokens, raw_text=None,
         return False
     if raw_text is None:
         return True
-    if affirmative_skill_in_text(skill, raw_text, forms):
+    st = skill_mention_states(skill, raw_text, forms)
+    if st["affirmative"]:
         return True
-    if negated_out is not None and skill not in negated_out:
+    if st["negated"] and negated_out is not None and skill not in negated_out:
         negated_out.append(skill)
+    elif st["uncertain"] and uncertain_out is not None and skill not in uncertain_out:
+        uncertain_out.append(skill)
     return False
 
 
@@ -33,9 +37,11 @@ def effective_years(parsed_resume, mode="conservative"):
     flagged. mode="stated" reproduces the raw stated value (used by the router to
     check whether the discrepancy actually changes the decision).
 
-    Returns (years, basis) with basis in {"stated", "conservative_min"}.
+    Returns (years, basis) with basis in {"stated", "conservative_min", "unknown"}.
     """
     parsed_resume = parsed_resume or {}
+    if parsed_resume.get("years_experience") is None and parsed_resume.get("experience_unknown"):
+        return None, "unknown"          # rules parse found no explicit statement
     stated = parsed_resume.get("years_experience") or 0
     disc = parsed_resume.get("experience_discrepancy")
     if mode == "conservative" and isinstance(disc, dict):
@@ -64,10 +70,12 @@ def calculate_match_score(parsed_resume, requirements, resume_text, job=None, us
     requirements = normalize_requirements(requirements)
     surface = requirements.get("_surface_forms") or {}
     negated = []
+    uncertain = []
     raw = resume_text or ""
 
     def present(skill):
-        return _skill_present(skill, resume_text_lower, resume_tokens, raw, surface, negated)
+        return _skill_present(skill, resume_text_lower, resume_tokens, raw, surface,
+                              negated, uncertain)
 
     required = list(requirements["required_skills"])
     any_of_groups = [list(g) for g in requirements.get("required_any_of", [])]
@@ -165,14 +173,20 @@ def calculate_match_score(parsed_resume, requirements, resume_text, job=None, us
     if projects_category_applies:
         applicable["projects"] = BASE_WEIGHTS["projects"]
 
-    # Experience.
-    if candidate_years >= min_years:
+    # Experience. UNKNOWN experience (rules-only parse with no explicit statement)
+    # is not scored as zero and not assumed sufficient: the category is absent and
+    # the decision is capped below (it cannot be an automatic Apply).
+    experience_unknown = candidate_years is None
+    if experience_unknown:
+        pass
+    elif candidate_years >= min_years:
         fractions["experience"] = 1.0
     elif min_years > 0:
         fractions["experience"] = candidate_years / min_years
     else:
         fractions["experience"] = 1.0
-    applicable["experience"] = BASE_WEIGHTS["experience"]   # experience always applies
+    if not experience_unknown:
+        applicable["experience"] = BASE_WEIGHTS["experience"]
 
     # --- Normalize over applicable weight and build the reported breakdown --------
     # Renormalize the applicable weights so they still sum to 100 (this is where an
@@ -208,6 +222,8 @@ def calculate_match_score(parsed_resume, requirements, resume_text, job=None, us
         decision = "Maybe"
     else:
         decision = "Skip"
+    if experience_unknown and min_years > 0 and decision == "Apply":
+        decision = "Maybe"              # can't confirm the years requirement
 
     return {
         "score": total,
@@ -218,6 +234,7 @@ def calculate_match_score(parsed_resume, requirements, resume_text, job=None, us
         "candidate_years_used": candidate_years,
         "experience_basis": experience_basis,
         "insufficient_requirements": insufficient,
+        "experience_unknown": experience_unknown,
         # Accurate, requirements-based evidence (whole-word, optional-aware).
         # 'missing_skills' is REQUIRED-only — so an optional skill is never a gap.
         "matched_skills": matched_required,
@@ -227,4 +244,6 @@ def calculate_match_score(parsed_resume, requirements, resume_text, job=None, us
         # Skills the resume mentions ONLY in negated form ("no Python experience").
         # They are scored as absent; the router forces a review when any appear.
         "negated_skills": negated,
+        # Mentioned only aspirationally ("currently learning X") — also absent.
+        "uncertain_skills": uncertain,
     }

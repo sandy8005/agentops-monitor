@@ -52,7 +52,7 @@ Return ONLY valid JSON, no markdown fences, no explanation, in exactly this shap
   "notes": "one sentence"
 }}
 """
-    raw = logged_llm_call(prompt, run_id, step_id, budget=budget)
+    raw = logged_llm_call(prompt, run_id, step_id, operation="evaluate_decision", budget=budget)
     cleaned = raw.strip().replace("```json", "").replace("```", "").strip()
     data = json.loads(cleaned)
     return Evaluation(**data).model_dump()

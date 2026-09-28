@@ -135,6 +135,7 @@ app.add_middleware(
 #   * step retrieved_context                        (resume-derived evidence)
 #   * evaluation notes and hallucinated claims      (quote resume/job content)
 #   * LLM / tool / step ERROR MESSAGES               (providers can echo input)
+#   * agent-action free text (errors, rejections, model reasons) — recursively
 # What it deliberately does NOT hide — these are the product's OUTPUT to the run's
 # owner, shown only to that authenticated owner:
 #   * generated application advice (/runs/{id}/rankings)
@@ -362,6 +363,7 @@ class AgentGoalRequest(BaseModel):
     use_llm_controller: bool = True
     use_llm_advice: bool = False
     on_model_unavailable: Literal["rules", "pause"] = "rules"
+    require_verified_matches: bool = False
 
 
 class StartRunRequest(BaseModel):
@@ -380,6 +382,8 @@ class StartRunRequest(BaseModel):
     live_only: bool = False
     mode: Literal["pipeline", "agent"] = "pipeline"
     goal: Optional[AgentGoalRequest] = None
+    # Applies to BOTH modes. "rules_only" = zero model calls for the whole run.
+    model_policy: Literal["auto", "rules_only"] = "auto"
 
 
 class ResumeRunRequest(BaseModel):
@@ -416,6 +420,8 @@ def _build_agent_goal(body):
             use_llm_controller=g.use_llm_controller,
             use_llm_advice=g.use_llm_advice,
             on_model_unavailable=g.on_model_unavailable,
+            model_policy=body.model_policy,
+            require_verified_matches=g.require_verified_matches,
         )
     except Exception as e:
         raise HTTPException(status_code=422, detail=f"invalid agent goal: {e}")
@@ -503,7 +509,7 @@ def start_run(request: Request, body: StartRunRequest,
             "resume_id": resume_id, "target_role": target_role, "location": location,
             "work_mode": work_mode, "employment_type": employment_type,
             "evaluate": evaluate, "run_id": run_id, "live_only": live_only,
-            "mode": body.mode,
+            "mode": body.mode, "model_policy": body.model_policy,
         }, run_id=run_id)
         conn.commit()
     except HTTPException:
@@ -840,6 +846,39 @@ def get_run_rankings(run_id: int, user: dict = Depends(require_auth)):
     return {"run_id": run_id, "rankings": rankings}
 
 
+# Free-text fields inside action traces that can quote resume/job/provider/user
+# content. Everything else in an observation is counts, ids, enums, statuses or a
+# backend-validated search title.
+_FREE_TEXT_KEYS = {"failed", "rejected", "note", "error", "stopped_before_execution",
+                   "answer", "question", "reason", "provider_detail", "generation"}
+
+
+def _redact_tree(value, key=None):
+    """Apply the trace-redaction policy RECURSIVELY (N09): free-text values anywhere
+    in the structure are redacted, structural data is kept."""
+    if isinstance(value, dict):
+        return {k: _redact_tree(v, k) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_redact_tree(v, key) for v in value]
+    if key in _FREE_TEXT_KEYS and value is not None:
+        return _REDACTED
+    return value
+
+
+def _safe_action(a):
+    """Explicit response schema for one controller action."""
+    if not REDACT_TRACE_PAYLOADS:
+        return a
+    out = dict(a)
+    out["error"] = _redact(a.get("error"))
+    out["observation"] = _redact_tree(a.get("observation"))
+    out["arguments"] = _redact_tree(a.get("arguments"))
+    # A model-written justification is free text; backend/rules reasons are ours.
+    if a.get("decided_by") == "llm":
+        out["reason"] = _redact(a.get("reason"))
+    return out
+
+
 def _safe_url(url):
     """Only http(s) provider URLs are returned as clickable links (R07)."""
     u = (url or "").strip()
@@ -862,10 +901,7 @@ def get_agent_timeline(run_id: int, user: dict = Depends(require_auth)):
         raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
     if row[0] != "agent":
         return {"run_id": run_id, "mode": row[0] or "pipeline", "actions": []}
-    actions = agent_store.list_actions(run_id)
-    if REDACT_TRACE_PAYLOADS:
-        for a in actions:
-            a["error"] = _redact(a["error"])
+    actions = [_safe_action(a) for a in agent_store.list_actions(run_id)]
     usage = agent_store.run_usage(run_id)
     return {"run_id": run_id, "mode": "agent", "goal": row[1], "controller_mode": row[2],
             "progress": row[3], "status": row[6], "error_code": row[7],

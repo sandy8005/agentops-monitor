@@ -52,14 +52,27 @@ def _reqs_cache_key(title, description):
     return _hash(f"{title}\n{description}|{reqs_cache_version()}")
 
 
+def _llm_allowed(state):
+    """The run's model policy allows a model call AND one could succeed now
+    (credentials configured, quota breaker closed, run budget left)."""
+    from llm import llm_available
+    return (getattr(state, "model_policy", "auto") != "rules_only"
+            and llm_available() and not state.budget_exceeded())
+
+
 def load_resume(state, run_id):
     """Load the resume document from DB (0 LLM calls)."""
     with get_connection() as conn:
         cur = conn.cursor()
-        cur.execute("SELECT resume_text FROM resumes WHERE id = %s", (state.resume_id,))
+        cur.execute("SELECT resume_text, is_deleted FROM resumes WHERE id = %s",
+                    (state.resume_id,))
         row = cur.fetchone()
         if not row or not row[0]:
             state.error = f"resume {state.resume_id} not found or empty"
+            return
+        # R22 defense in depth: an erased resume is never used as input.
+        if row[1] or row[0] == "[erased]":
+            state.error = f"resume {state.resume_id} was erased"
             return
         state.resume_text = row[0]
 
@@ -102,14 +115,29 @@ def do_parse_resume(state, run_id):
             finish_step(step_id, "success")
             log.info("parsed resume served from cache — 0 LLM calls", extra={"step_id": step_id})
             return
-        parsed = parse_resume(state.resume_text, run_id, step_id, budget=state)
-        # A parse that yields no usable dict must NOT flow downstream as
-        # parsed_resume=None — it would crash scoring/judging on None["..."]. Treat it
-        # as a parse failure so route_after_parse ends the run cleanly, and never
-        # cache a non-dict (which would poison the parse cache).
-        if not isinstance(parsed, dict):
-            raise ValueError("resume parse returned no usable data")
-        _parse_cache_put(rhash, parsed)
+        parsed = None
+        if _llm_allowed(state):
+            try:
+                parsed = parse_resume(state.resume_text, run_id, step_id, budget=state)
+                # A parse that yields no usable dict must NOT flow downstream as None;
+                # never cache a non-dict (it would poison the parse cache).
+                if not isinstance(parsed, dict):
+                    raise ValueError("resume parse returned no usable data")
+                _parse_cache_put(rhash, parsed)
+            except Exception as llm_err:
+                from error_codes import summarize_error
+                log.warning("model resume parse unavailable (%s) — using rules parse",
+                            summarize_error(llm_err), extra={"step_id": step_id})
+                parsed = None
+        if parsed is None:
+            # N01: deterministic extraction — zero model calls. Never cached under
+            # the model-parse key, so a later model-enabled run still gets a model parse.
+            from rule_resume_parser import parse_resume_rules
+            parsed = parse_resume_rules(state.resume_text)
+            log.info("resume parsed by rules (%d skills, years %s) — 0 LLM calls",
+                     len(parsed["skills"]),
+                     "unknown" if parsed["years_experience"] is None else parsed["years_experience"],
+                     extra={"step_id": step_id})
         state.parsed_resume = parsed
         finish_step(step_id, "success")
     except Exception as e:
@@ -298,7 +326,7 @@ def _get_requirements(state, job, run_id, step_id):
         log.info("requirements for '%s' served from cache [llm] — 0 LLM calls", job["title"])
         return cached, True, "llm"
 
-    if not state.budget_exceeded():
+    if _llm_allowed(state):
         try:
             reqs = extract_requirements(job, run_id, step_id, budget=state)
             _reqs_cache_put(dhash, reqs, "llm")
@@ -306,7 +334,8 @@ def _get_requirements(state, job, run_id, step_id):
                 log.info("requirements for '%s' upgraded rule_based -> llm", job["title"])
             return reqs, False, "llm"
         except Exception as extract_err:
-            log.warning("requirements LLM extraction failed (%s)", extract_err)
+            from error_codes import summarize_error
+            log.warning("requirements LLM extraction failed (%s)", summarize_error(extract_err))
 
     if cached is not None:
         # Degraded but still valid fallback that hasn't expired — reuse it, don't rewrite.
@@ -427,6 +456,16 @@ def do_process_job(state, run_id):
             run_id, step_id, operation="score")
         score = score_result["score"]
 
+        # 2a. Quality gates that a confident score must NOT bypass (R08, R12):
+        #     a required skill the resume only mentions in NEGATED form, or an
+        #     extraction that produced no usable requirements at all.
+        if score_result.get("negated_skills"):
+            flag_for_review(step_id, reason="negated_skill_mention")
+        if score_result.get("uncertain_skills"):
+            flag_for_review(step_id, reason="uncertain_skill_evidence")
+        if score_result.get("insufficient_requirements"):
+            flag_for_review(step_id, reason="insufficient_requirements")
+
         # 2b. Experience discrepancy: the scorer already used the CONSERVATIVE years
         #     (the lower of stated vs. summed). If the questionable stated value would
         #     have produced a DIFFERENT decision, a human must look — the number that
@@ -440,7 +479,7 @@ def do_process_job(state, run_id):
 
         # 3. Gemini judge ONLY in the uncertain middle band (#5,6,7).
         #    judge_status is the single truth about whether the judge RAN:
-        #      ran | invalid_output | unavailable | skipped_budget | not_needed
+        #      ran | invalid_output | unavailable | skipped_budget | not_needed | disabled
         result = None
         judge_status = "not_needed"
         judge_skip_reason = None
@@ -449,13 +488,28 @@ def do_process_job(state, run_id):
             # Extreme score — judge adds little; skip it (honest, not faked).
             judge_skip_reason = "score_extreme_low" if score < 20 else "score_extreme_high"
             llm_decision = f"skipped ({judge_skip_reason})"
-        elif state.budget_exceeded():
+        elif getattr(state, "model_policy", "auto") == "rules_only":
+            # The user CHOSE a model-free run: the deterministic score decides, and
+            # that is recorded as such (not as an outage requiring review).
+            judge_status = "disabled"
+            judge_skip_reason = "rules_only"
+            llm_decision = "skipped (rules_only)"
+        elif not _llm_allowed(state):
             # Uncertain band BY CONSTRUCTION needs a second opinion — none is
             # available, so the deterministic score alone must not decide silently.
-            judge_status = "skipped_budget"
-            judge_skip_reason = "budget"
-            llm_decision = "skipped (budget)"
-            flag_for_review(step_id, reason="judge_unavailable(budget)")
+            from llm import quota_blocked
+            if state.budget_exceeded():
+                why = "budget"
+            elif quota_blocked():
+                why = "quota"
+            elif not settings.gemini_api_key:
+                why = "not_configured"
+            else:
+                why = "unavailable"
+            judge_status = "skipped_budget" if why == "budget" else "unavailable"
+            judge_skip_reason = why
+            llm_decision = f"skipped ({why})"
+            flag_for_review(step_id, reason=f"judge_unavailable({why})")
         else:
             from agent import build_prompt
             evidence = {"matched_in_resume": score_result["matched_skills"],
@@ -484,8 +538,9 @@ def do_process_job(state, run_id):
                 judge_skip_reason = "judge_unavailable"
                 llm_decision = "skipped (judge_unavailable)"
                 flag_for_review(step_id, reason="judge_unavailable")
+                from error_codes import summarize_error
                 log.warning("judge unavailable (%s) — keeping score, flagged for review",
-                            judge_err, extra={"run_id": run_id, "step_id": step_id})
+                            summarize_error(judge_err), extra={"run_id": run_id, "step_id": step_id})
 
         # record_score sets the score-vs-LLM DISAGREEMENT review flag (additively) as a
         # side effect. Its return value is only that ONE trigger, so it is deliberately
@@ -512,7 +567,7 @@ def do_process_job(state, run_id):
         if (state.evaluate and result is not None
                 and llm_decision in ("Apply", "Maybe", "Skip")):
             eval_selection = _evaluation_selection(run_id, step_id, _step_needs_review(step_id))
-        if eval_selection and not state.budget_exceeded():
+        if eval_selection and _llm_allowed(state):
             try:
                 from evaluator import evaluate_decision
                 from llm import save_evaluation
@@ -530,7 +585,8 @@ def do_process_job(state, run_id):
                          extra={"run_id": run_id, "step_id": step_id})
             except Exception as eval_err:
                 flag_for_review(step_id, reason="evaluation_failed")
-                log.warning("evaluation requested but failed: %s", eval_err,
+                from error_codes import summarize_error
+                log.warning("evaluation requested but failed: %s", summarize_error(eval_err),
                             extra={"run_id": run_id, "step_id": step_id})
         elif eval_selection:
             eval_selection = "skipped_budget"
@@ -602,8 +658,11 @@ def do_rank_jobs(state, run_id):
         _persist_rankings(run_id, state.ranked)
         finish_step(step_id, "success")
     except Exception as e:
+        # The ranking IS the run's deliverable: if it was not committed, the run
+        # must not report success (R03).
         fail_step(step_id, e)
         state.ranked = state.job_results
+        state.error = f"rank failed: {e}"
     finally:
         state.ranking_done = True   # ranking ran (even if empty) — don't loop on it
 
@@ -612,25 +671,22 @@ def _persist_rankings(run_id, ranked):
     """
     Persist the final ranked list as self-contained snapshot rows in run_rankings
     (1-based rank_position). Snapshot fields are stored so the ranking is readable
-    later without joining job_postings. Best-effort — a persistence failure never
-    breaks the run. Re-persisting a run replaces its previous rows. The connection
-    is always returned to the pool (context manager), even when an INSERT fails.
+    later without joining job_postings. Replace-all in ONE transaction, so a retry
+    is idempotent. A persistence failure RAISES (R03): the caller decides the run
+    outcome; it is never silently reported as a successful ranking.
     """
-    try:
-        with get_connection() as conn:
-            cur = conn.cursor()
-            cur.execute("DELETE FROM run_rankings WHERE run_id = %s", (run_id,))
-            for pos, r in enumerate(ranked or [], start=1):
-                cur.execute("""
-                    INSERT INTO run_rankings
-                        (run_id, job_id, rank_position, title, company, score,
-                         final_decision, apply_url)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-                """, (run_id, r.get("job_id"), pos, r.get("title"), r.get("company"),
-                      r.get("score"), r.get("final_decision") or r.get("decision"),
-                      r.get("apply_url")))
-    except Exception:
-        log.exception("persist rankings failed", extra={"run_id": run_id})
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM run_rankings WHERE run_id = %s", (run_id,))
+        for pos, r in enumerate(ranked or [], start=1):
+            cur.execute("""
+                INSERT INTO run_rankings
+                    (run_id, job_id, rank_position, title, company, score,
+                     final_decision, apply_url)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            """, (run_id, r.get("job_id"), pos, r.get("title"), r.get("company"),
+                  r.get("score"), r.get("final_decision") or r.get("decision"),
+                  r.get("apply_url")))
 
 
 def _advice_profile(parsed_resume, score_result):
@@ -704,23 +760,40 @@ RESUME EDITS:
 
 
 def _persist_advice(run_id, job_id, title, advice):
-    """Persist one advice text to run_advice, keyed to (run_id, job_id). Best-effort
-    — never breaks the run. Re-persisting the same (run, job) replaces the prior row.
-    The connection is always returned to the pool, even when a statement fails."""
+    """Persist one advice text to run_advice, keyed to (run_id, job_id). Re-persisting
+    the same (run, job) replaces the prior row. A failure RAISES (R03); the caller
+    records it as a partial failure instead of reporting silent success."""
     if not advice:
         return
-    try:
-        with get_connection() as conn:
-            cur = conn.cursor()
-            cur.execute(
-                "DELETE FROM run_advice WHERE run_id = %s AND job_id IS NOT DISTINCT FROM %s",
-                (run_id, job_id))
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "DELETE FROM run_advice WHERE run_id = %s AND job_id IS NOT DISTINCT FROM %s",
+            (run_id, job_id))
+        cur.execute("""
+            INSERT INTO run_advice (run_id, job_id, title, advice)
+            VALUES (%s, %s, %s, %s)
+        """, (run_id, job_id, title, advice.strip()))
+
+
+def _persist_suggestions(run_id, job_id, resume_id, resume_hash, suggestions):
+    """Structured suggestions for the pipeline path (same table as agent mode).
+    Replace-per-(run, job); raises on failure (R03)."""
+    if job_id is None or resume_id is None:
+        return
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM resume_suggestions WHERE run_id = %s AND job_id = %s",
+                    (run_id, job_id))
+        for pos, sg in enumerate(suggestions, start=1):
             cur.execute("""
-                INSERT INTO run_advice (run_id, job_id, title, advice)
-                VALUES (%s, %s, %s, %s)
-            """, (run_id, job_id, title, advice.strip()))
-    except Exception:
-        log.exception("persist advice failed", extra={"run_id": run_id})
+                INSERT INTO resume_suggestions (run_id, job_id, resume_id, resume_hash, position,
+                    kind, original_text, suggested_text, reason, evidence, method, status,
+                    validation_notes)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            """, (run_id, job_id, resume_id, resume_hash, pos, sg["kind"], sg.get("original_text"),
+                  sg["suggested_text"], sg["reason"], json.dumps(sg.get("evidence") or []),
+                  sg["method"], sg["status"], sg.get("validation_notes")))
 
 
 def do_generate_advice(state, run_id, top_n=2):
@@ -734,16 +807,14 @@ def do_generate_advice(state, run_id, top_n=2):
         viable = [r for r in (state.ranked or [])
                   if r.get("final_decision", r.get("decision")) in ("Apply", "Maybe")][:top_n]
         for r in viable:
-            if state.budget_exceeded():
-                log.info("advice skipped — budget reached")
-                break
             # Look up the posting by STABLE job_id, falling back to title only when
             # job_id is missing (legacy rows).
             job = None
             if r.get("job_id") is not None:
                 job = next((j for j in state.jobs if j.get("id") == r["job_id"]), None)
-            if job is None:
-                job = next((j for j in state.jobs if j["title"] == r["title"]), None)
+            if job is None and r.get("job_id") is None:
+                same_title = [j for j in state.jobs if j["title"] == r["title"]]
+                job = same_title[0] if len(same_title) == 1 else None
             if not job:
                 continue
             dhash = _reqs_cache_key(job["title"], job["description"])
@@ -752,11 +823,28 @@ def do_generate_advice(state, run_id, top_n=2):
                 "required_skills": [], "required_any_of": [], "preferred_skills": [],
                 "min_years_experience": 0, "responsibilities": []
             }
+            from skills import normalize_requirements
+            requirements = normalize_requirements(requirements)
             sc = calculate_match_score(state.parsed_resume, requirements,
                                        state.resume_text, job, None)
-            advice = _combined_advice(state.parsed_resume, job, requirements, sc,
-                                      run_id, step_id, budget=state)
+            # Evidence-checked suggestions from rules ALWAYS (no model needed); the
+            # model-written strategy text is added only when a model call is allowed.
+            from resume_advisor import rule_suggestions, advice_summary
+            suggestions = rule_suggestions(state.parsed_resume, state.resume_text, job,
+                                           requirements, sc)
+            advice = advice_summary(job, suggestions, "rules")
+            if _llm_allowed(state):
+                try:
+                    advice = _combined_advice(state.parsed_resume, job, requirements, sc,
+                                              run_id, step_id, budget=state) \
+                        + "\n\n" + advice
+                except Exception as adv_err:
+                    from error_codes import summarize_error
+                    log.warning("model advice unavailable (%s) — rules suggestions only",
+                                summarize_error(adv_err), extra={"step_id": step_id})
             _persist_advice(run_id, job.get("id"), job["title"], advice)
+            _persist_suggestions(run_id, job.get("id"), state.resume_id,
+                                 resume_content_hash(state.resume_text or ""), suggestions)
             # METADATA ONLY. The advice text is derived from the resume and the job
             # posting; it lives in run_advice (covered by erasure and retention) and
             # must never leak into application logs, which those controls don't reach.
@@ -767,7 +855,10 @@ def do_generate_advice(state, run_id, top_n=2):
         finish_step(step_id, "success")
         state.advice_done = True
     except Exception as e:
+        # Advice is optional enrichment: its failure makes the run PARTIAL
+        # (completed_with_errors), never a silent success (R03).
         fail_step(step_id, e)
+        state.failed_jobs += 1
         state.advice_done = True   # don't loop on advice failure
 
 

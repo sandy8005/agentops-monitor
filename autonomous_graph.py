@@ -92,6 +92,7 @@ class GraphState(TypedDict, total=False):
     employment_type: Optional[str]
     evaluate: bool
     live_only: bool
+    model_policy: str
     # accumulated results
     resume_text: Optional[str]
     parsed_resume: Optional[dict]
@@ -331,7 +332,7 @@ def _abandon_if_lost(run_id, where):
 
 def run_agent_graph(resume_id, target_role=None, location=None,
                     work_mode=None, employment_type=None, evaluate=False,
-                    run_id=None, max_llm_calls=30, live_only=False):
+                    run_id=None, max_llm_calls=30, live_only=False, model_policy="auto"):
     """
     LangGraph entry point — same signature as run_agent_autonomous.
     Builds the initial flat state, invokes the graph, derives the run status
@@ -349,7 +350,7 @@ def run_agent_graph(resume_id, target_role=None, location=None,
         goal="match resume to jobs", resume_id=resume_id,
         target_role=target_role, location=location,
         work_mode=work_mode, employment_type=employment_type, evaluate=evaluate,
-        live_only=live_only,
+        live_only=live_only, model_policy=model_policy,
     )
     seed.max_llm_calls = max_llm_calls
     initial = _dump(seed, run_id)

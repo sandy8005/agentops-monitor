@@ -18,6 +18,8 @@ def _goal(**kw):
     return AgentGoal(**base)
 
 
+# ---------------------------------------------------------------- goal ------
+
 def test_query_cannot_change_seniority_or_location():
     g = _goal()
     assert validate_search_query("Machine Learning Engineer", g)[0]
@@ -37,6 +39,8 @@ def test_seniority_conflict_directional():
     assert seniority_conflict("Junior Data Scientist", "entry") is None
     assert seniority_conflict("Data Science Intern", "senior") in ("intern", "internship")
 
+
+# ----------------------------------------------------------- controller -----
 
 def test_parse_decision_strict():
     d = parse_decision('```json\n{"action":"rank_jobs","arguments":{},"reason":"done"}\n```')
@@ -72,7 +76,7 @@ def test_rules_policy_adapts_then_finishes():
     d = rules_decide(g, s, 0)
     assert d.action == "evaluate_jobs" and d.arguments["job_ids"] == [7]
     s["evaluated"] = {"7": {"job_id": 7, "status": "ok", "final_decision": "Apply", "score": 90}}
-    d = rules_decide(g, s, 3)
+    d = rules_decide(g, s, 3)                       # goal verified -> rank first
     assert d.action == "rank_jobs"
     s["ranked"] = True
     assert rules_decide(g, s, 3).action == "generate_advice"
@@ -97,6 +101,8 @@ def test_tool_argument_validation():
     with pytest.raises(ToolRejected):
         validate_arguments("drop_tables", {})
 
+
+# ------------------------------------------------------------- scoring ------
 
 PR = {"skills": [], "years_experience": 5, "education": [], "projects": [],
       "experience": [{"title": "Engineer", "company": "X", "years": 5}]}
@@ -124,6 +130,8 @@ def test_negation_scope_is_local():
     assert not affirmative_skill_in_text("kubernetes", "never used Kubernetes")
 
 
+# -------------------------------------------------------------- advisor -----
+
 RESUME = ("Software engineer.\nBuilt a FastAPI service in Python for invoice search.\n"
           "Project: InvoiceBot using Python and FastAPI.\nNo Kubernetes experience.")
 
@@ -150,10 +158,16 @@ def test_validate_rewrite_rejects_invented_facts():
     assert validate_rewrite(orig, "Built a FastAPI service at Google in 2021.", RESUME)[0] == "rejected"
     assert validate_rewrite(orig, "Led the team that built a FastAPI service in Python.",
                             RESUME)[0] == "needs_confirmation"
+    # new content words -> a draft the user must confirm, never auto-validated
     assert validate_rewrite(orig, "Developed a Python FastAPI service for invoice search.",
+                            RESUME)[0] == "needs_confirmation"
+    # pure reordering of the original's own words -> validated
+    assert validate_rewrite(orig, "Built a Python FastAPI service for invoice search.",
                             RESUME)[0] == "validated"
     assert validate_rewrite("Invented line", "x y z", RESUME)[0] == "rejected"
 
+
+# ------------------------------------------------------------- sanitize -----
 
 def test_adzuna_credentials_redacted_R05():
     msg = ("HTTPSConnectionPool(host='api.adzuna.com'): Max retries exceeded with url: "

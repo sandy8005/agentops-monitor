@@ -1,7 +1,19 @@
 """
-Controller toolset. Every call: strict argument model -> semantic checks against
-BACKEND state -> replay-safe execution -> compact observation. Rejected calls have
-no side effects. Job text is untrusted and never becomes an instruction.
+The controller's toolset: search_jobs, evaluate_jobs, rank_jobs, generate_advice,
+request_human_input, finish.
+
+Contract for every tool:
+  * Arguments are validated with a strict Pydantic model (extra fields rejected).
+  * Semantic checks run against BACKEND state, not the model's claims: job ids must
+    be ids this run discovered; queries cannot change fixed constraints; searches
+    cannot repeat; limits are checked before execution.
+  * A rejected call returns an observation explaining why and has NO side effects.
+  * Execution is REPLAY-SAFE: re-running the same iteration after a crash reuses
+    persisted effects (recorded searches, existing job evaluations, idempotent
+    ranking/advice writes) instead of duplicating them.
+  * Observations are compact counts and ids. Job text is untrusted data and never
+    becomes an instruction; titles are only shown to the controller fenced and
+    truncated.
 """
 from typing import List, Literal
 
@@ -20,8 +32,10 @@ MAX_INPUT_REQUESTS = 2
 
 
 class ToolRejected(Exception):
-    pass
+    """The requested action is not allowed. No side effects happened."""
 
+
+# ------------------------------------------------------------------ arguments --
 
 class SearchArgs(BaseModel):
     model_config = ConfigDict(extra="forbid")
@@ -48,6 +62,16 @@ class RankArgs(BaseModel):
 class AdviceArgs(BaseModel):
     model_config = ConfigDict(extra="forbid")
     job_ids: List[int] = Field(..., min_length=1, max_length=3)
+
+    @field_validator("job_ids")
+    @classmethod
+    def _unique(cls, v):
+        if len(set(v)) != len(v):
+            raise ValueError("job_ids must be unique")
+        return v
+
+
+MAX_ADVICE_JOBS = 3     # run-wide cap on jobs that receive advice (enforced HERE)
 
 
 class HumanInputArgs(BaseModel):
@@ -91,6 +115,7 @@ TOOL_SPECS = {
 
 
 def validate_arguments(action, arguments):
+    """Parse arguments with the tool's model. Raises ToolRejected on invalid input."""
     if action not in ARG_MODELS:
         raise ToolRejected(f"unknown action {action!r}; allowed: {list(TOOL_NAMES)}")
     try:
@@ -103,14 +128,23 @@ def validate_arguments(action, arguments):
         raise ToolRejected(f"invalid arguments for {action}: {e}")
 
 
+# ------------------------------------------------------------------- helpers --
+
 class ToolContext:
-    def __init__(self, run_id, generation, goal: AgentGoal, state, budget, iteration):
+    """What a tool needs: run identity, the fenced generation, the goal, the loop
+    state (mutated in place), the durable budget and the iteration number."""
+
+    def __init__(self, run_id, generation, goal: AgentGoal, state, budget, iteration,
+                 limit_check=None):
         self.run_id = run_id
         self.generation = generation
         self.goal = goal
         self.state = state
         self.budget = budget
         self.iteration = iteration
+        # Callable -> None | stop dict. Multi-unit tools call it between units so
+        # cancellation and runtime/cost limits are honoured inside a tool (N06).
+        self.limit_check = limit_check or (lambda: None)
 
 
 def unevaluated_eligible_ids(state):
@@ -120,12 +154,13 @@ def unevaluated_eligible_ids(state):
 
 
 def qualified_count(ctx):
-    return len(store.qualified_job_ids(ctx.run_id, ctx.goal.qualifying_decisions))
+    return len(store.qualified_job_ids(ctx.run_id, ctx.goal.qualifying_decisions,
+                                       verified_only=ctx.goal.require_verified_matches))
 
 
 def _tool_state(ctx):
-    """AgentState whose budget delegates to the DURABLE run budget, so the tested
-    router.do_process_job is reused unchanged."""
+    """An AgentState whose budget methods delegate to the DURABLE run budget, so the
+    existing, tested router.do_process_job can be reused unchanged."""
     from agent_state import AgentState
     g = ctx.goal
 
@@ -146,8 +181,11 @@ def _tool_state(ctx):
                     evaluate=g.evaluate_quality, live_only=True)
     ts.resume_text = ctx.state.get("resume_text")
     ts.parsed_resume = ctx.state.get("parsed_resume")
+    ts.model_policy = g.model_policy
     return ts
 
+
+# ------------------------------------------------------------------- search --
 
 def _collect_candidates(ctx, provider, query):
     from job_source import search_jobs as pool_search
@@ -159,7 +197,9 @@ def _collect_candidates(ctx, provider, query):
         jobs = [j for j in jobs if (j.get("source") or "").lower() == provider]
     else:
         jobs = [j for j in jobs if (j.get("source") or "").lower() not in LIVE_PROVIDERS]
-    return sorted(jobs, key=lambda j: j["id"], reverse=True)[:ctx.goal.limits.max_jobs_per_search]
+    # Deterministic, bounded selection (R14): newest ids first, capped.
+    jobs = sorted(jobs, key=lambda j: j["id"], reverse=True)[:ctx.goal.limits.max_jobs_per_search]
+    return jobs
 
 
 def tool_search_jobs(ctx, args: SearchArgs):
@@ -183,7 +223,7 @@ def tool_search_jobs(ctx, args: SearchArgs):
     step_id = create_step(ctx.run_id, f"agent_search:{args.provider}", ctx.iteration)
     try:
         if replay:
-            provider_status = prior["provider_status"]
+            provider_status = prior["provider_status"]       # never refetch on replay
         elif args.provider == "adzuna":
             from adzuna_jobs import fetch_and_upsert_adzuna
             _, _, provider_status = fetch_and_upsert_adzuna(
@@ -209,7 +249,8 @@ def tool_search_jobs(ctx, args: SearchArgs):
                 continue
             new += 1
             reason = None
-            if seniority_conflict(j.get("title"), goal.constraints.seniority):
+            conflict = seniority_conflict(j.get("title"), goal.constraints.seniority)
+            if conflict:
                 reason = "seniority"
             elif j.get("geo_eligibility") == "ineligible":
                 reason = "location"
@@ -222,11 +263,13 @@ def tool_search_jobs(ctx, args: SearchArgs):
                                "source": j.get("source"), "apply_url": j.get("apply_url"),
                                "eligible": reason is None, "reject_reason": reason,
                                "found_by": f"{args.provider}:{qnorm}"}
-        obs = {"provider": args.provider, "query": qnorm,
-               "provider_status": "success" if succeeded else "failed",
-               "provider_detail": provider_status,
-               "new_jobs": new, "duplicates": dup, "eligible_jobs": eligible,
-               "rejection_summary": rejections}
+        obs = {
+            "provider": args.provider, "query": qnorm,
+            "provider_status": "success" if succeeded else "failed",
+            "provider_detail": provider_status,
+            "new_jobs": new, "duplicates": dup, "eligible_jobs": eligible,
+            "rejection_summary": rejections,
+        }
         if not succeeded:
             obs["note"] = ("search FAILED — this is not evidence that no jobs exist; "
                            "try another provider or title")
@@ -240,8 +283,11 @@ def tool_search_jobs(ctx, args: SearchArgs):
         raise
 
 
+# ----------------------------------------------------------------- evaluate --
+
 def _existing_evaluation(run_id, job_id):
-    """Replay safety: reuse an already-persisted successful evaluation."""
+    """A SUCCESSFUL, already-persisted evaluation of this job in this run (replay
+    safety: evaluating twice would create duplicate steps and LLM calls)."""
     from database import get_connection
     with get_connection() as conn:
         cur = conn.cursor()
@@ -277,8 +323,11 @@ def tool_evaluate_jobs(ctx, args: EvaluateArgs):
     counts = {"Apply": 0, "Maybe": 0, "Skip": 0}
     failed, flagged, step_ids = [], [], []
     for job_id in args.job_ids:
-        if store.is_cancel_requested(ctx.run_id):
-            state["cancel_seen"] = True
+        stop = ctx.limit_check()                           # N06: between work units
+        if stop:
+            if stop.get("cancel"):
+                state["cancel_seen"] = True
+            state["limit_stop"] = stop
             break
         meta = state["discovered"][str(job_id)]
         prior = _existing_evaluation(ctx.run_id, job_id)
@@ -318,7 +367,7 @@ def tool_evaluate_jobs(ctx, args: EvaluateArgs):
             queue = state.setdefault("review_queue", [])
             if not any(q["review_id"] == rid for q in queue):
                 queue.append({"review_id": rid, "step_id": result["step_id"], "job_id": job_id})
-    state["ranked"] = False
+    state["ranked"] = False          # new evaluations invalidate the last ranking
     obs = {"evaluated": len(step_ids), "decisions": counts, "failed_job_ids": failed,
            "needs_human_review": flagged, "qualified_so_far": qualified_count(ctx),
            "target_count": goal.target_count,
@@ -329,18 +378,22 @@ def tool_evaluate_jobs(ctx, args: EvaluateArgs):
     return obs, None, progress > 0
 
 
+# --------------------------------------------------------------------- rank --
+
 def tool_rank_jobs(ctx, args: RankArgs):
     from ranker import rank_jobs
     ok = [v for v in (ctx.state.get("evaluated") or {}).values() if v.get("status") == "ok"]
     if not ok:
         raise ToolRejected("nothing has been evaluated yet")
     ranked = rank_jobs(ok)
-    store.persist_rankings(ctx.run_id, ctx.generation, ranked)
+    store.persist_rankings(ctx.run_id, ctx.generation, ranked)     # raises on failure (R03)
     ctx.state["ranked"] = True
     top = [{"job_id": r["job_id"], "final_decision": r.get("final_decision"),
             "score": r.get("score")} for r in ranked[:5]]
     return {"ranked": len(ranked), "top": top, "persisted": True}, None, False
 
+
+# ------------------------------------------------------------------- advice --
 
 def tool_generate_advice(ctx, args: AdviceArgs):
     from router import _reqs_cache_get, _reqs_cache_key, resume_content_hash
@@ -355,15 +408,33 @@ def tool_generate_advice(ctx, args: AdviceArgs):
            or (evaluated[str(i)].get("final_decision") not in allowed)]
     if bad:
         raise ToolRejected(f"job ids {bad} are not evaluated Apply/Maybe matches of this run")
+    # N10: repeats and the run-wide cap are enforced HERE, against durable state
+    # (persisted advice) as well as the checkpointed attempt list — not only by the
+    # rules policy. A replayed iteration may re-request exactly the jobs it already
+    # persisted; those are reused, never regenerated.
+    persisted = set(store.advised_job_ids(ctx.run_id))
+    attempted = set(state.get("advice_attempted") or []) | persisted
+    replay = bool(set(args.job_ids) <= persisted)
+    repeats = [i for i in args.job_ids if i in attempted]
+    if repeats and not replay:
+        raise ToolRejected(f"advice was already generated or attempted for {repeats}")
+    if not replay and len(attempted | set(args.job_ids)) > MAX_ADVICE_JOBS:
+        raise ToolRejected(f"advice is limited to {MAX_ADVICE_JOBS} jobs per run "
+                           f"({len(attempted)} already used)")
     # Recorded up front so a failing advice call is never retried in a loop.
-    state["advice_attempted"] = sorted(set(state.get("advice_attempted") or [])
-                                       | set(args.job_ids))
+    state["advice_attempted"] = sorted(attempted | set(args.job_ids))
     postings = store.load_postings(args.job_ids)
     step_id = create_step(ctx.run_id, "agent_generate_advice", ctx.iteration)
     done, failed, notes = [], [], {}
     resume_hash = resume_content_hash(state.get("resume_text") or "")
     try:
         for job_id in args.job_ids:
+            if job_id in persisted:
+                done.append(job_id)          # already persisted: reuse, don't regenerate
+                notes[str(job_id)] = "reused"
+                continue
+            if ctx.limit_check():
+                break
             job = postings.get(job_id)
             if job is None:
                 failed.append(job_id)
@@ -403,6 +474,8 @@ def tool_generate_advice(ctx, args: AdviceArgs):
     return {"advised": done, "failed_job_ids": failed, "generation": notes}, step_id, False
 
 
+# ------------------------------------------------------------- human input --
+
 def tool_request_human_input(ctx, args: HumanInputArgs):
     asked = int(ctx.state.get("input_requests") or 0)
     if asked >= MAX_INPUT_REQUESTS:
@@ -416,6 +489,8 @@ def tool_request_human_input(ctx, args: HumanInputArgs):
         ctx.state["input_requests"] = asked + 1
     return {"paused_for_input": True, "review_id": rid}, None, False
 
+
+# ------------------------------------------------------------------- finish --
 
 def tool_finish(ctx, args: FinishArgs):
     remaining = unevaluated_eligible_ids(ctx.state)

@@ -50,6 +50,7 @@ TERMINAL_FAILURE = "terminal_failure"
 # burn attempts). Everything else (bad input, parse failure, budget, cancel) is
 # terminal too.
 RETRYABLE_ERROR_CODES = {ErrorCode.LLM_UNAVAILABLE, ErrorCode.LLM_RATE_LIMITED,
+                         ErrorCode.DATABASE_UNAVAILABLE,
                          # An Adzuna/Remotive rate limit or outage is recoverable too;
                          # bad credentials / malformed responses are not.
                          ErrorCode.JOB_SOURCE_RATE_LIMITED, ErrorCode.JOB_SOURCE_UNAVAILABLE}
@@ -166,6 +167,7 @@ def _run_job(job):
             evaluate=p.get("evaluate", False),
             run_id=p["run_id"],
             live_only=p.get("live_only", False),
+            model_policy=p.get("model_policy", "auto"),
         )
     elif kind == "resume_run":
         resume_agent_graph(p["run_id"], p["decision"], p.get("comment", ""),
@@ -177,8 +179,17 @@ def _run_job(job):
         raise ValueError(f"unknown job kind: {kind}")
 
 
+class DatabaseUnavailable(RuntimeError):
+    """A required lookup failed for an operational reason — retry the job."""
+
+
 def _run_mode(run_id):
-    """'agent' or 'pipeline' (pre-0010 databases have no mode column -> pipeline)."""
+    """
+    'agent' or 'pipeline'. Only a database that genuinely predates migration 0010
+    (no runs.mode column) falls back to 'pipeline'. ANY other failure raises
+    DatabaseUnavailable (retryable) — a transient error must never route an agent
+    run into the legacy engine (N08).
+    """
     if run_id is None:
         return "pipeline"
     try:
@@ -186,9 +197,14 @@ def _run_mode(run_id):
             cur = conn.cursor()
             cur.execute("SELECT mode FROM runs WHERE id = %s", (run_id,))
             row = cur.fetchone()
-        return (row[0] if row else None) or "pipeline"
-    except Exception:
-        return "pipeline"
+    except Exception as e:
+        if getattr(e, "pgcode", None) == "42703":        # undefined_column: pre-0010 schema
+            return "pipeline"
+        raise DatabaseUnavailable(f"database_unavailable: run mode lookup failed "
+                                  f"({type(e).__name__})") from e
+    if not row:
+        raise ValueError(f"run {run_id} does not exist")
+    return row[0] or "pipeline"
 
 
 def _job_is_stale(job):
