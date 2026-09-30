@@ -48,3 +48,10 @@ def estimate_cost(model, prompt_tokens, completion_tokens):
         return (None, version)
     cost = ((prompt_tokens or 0) * inp + (completion_tokens or 0) * out) / 1_000_000
     return (round(cost, 8), version)
+
+
+def price_known(model=None):
+    """True if a cost can be computed for `model` (default: the configured model).
+    A cost-bounded run must not make model calls whose cost it cannot account for."""
+    inp, out, _version = rates_for(model if model is not None else settings.gemini_model)
+    return inp is not None and out is not None

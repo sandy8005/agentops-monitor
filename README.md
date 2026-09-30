@@ -34,6 +34,60 @@ Each **run** is one full execution. A run contains ordered **steps**; each step 
 
 You therefore run **two processes**: the API (`uvicorn api:app`) and the worker (`python worker.py`).
 
+### Execution modes
+
+`POST /runs` takes `mode: "pipeline" | "agent"` (the dashboard's *Autonomous agent
+mode* checkbox). Both modes share the queue, worker, run lock, checkpointer, trace
+tables and human-review workflow.
+
+**`pipeline`** — `autonomous_graph.py`: the fixed LangGraph sequence described in
+*The agent pipeline* below.
+
+**`agent`** — a bounded controller loop:
+
+```
+Goal → controller decision → backend validation → ONE tool → compact observation
+     → controller decision → … → finalize (outcome verified from persisted results)
+```
+
+| Module | Role |
+|---|---|
+| `agent_goal.py` | The goal, the user's **fixed constraints** (location, work mode, employment type, seniority — the controller can never change them) and the hard limits. |
+| `agent_controller.py` | Proposes the next action: Gemini (structured JSON) or a deterministic rules policy. The prompt separates **backend state** (counts, ids, enums, limits — stated as facts) from **untrusted data** (goal text, queries, observations, human answers, job titles — each fenced with `wrap_untrusted`). Only actions that are possible in the current state are offered. |
+| `agent_tools.py` | `search_jobs`, `evaluate_jobs`, `rank_jobs`, `generate_advice`, `request_human_input`, `finish`. Strict argument models, semantic checks against backend state, replay-safe execution. |
+| `agent_loop.py` | The graph (`setup → decide → act → review* → finalize`) and the guard checked before every decision and every tool call. |
+| `agent_store.py` | Persistence. Every write presents the worker's **execution generation**; a superseded worker gets `ExecutionLost` instead of overwriting a newer one. |
+
+**Limits** (all enforced by the backend, never by the model): iterations, searches,
+LLM requests (a durable, atomically reserved budget), **active runtime** (time
+actually executing — waiting for a human or in the retry queue is never charged),
+and an estimated **USD cap that fails closed**: if a cap is set and the configured
+model has no known price, the run is refused (`422`) or stopped with
+`error_code = cost_unknown` rather than running with an unenforceable cap.
+
+**Audit model.**
+
+```
+Run
+└── execution generation (one per worker execution)
+    └── controller iteration
+        ├── decision            agent_actions          (replayed, never re-asked)
+        │   └── attempts        agent_action_attempts  (one per generation that executed it)
+        └── search              agent_searches         (one row per generation)
+```
+
+So the monitor can answer: was this a LangGraph replay (`decision_replayed`)? a
+worker retry (a new `execution_generation`)? did the same action execute twice
+(`attempt_number`)? was the provider really called again (`agent_searches.fetched`,
+`reused_from_generation`)? A search that failed **transiently** (429, 5xx, network)
+is genuinely refetched by the next generation; a successful search is reused;
+configuration failures (missing keys, auth) are not retried.
+
+**Cost reporting.** Costs are paid-tier *estimates* (`pricing.py`). Every endpoint
+returns `known_cost_usd`, `unknown_cost_calls` and `cost_complete`; `total_cost` is a
+number only when it is complete, and the dashboard shows a partial total as a lower
+bound (`est. ≥ $…`).
+
 ### The agent pipeline
 
 1. **load_resume** — load the stored resume document for the run.
@@ -51,7 +105,7 @@ Every LLM and tool call is wrapped so timing, tokens, cost, and errors are recor
 
 ### Human approval workflow (inline, via LangGraph interrupts)
 
-Review is **inline**, not post-hoc. When a step is flagged mid-run, the graph pauses at a `human_review` node (`interrupt()`), the checkpointer saves state, and the run's status becomes `waiting_for_human` with the review payload in `runs.pending_review`. The dashboard's **"Runs Awaiting Your Review"** panel shows the paused run; the reviewer submits Apply / Maybe / Skip (+ comment) to `POST /runs/{id}/resume`, and the graph resumes from the exact node that paused. The review card states **why** the run paused (`review_reason`: score disagreement, prompt injection in the job posting, hallucination signal, low evaluation scores, evaluation failure, invalid judge output — possibly several). The human's choice becomes the authoritative `final_decision`, recorded with **who** decided (`reviewer_user_id`, `reviewer`), **when** (`reviewed_at`) and their comment; the agent's original score/LLM decisions are preserved for the audit trail. A run with N flagged jobs pauses and resumes N times. See DESIGN.md.
+Review is **inline**, not post-hoc. When a step is flagged mid-run, the graph pauses at a `human_review` node (`interrupt()`), the checkpointer saves state, and the run's status becomes `waiting_for_human` with the review payload in `runs.pending_review`. The dashboard's **"Runs Awaiting Your Review"** panel shows the paused run; the reviewer submits Apply / Maybe / Skip (+ comment) to `POST /runs/{id}/resume`, and the graph resumes from the exact node that paused. The review card states **why** the run paused (`review_reason`: score disagreement, prompt injection in the job posting, hallucination signal, low evaluation scores, evaluation failure, invalid judge output — possibly several). The human's choice becomes the authoritative `final_decision`, recorded with **who** decided (`reviewer_user_id`, `reviewer`), **when** (`reviewed_at`) and their comment; the agent's original score/LLM decisions are preserved for the audit trail. A run with N flagged jobs pauses and resumes N times. (The original design spec is in docs/design-history.md.)
 
 **Review vs. security warning.** `needs_human_review` means "the graph WILL pause for a human". Injection-like text in the *resume* is recorded as a separate **security warning** (`security_flag` / `security_reason`): the run intentionally continues (the prompt is fenced) and the event is visible in the trace, but no approval is requested. Injection-like text in a *job posting* does pause the run, because it can steer that job's decision; it is checked on every job, including requirements-cache hits.
 
@@ -133,25 +187,38 @@ All timestamps are stored as `TIMESTAMPTZ` and written in UTC.
 ```bash
 python -m venv venv && . venv/bin/activate
 pip install -r requirements-dev.txt          # runtime + test dependencies
-cp .env.example .env                         # then fill in DB_* and GEMINI_API_KEY
+cp .env.example .env                         # then fill in DB_*, SESSION_SECRET, GEMINI_API_KEY
 python migrate.py                            # empty DB -> latest schema (the ONLY schema path)
-python scripts/ops/seed_jobs.py              # optional: practice job pool
 uvicorn api:app                              # process 1: API + dashboard
 python worker.py                             # process 2: executes runs
-pytest                                       # needs the DB from .env
+pytest                                       # see "Tests" below
 ```
 
 `python db_pg.py` is kept as an alias for `python migrate.py`.
 
+### Tests
+
+The suite needs PostgreSQL (the `DB_*` settings from `.env`, migrated with
+`python migrate.py`). Model calls are stubbed, but `GEMINI_API_KEY` must be set to
+any non-empty value so the model code paths are exercised instead of their
+"not configured" fallbacks. Tests that need a database are marked `db`
+(`pytest -m "not db"` runs the pure-logic subset).
+
+### Packaging
+
+Ship tracked source only — never a working directory (it contains `__pycache__`,
+`.env`, local data):
+
+```bash
+git archive --format=zip -o agentops-monitor.zip HEAD
+```
+
 ### Repository layout
 
-- Top level: the runtime (API, worker, graph, router, scoring, sources, persistence).
+- Top level: the runtime (API, worker, pipeline graph, agent loop, router, scoring, sources, persistence).
 - `migrations/`: schema history; `migrate.py` applies it.
 - `static/`: dashboard.
 - `tests/`: pytest suite.
-- `fixtures/`: fictional sample data (jobs, a sample resume).
-- `scripts/ops/`: operator one-offs (seeding, imports, inspection, repair).
 - `scripts/manual/`: print-based manual checks (not collected by pytest).
 - `scripts/legacy_migrations/`: pre-runner migration scripts, superseded by `migrations/`.
-- `legacy/`: retired modules, not imported by anything.
 - `docs/design-history.md`: the original HITL design spec, kept for history.

@@ -1,3 +1,14 @@
+// Cost cell: a total is only shown as a total when it is COMPLETE. A run with
+// unpriced model calls shows its known part as a lower bound plus the gap.
+function formatCost(r) {
+  if (r.cost_complete === false) {
+    return '<span title="partial: some calls have no known price">est. \u2265 $' +
+      escapeHtml(Number(r.known_cost_usd || 0).toFixed(6)) + ' (+' +
+      escapeHtml(r.unknown_cost_calls) + ' unpriced call(s))</span>';
+  }
+  return r.total_cost == null ? 'unknown' : 'est. $' + escapeHtml(Number(r.total_cost).toFixed(6));
+}
+
 var NL = String.fromCharCode(10);
     var pollTimer = null;
     // Incremented on logout: any response that started under an older session is
@@ -226,7 +237,7 @@ var NL = String.fromCharCode(10);
             '<td style="font-size:12px;color:#b0b4c0;">' + escapeHtml(searchDesc) + '</td>' +
             '<td>' + escapeHtml((r.started_at || '').replace('T', ' ').slice(0, 16)) + '</td>' +
             '<td>' + escapeHtml(r.total_tokens || 0) + '</td>' +
-            '<td title="estimated paid-tier cost">' + (r.total_cost == null ? 'unknown' : 'est. $' + escapeHtml(Number(r.total_cost).toFixed(6))) + '</td>';
+            '<td title="estimated paid-tier cost">' + formatCost(r) + '</td>';
           tr.onclick = function() { selectRun(r.id); };
           tbody.appendChild(tr);
         }
@@ -307,6 +318,8 @@ var NL = String.fromCharCode(10);
         '<div class="note">LLM calls reserved ' + escapeHtml(a.llm_calls.reserved) + '/' + escapeHtml(a.llm_calls.budget) +
         ' &nbsp; est. cost $' + escapeHtml((a.cost.known_estimated_usd || 0).toFixed(6)) +
         (a.cost.complete ? '' : ' (+' + escapeHtml(a.cost.calls_with_unknown_cost) + ' call(s) with unknown cost)') + '</div>' +
+        (a.runtime ? '<div class="note">Active runtime ' + escapeHtml(Math.round(a.runtime.active_seconds)) + 's' +
+          ' (wall clock ' + escapeHtml(Math.round(a.runtime.wall_clock_seconds)) + 's; waiting for a human is not counted)</div>' : '') +
         '<div class="note">Fixed constraints: ' + escapeHtml(JSON.stringify((a.goal && a.goal.constraints) || {})) + '</div></div>';
       for (const act of (a.actions || [])) {
         var cls = act.status === 'executed' ? '' : (act.status === 'rejected' ? 'review' : 'call-failed');
@@ -316,7 +329,27 @@ var NL = String.fromCharCode(10);
           '<details><summary>arguments / observation</summary><pre class="io">' +
           escapeHtml(JSON.stringify(act.arguments || {}, null, 1)) + NL + NL +
           escapeHtml(JSON.stringify(act.observation || {}, null, 1)) +
-          (act.error ? NL + NL + 'ERROR: ' + escapeHtml(act.error) : '') + '</pre></details></div>';
+          (act.error ? NL + NL + 'ERROR: ' + escapeHtml(act.error) : '') + '</pre></details>' +
+          renderAttempts(act.attempts) + '</div>';
+      }
+      return html;
+    }
+
+    // One decision can be executed more than once (a worker retry in a new
+    // execution generation). Each execution is shown as its own attempt so the
+    // trace answers: replayed decision? worker retry? which attempt succeeded?
+    function renderAttempts(attempts) {
+      attempts = attempts || [];
+      if (attempts.length < 2 && !(attempts[0] && attempts[0].decision_replayed)) return '';
+      var html = '<div class="note">execution attempts:</div>';
+      for (const t of attempts) {
+        var cls = t.status === 'executed' ? '' : 'call-failed';
+        html += '<div class="call ' + cls + '">attempt ' + escapeHtml(t.attempt_number) +
+          ' &middot; generation ' + escapeHtml(t.execution_generation) +
+          (t.run_attempt ? ' &middot; run attempt ' + escapeHtml(t.run_attempt) : '') +
+          (t.decision_replayed ? ' &middot; <span class="retry">replayed decision</span>' : '') +
+          ' [' + escapeHtml(t.status) + ']' +
+          (t.error ? ' <span class="reason">' + escapeHtml(t.error) + '</span>' : '') + '</div>';
       }
       return html;
     }

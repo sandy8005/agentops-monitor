@@ -1,6 +1,12 @@
+> **HISTORICAL — superseded.** This is the original human-in-the-loop design spec,
+> kept for history. It has been implemented and the architecture has moved on:
+> runs are executed by a separate worker from a PostgreSQL job queue (not a FastAPI
+> background task), and there is a second, autonomous execution mode. The current
+> architecture is described in README.md ("Architecture" and "Execution modes").
+
 # DESIGN: Human-in-the-Loop Review via LangGraph Interrupts
 
-Status: **Designed, not yet implemented.** This document is the spec to build from.
+Original status (at the time of writing): designed, not yet implemented.
 
 ## Motivation
 

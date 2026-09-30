@@ -32,9 +32,26 @@ def _check_generation(cur, run_id, generation, lock="FOR SHARE"):
 
 # ------------------------------------------------------------------ lifecycle --
 
+# Close the run's open execution interval: add (NOW() - execution_started_at) to
+# active_runtime_seconds and clear the marker. Used whenever execution stops being
+# ACTIVE — paused for a human, finalized, or handed back after a stale resume — so
+# time spent waiting is never charged to the runtime limit. Idempotent (a closed
+# interval adds 0).
+CLOSE_EXECUTION_INTERVAL_SQL = """
+    active_runtime_seconds = active_runtime_seconds + COALESCE(
+        GREATEST(0, EXTRACT(EPOCH FROM (NOW() - execution_started_at)))::double precision, 0),
+    execution_started_at = NULL"""
+
+
 def begin_execution(run_id, new_attempt):
-    """Mark the run running and take a NEW execution generation in one statement.
-    Returns the generation this worker must present on every guarded write."""
+    """Mark the run running, open a new ACTIVE execution interval and take a NEW
+    execution generation, in one statement. Returns the generation this worker must
+    present on every guarded write.
+
+    If the previous interval was never closed (the worker died mid-execution), it is
+    charged up to NOW(): we cannot know when the dead worker stopped, and a runtime
+    budget must fail closed rather than silently forgive time. (All SET expressions
+    read the row's OLD values, so the carried interval is the previous one.)"""
     with get_connection() as conn:
         cur = conn.cursor()
         cur.execute("""
@@ -43,7 +60,10 @@ def begin_execution(run_id, new_attempt):
                 last_attempt_ended_at = COALESCE(ended_at, last_attempt_ended_at),
                 ended_at = NULL,
                 attempt = CASE WHEN %s OR attempt = 0 THEN attempt + 1 ELSE attempt END,
-                execution_generation = execution_generation + 1
+                execution_generation = execution_generation + 1,
+                active_runtime_seconds = active_runtime_seconds + COALESCE(
+                    GREATEST(0, EXTRACT(EPOCH FROM (NOW() - execution_started_at)))::double precision, 0),
+                execution_started_at = NOW()
             WHERE id = %s
             RETURNING execution_generation
         """, (bool(new_attempt), run_id))
@@ -51,6 +71,15 @@ def begin_execution(run_id, new_attempt):
         if not row:
             raise ExecutionLost(f"run {run_id} does not exist")
         return int(row[0])
+
+
+def suspend_execution(run_id, generation):
+    """Close the active interval WITHOUT changing status (e.g. a stale resume job
+    that applied nothing). Fenced like every other write of this generation."""
+    with get_connection() as conn:
+        cur = conn.cursor()
+        _check_generation(cur, run_id, generation, lock="FOR UPDATE")
+        cur.execute(f"UPDATE runs SET {CLOSE_EXECUTION_INTERVAL_SQL} WHERE id = %s", (run_id,))
 
 
 def load_run_config(run_id):
@@ -76,26 +105,36 @@ def is_cancel_requested(run_id):
 
 
 def run_usage(run_id):
-    """Durable usage snapshot used by the guard: elapsed seconds since the run first
-    started, LLM requests reserved, the KNOWN estimated cost and how many calls have
-    unknown cost (R15 — unknown is never summed as zero)."""
+    """Durable usage snapshot used by the guard.
+
+      active_runtime_seconds  time the agent actually EXECUTED: closed intervals +
+                              the currently open one. Human-review waits and queue
+                              backoff are not included. This is what the runtime
+                              limit is enforced against.
+      elapsed_seconds         wall-clock since the run first started (display only).
+      known_cost_usd          sum of PRICED calls only.
+      unknown_cost_calls      successful calls with no known price (R15 — unknown is
+                              never summed as zero; the guard fails closed on it).
+    """
     with get_connection() as conn:
         cur = conn.cursor()
         cur.execute("""
             SELECT EXTRACT(EPOCH FROM (NOW() - COALESCE(started_at, NOW()))),
+                   active_runtime_seconds + COALESCE(
+                       GREATEST(0, EXTRACT(EPOCH FROM (NOW() - execution_started_at)))::double precision, 0),
                    llm_calls_reserved, llm_call_budget
             FROM runs WHERE id = %s
         """, (run_id,))
-        row = cur.fetchone() or (0, 0, None)
+        row = cur.fetchone() or (0, 0, 0, None)
         cur.execute("""
             SELECT COALESCE(SUM(cost_usd) FILTER (WHERE cost_usd IS NOT NULL), 0),
                    COUNT(*) FILTER (WHERE cost_usd IS NULL AND status = 'success')
             FROM llm_calls WHERE run_id = %s
         """, (run_id,))
         cost = cur.fetchone() or (0, 0)
-    return {"elapsed_seconds": float(row[0] or 0), "llm_calls_reserved": int(row[1] or 0),
-            "llm_call_budget": row[2], "known_cost_usd": float(cost[0] or 0),
-            "unknown_cost_calls": int(cost[1] or 0)}
+    return {"elapsed_seconds": float(row[0] or 0), "active_runtime_seconds": float(row[1] or 0),
+            "llm_calls_reserved": int(row[2] or 0), "llm_call_budget": row[3],
+            "known_cost_usd": float(cost[0] or 0), "unknown_cost_calls": int(cost[1] or 0)}
 
 
 def reserve_llm_call(run_id, default_budget):
@@ -122,26 +161,32 @@ def set_controller_mode(run_id, generation, mode, progress):
 
 # -------------------------------------------------------------------- actions --
 
+def _j(v):
+    return v if (v is None or isinstance(v, (dict, list))) else json.loads(v)
+
+
 def get_action(run_id, iteration):
-    """The recorded action for (run, iteration), or None. Used for replay safety."""
+    """The recorded controller DECISION for (run, iteration), or None. A decision is
+    reused on replay (the model is never re-asked); each execution of it is a
+    separate row in agent_action_attempts."""
     with get_connection() as conn:
         cur = conn.cursor()
-        cur.execute("""SELECT action, arguments, reason, decided_by, status, observation, error
+        cur.execute("""SELECT action, arguments, reason, decided_by, status, observation, error,
+                              id, execution_generation, attempt_count
                        FROM agent_actions WHERE run_id = %s AND iteration = %s""",
                     (run_id, iteration))
         row = cur.fetchone()
     if not row:
         return None
-    def _j(v):
-        return v if (v is None or isinstance(v, (dict, list))) else json.loads(v)
     return {"action": row[0], "arguments": _j(row[1]) or {}, "reason": row[2],
             "decided_by": row[3], "status": row[4], "observation": _j(row[5]),
-            "error": row[6]}
+            "error": row[6], "action_id": row[7], "decision_generation": row[8],
+            "attempt_count": int(row[9] or 0)}
 
 
 def record_proposed_action(run_id, generation, iteration, action, arguments, reason, decided_by):
-    """Insert the proposal. ON CONFLICT DO NOTHING: a replayed iteration keeps the
-    ORIGINAL proposal (and its outcome) rather than recording a second decision."""
+    """Insert the DECISION. ON CONFLICT DO NOTHING: a replayed iteration keeps the
+    ORIGINAL decision; executions are recorded as attempts, never as new decisions."""
     with get_connection() as conn:
         cur = conn.cursor()
         _check_generation(cur, run_id, generation)
@@ -154,64 +199,138 @@ def record_proposed_action(run_id, generation, iteration, action, arguments, rea
               (reason or "")[:500], decided_by))
 
 
-def record_action_outcome(run_id, generation, iteration, status, observation=None,
-                          error=None, step_id=None):
+def _ensure_attempt(cur, run_id, generation, iteration, replayed):
+    """Return (action_id, attempt_number) of THIS generation's attempt at the
+    decision for (run, iteration), creating it if needed. One attempt per
+    (decision, execution generation): a new worker generation executing the same
+    decision is a new, numbered attempt."""
+    cur.execute("SELECT id, attempt_count FROM agent_actions WHERE run_id = %s AND iteration = %s "
+                "FOR UPDATE", (run_id, iteration))
+    row = cur.fetchone()
+    if not row:
+        raise RuntimeError(f"run {run_id}: no recorded decision for iteration {iteration}")
+    action_id, count = row[0], int(row[1] or 0)
+    cur.execute("SELECT attempt_number FROM agent_action_attempts "
+                "WHERE action_id = %s AND execution_generation = %s", (action_id, generation))
+    existing = cur.fetchone()
+    if existing:
+        return action_id, int(existing[0])
+    n = count + 1
+    cur.execute("""
+        INSERT INTO agent_action_attempts (action_id, run_id, iteration, execution_generation,
+            run_attempt, attempt_number, decision_replayed, status)
+        VALUES (%s, %s, %s, %s, (SELECT attempt FROM runs WHERE id = %s), %s, %s, 'running')
+    """, (action_id, run_id, iteration, generation, run_id, n, bool(replayed)))
+    cur.execute("UPDATE agent_actions SET attempt_count = %s, last_execution_generation = %s "
+                "WHERE id = %s", (n, generation, action_id))
+    return action_id, n
+
+
+def begin_action_attempt(run_id, generation, iteration, replayed=False):
+    """Durably mark that THIS generation is about to execute the decision. If the
+    worker dies mid-tool, the attempt stays 'running' in the trace instead of
+    vanishing. Returns the attempt number."""
     with get_connection() as conn:
         cur = conn.cursor()
         _check_generation(cur, run_id, generation)
+        return _ensure_attempt(cur, run_id, generation, iteration, replayed)[1]
+
+
+def record_action_outcome(run_id, generation, iteration, status, observation=None,
+                          error=None, step_id=None, replayed=False):
+    """Record the outcome of THIS generation's attempt, and mirror it onto the
+    decision row as its LATEST outcome. Earlier attempts are never overwritten."""
+    obs_json = json.dumps(observation, default=str) if observation is not None else None
+    err = redact_secrets(error, 1000) if error else None
+    now = utcnow()
+    with get_connection() as conn:
+        cur = conn.cursor()
+        _check_generation(cur, run_id, generation)
+        action_id, _n = _ensure_attempt(cur, run_id, generation, iteration, replayed)
+        cur.execute("""
+            UPDATE agent_action_attempts SET status = %s, observation = %s, error = %s,
+                   step_id = COALESCE(%s, step_id), finished_at = %s
+            WHERE action_id = %s AND execution_generation = %s
+        """, (status, obs_json, err, step_id, now, action_id, generation))
         cur.execute("""
             UPDATE agent_actions SET status = %s, observation = %s, error = %s,
                    step_id = COALESCE(%s, step_id), finished_at = %s
-            WHERE run_id = %s AND iteration = %s AND status = 'proposed'
-        """, (status, json.dumps(observation, default=str) if observation is not None else None,
-              redact_secrets(error, 1000) if error else None, step_id, utcnow(),
-              run_id, iteration))
+            WHERE id = %s AND last_execution_generation = %s
+        """, (status, obs_json, err, step_id, now, action_id, generation))
 
 
 def list_actions(run_id):
+    """Every decision with its execution attempts nested, oldest first."""
     with get_connection() as conn:
         cur = conn.cursor()
-        cur.execute("""SELECT iteration, action, arguments, reason, decided_by, status,
-                              observation, error, created_at, finished_at
+        cur.execute("""SELECT id, iteration, action, arguments, reason, decided_by, status,
+                              observation, error, created_at, finished_at,
+                              execution_generation, attempt_count
                        FROM agent_actions WHERE run_id = %s ORDER BY iteration""", (run_id,))
         rows = cur.fetchall()
+        cur.execute("""SELECT action_id, attempt_number, execution_generation, run_attempt,
+                              decision_replayed, status, observation, error, step_id,
+                              started_at, finished_at
+                       FROM agent_action_attempts WHERE run_id = %s
+                       ORDER BY iteration, attempt_number""", (run_id,))
+        attempts = {}
+        for t in cur.fetchall():
+            attempts.setdefault(t[0], []).append({
+                "attempt_number": t[1], "execution_generation": t[2], "run_attempt": t[3],
+                "decision_replayed": bool(t[4]), "status": t[5], "observation": _j(t[6]),
+                "error": t[7], "step_id": t[8],
+                "started_at": t[9].isoformat() if t[9] else None,
+                "finished_at": t[10].isoformat() if t[10] else None})
     out = []
     for r in rows:
-        out.append({"iteration": r[0], "action": r[1], "arguments": r[2], "reason": r[3],
-                    "decided_by": r[4], "status": r[5], "observation": r[6], "error": r[7],
-                    "created_at": r[8].isoformat() if r[8] else None,
-                    "finished_at": r[9].isoformat() if r[9] else None})
+        out.append({"iteration": r[1], "action": r[2], "arguments": _j(r[3]), "reason": r[4],
+                    "decided_by": r[5], "status": r[6], "observation": _j(r[7]), "error": r[8],
+                    "created_at": r[9].isoformat() if r[9] else None,
+                    "finished_at": r[10].isoformat() if r[10] else None,
+                    "decided_in_generation": r[11], "attempt_count": int(r[12] or 0),
+                    "attempts": attempts.get(r[0], [])})
     return out
 
 
 # ------------------------------------------------------------------- searches --
 
-def get_search(run_id, provider, query_norm):
+def search_history(run_id, provider, query_norm):
+    """Every recorded execution of (provider, query) in this run, newest generation
+    first. One row per execution generation (migration 0011)."""
     with get_connection() as conn:
         cur = conn.cursor()
         cur.execute("""SELECT provider_status, new_jobs, duplicates, eligible_jobs,
-                              rejection_summary, iteration
-                       FROM agent_searches WHERE run_id = %s AND provider = %s AND query_norm = %s""",
+                              rejection_summary, iteration, execution_generation,
+                              provider_detail, fetched, reused_from_generation
+                       FROM agent_searches
+                       WHERE run_id = %s AND provider = %s AND query_norm = %s
+                       ORDER BY execution_generation DESC, id DESC""",
                     (run_id, provider, query_norm))
-        row = cur.fetchone()
-    if not row:
-        return None
-    return {"provider_status": row[0], "new_jobs": row[1], "duplicates": row[2],
-            "eligible_jobs": row[3], "rejection_summary": row[4], "iteration": row[5]}
+        rows = cur.fetchall()
+    return [{"provider_status": r[0], "new_jobs": r[1], "duplicates": r[2],
+             "eligible_jobs": r[3], "rejection_summary": r[4], "iteration": r[5],
+             "execution_generation": r[6], "provider_detail": r[7], "fetched": bool(r[8]),
+             "reused_from_generation": r[9]} for r in rows]
 
 
-def record_search(run_id, generation, iteration, provider, query_norm, location, obs):
+def record_search(run_id, generation, iteration, provider, query_norm, location, obs,
+                  fetched=True, reused_from_generation=None):
+    """One row per (run, provider, query, execution generation). `fetched` says
+    whether the provider was actually called in this generation; a reused result
+    names the generation it came from."""
     with get_connection() as conn:
         cur = conn.cursor()
         _check_generation(cur, run_id, generation)
         cur.execute("""
             INSERT INTO agent_searches (run_id, provider, query_norm, location, iteration,
-                provider_status, new_jobs, duplicates, eligible_jobs, rejection_summary)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (run_id, provider, query_norm) DO NOTHING
+                provider_status, new_jobs, duplicates, eligible_jobs, rejection_summary,
+                execution_generation, provider_detail, fetched, reused_from_generation)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (run_id, provider, query_norm, execution_generation) DO NOTHING
         """, (run_id, provider, query_norm, location or None, iteration,
               obs.get("provider_status"), obs.get("new_jobs", 0), obs.get("duplicates", 0),
-              obs.get("eligible_jobs", 0), json.dumps(obs.get("rejection_summary") or {})))
+              obs.get("eligible_jobs", 0), json.dumps(obs.get("rejection_summary") or {}),
+              generation, obs.get("provider_detail"), bool(fetched), reused_from_generation))
 
 
 # ------------------------------------------------------------------- postings --
@@ -371,27 +490,36 @@ def persist_advice(run_id, generation, job_id, title, advice_text, suggestions,
 
 
 def finalize(run_id, generation, status, stop_reason, error_code, progress):
-    """Terminal transition, fenced. Totals keep unknown cost visible (R15)."""
+    """Terminal transition, fenced. Closes the active runtime interval. Cost totals
+    keep unknown cost visible (R15): total_cost is the sum of PRICED calls (NULL if
+    none were priced) and unknown_cost_calls says how many successful calls are
+    missing from it — a partial total is never presented as complete."""
     code = error_code.value if hasattr(error_code, "value") else error_code
     with get_connection() as conn:
         cur = conn.cursor()
         _check_generation(cur, run_id, generation, lock="FOR UPDATE")
-        cur.execute("""
+        cur.execute(f"""
             UPDATE runs SET ended_at = NOW(), status = %s, stop_reason = %s, error_code = %s,
                 pending_review = NULL, goal_progress = %s,
                 total_tokens = (SELECT COALESCE(SUM(prompt_tokens + completion_tokens), 0)
                                 FROM llm_calls WHERE run_id = %s),
-                total_cost = (SELECT SUM(cost_usd) FROM llm_calls WHERE run_id = %s)
+                total_cost = (SELECT SUM(cost_usd) FROM llm_calls WHERE run_id = %s),
+                unknown_cost_calls = (SELECT COUNT(*) FROM llm_calls WHERE run_id = %s
+                                      AND cost_usd IS NULL AND status = 'success'),
+                {CLOSE_EXECUTION_INTERVAL_SQL}
             WHERE id = %s
         """, (status, redact_secrets(stop_reason, 500), code,
-              json.dumps(progress, default=str), run_id, run_id, run_id))
+              json.dumps(progress, default=str), run_id, run_id, run_id, run_id))
         cur.execute("""UPDATE review_requests SET status = 'superseded'
                        WHERE run_id = %s AND status IN ('pending', 'submitted')""", (run_id,))
 
 
 def mark_waiting(run_id, generation, payload):
+    """Pause for a human. Closes the active interval: waiting time is not runtime."""
     with get_connection() as conn:
         cur = conn.cursor()
         _check_generation(cur, run_id, generation, lock="FOR UPDATE")
-        cur.execute("UPDATE runs SET status = 'waiting_for_human', pending_review = %s WHERE id = %s",
+        cur.execute(f"""UPDATE runs SET status = 'waiting_for_human', pending_review = %s,
+                            {CLOSE_EXECUTION_INTERVAL_SQL}
+                        WHERE id = %s""",
                     (json.dumps(payload, default=str), run_id))

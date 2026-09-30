@@ -22,3 +22,20 @@ def _reset_rate_limiter():
         # nothing to reset, so let the test run as-is.
         pass
     yield
+
+@pytest.fixture(autouse=True)
+def _reset_quota_breaker():
+    """The LLM quota circuit breaker is process-global. A test that trips it
+    (e.g. an exhausted-quota test) must not make later, unrelated tests take their
+    rules fallback. Reset before and after every test."""
+    try:
+        import llm
+        llm.reset_quota_breaker()
+    except Exception:
+        pass
+    yield
+    try:
+        import llm
+        llm.reset_quota_breaker()
+    except Exception:
+        pass

@@ -86,7 +86,12 @@ def test_rules_policy_adapts_then_finishes():
 
 def test_allowed_actions_after_goal_met():
     g = _goal()
-    assert set(allowed_actions_for(g, {}, 3)) == {"rank_jobs", "generate_advice", "finish"}
+    # Goal met but nothing evaluated in this state: ranking/advice are impossible,
+    # so they must not be offered (review #8) — only finish.
+    assert allowed_actions_for(g, {}, 3) == ["finish"]
+    ev = {"1": {"job_id": 1, "status": "ok", "final_decision": "Apply", "score": 90}}
+    assert set(allowed_actions_for(g, {"evaluated": ev}, 3)) == {
+        "rank_jobs", "generate_advice", "finish"}
     acts = allowed_actions_for(g, {"searches": [], "discovered": {}, "evaluated": {}}, 0)
     assert "evaluate_jobs" not in acts and "rank_jobs" not in acts
 

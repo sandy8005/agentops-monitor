@@ -298,18 +298,29 @@ def build_suggestions(parsed_resume, resume_text, job, requirements, score_resul
         rewrites = gemini_rewrites(verified, job, requirements, run_id, step_id, budget)
         job_terms = list((requirements or {}).get("required_skills", [])) + \
             list((requirements or {}).get("preferred_skills", []))
-        sent = {_norm_ws(p["text"]).lower() for p in verified}
+        # Map each verified passage (by normalized text) to its ORIGINAL evidence
+        # entry. The offset recorded with a rewrite must be the passage's offset in
+        # the ORIGINAL resume text (from resume_passages()), never a position in a
+        # whitespace-normalized copy — those differ as soon as the resume has line
+        # breaks or repeated spaces.
+        by_text = {}
+        for p in verified:
+            by_text.setdefault(_norm_ws(p["text"]).lower(), p)
         for rw in rewrites:
-            if _norm_ws(rw.original_text).lower() not in sent:
+            source = by_text.get(_norm_ws(rw.original_text).lower())
+            if source is None:
                 status, vnotes = "rejected", "original_text was not one of the verified passages"
+                evidence = [{"source": "resume", "offset": None, "text": rw.original_text,
+                             "verified": False}]
             else:
                 status, vnotes = validate_rewrite(rw.original_text, rw.suggested_text,
                                                   resume_text, job_terms)
-            off = _norm_ws(resume_text).find(_norm_ws(rw.original_text))
+                evidence = [{"source": "resume", "offset": source.get("offset"),
+                             "text": source["text"], "verified": True}]
             suggestions.append({
                 "kind": "rewrite", "original_text": rw.original_text,
                 "suggested_text": rw.suggested_text, "reason": rw.reason,
-                "evidence": [{"source": "resume", "offset": off, "text": rw.original_text}],
+                "evidence": evidence,
                 "method": "gemini", "status": status, "validation_notes": vnotes,
             })
         note = "rules + gemini wording"

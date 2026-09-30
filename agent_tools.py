@@ -9,8 +9,9 @@ Contract for every tool:
     cannot repeat; limits are checked before execution.
   * A rejected call returns an observation explaining why and has NO side effects.
   * Execution is REPLAY-SAFE: re-running the same iteration after a crash reuses
-    persisted effects (recorded searches, existing job evaluations, idempotent
-    ranking/advice writes) instead of duplicating them.
+    persisted effects (successful searches, existing job evaluations, idempotent
+    ranking/advice writes) instead of duplicating them — but a search that FAILED
+    transiently in an earlier worker generation is genuinely retried (plan_search).
   * Observations are compact counts and ids. Job text is untrusted data and never
     becomes an instruction; titles are only shown to the controller fenced and
     truncated.
@@ -202,6 +203,48 @@ def _collect_candidates(ctx, provider, query):
     return jobs
 
 
+# Provider outcomes that can change on a retry (a later worker generation should
+# really call the provider again) vs. ones that cannot (credentials/config, a body
+# the provider will keep sending malformed). Unknown/legacy details count as
+# transient: retrying costs one request, wrongly never retrying loses the search.
+NON_TRANSIENT_PROVIDER_FAILURES = frozenset({"missing_keys", "auth_error", "invalid_response"})
+
+
+def plan_search(history, iteration, generation):
+    """Decide how THIS execution of search_jobs(provider, query) treats earlier
+    recorded executions of the same (provider, query) in this run.
+
+    Returns {"mode": "fetch" | "reuse" | "reject", "prior": row | None,
+             "retrying_generation": int | None}
+
+      * no history                                   -> fetch
+      * recorded by a DIFFERENT iteration (another
+        decision already searched this)              -> reject (no duplicate searches)
+      * same decision, any SUCCESSFUL execution      -> reuse (postings are persisted)
+      * same decision, same generation (LangGraph
+        replay inside one execution)                 -> reuse (never refetch)
+      * same decision, only FAILED executions in
+        EARLIER generations:
+            transient failure (429/5xx/network/...)  -> fetch  (a real provider retry)
+            non-transient (auth/keys/bad body)       -> reuse
+    """
+    if not history:
+        return {"mode": "fetch", "prior": None, "retrying_generation": None}
+    if any(h.get("iteration") != iteration for h in history):
+        return {"mode": "reject", "prior": history[0], "retrying_generation": None}
+    ok = [h for h in history if h.get("provider_status") == "success"]
+    if ok:
+        return {"mode": "reuse", "prior": ok[0], "retrying_generation": None}
+    same = [h for h in history if h.get("execution_generation") == generation]
+    if same:
+        return {"mode": "reuse", "prior": same[0], "retrying_generation": None}
+    latest = history[0]
+    if (latest.get("provider_detail") or "") in NON_TRANSIENT_PROVIDER_FAILURES:
+        return {"mode": "reuse", "prior": latest, "retrying_generation": None}
+    return {"mode": "fetch", "prior": latest,
+            "retrying_generation": latest.get("execution_generation")}
+
+
 def tool_search_jobs(ctx, args: SearchArgs):
     goal, state = ctx.goal, ctx.state
     if args.provider not in goal.providers:
@@ -210,9 +253,9 @@ def tool_search_jobs(ctx, args: SearchArgs):
     ok, qnorm, why = validate_search_query(args.query, goal)
     if not ok:
         raise ToolRejected(why)
-    prior = store.get_search(ctx.run_id, args.provider, qnorm)
-    replay = prior is not None and prior.get("iteration") == ctx.iteration
-    if prior is not None and not replay:
+    plan = plan_search(store.search_history(ctx.run_id, args.provider, qnorm),
+                       ctx.iteration, ctx.generation)
+    if plan["mode"] == "reject":
         raise ToolRejected(f"'{qnorm}' was already searched on {args.provider}; "
                            f"choose a different title or provider")
     done = [s for s in state.get("searches") or [] if s.get("iteration") != ctx.iteration]
@@ -222,8 +265,13 @@ def tool_search_jobs(ctx, args: SearchArgs):
     from llm import create_step, finish_step, fail_step
     step_id = create_step(ctx.run_id, f"agent_search:{args.provider}", ctx.iteration)
     try:
-        if replay:
-            provider_status = prior["provider_status"]       # never refetch on replay
+        prior = plan.get("prior")
+        if plan["mode"] == "reuse":
+            # Same decision, result already known and NOT worth refetching: a
+            # success (postings are persisted), a same-generation replay, or a
+            # non-transient failure (bad credentials won't fix themselves).
+            provider_status = prior.get("provider_detail") or (
+                "success" if prior["provider_status"] == "success" else "failed")
         elif args.provider == "adzuna":
             from adzuna_jobs import fetch_and_upsert_adzuna
             _, _, provider_status = fetch_and_upsert_adzuna(
@@ -236,6 +284,8 @@ def tool_search_jobs(ctx, args: SearchArgs):
                 limit=goal.limits.max_jobs_per_search, run_id=ctx.run_id, step_id=step_id)
         else:
             provider_status = "success"
+        fetched = plan["mode"] == "fetch"
+        reused_from = None if fetched else prior.get("execution_generation")
 
         succeeded = provider_status in ("success", "empty")
         candidates = _collect_candidates(ctx, args.provider, args.query) if succeeded else []
@@ -269,12 +319,18 @@ def tool_search_jobs(ctx, args: SearchArgs):
             "provider_detail": provider_status,
             "new_jobs": new, "duplicates": dup, "eligible_jobs": eligible,
             "rejection_summary": rejections,
+            "fetched": fetched,
         }
+        if plan["mode"] == "fetch" and plan.get("retrying_generation") is not None:
+            obs["retry_of_generation"] = plan["retrying_generation"]
+        if reused_from is not None:
+            obs["reused_from_generation"] = reused_from
         if not succeeded:
             obs["note"] = ("search FAILED — this is not evidence that no jobs exist; "
                            "try another provider or title")
         store.record_search(ctx.run_id, ctx.generation, ctx.iteration, args.provider,
-                            qnorm, goal.constraints.location, obs)
+                            qnorm, goal.constraints.location, obs, fetched=fetched,
+                            reused_from_generation=reused_from)
         state.setdefault("searches", []).append({**obs, "iteration": ctx.iteration})
         finish_step(step_id, "success" if succeeded else "failed")
         return obs, step_id, (eligible > 0)

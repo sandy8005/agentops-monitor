@@ -1,6 +1,7 @@
 import json
 import re
-from llm import logged_llm_call
+from llm import logged_llm_call, ModelOutputInvalid
+from pydantic import ValidationError
 from schemas import ParsedResume, _strict_float
 from logging_config import get_logger
 
@@ -244,6 +245,9 @@ RULES:
     # would let the router cache json.dumps(None) == "null" and poison the parse
     # cache; raising surfaces the failure so the run fails cleanly and nothing bad
     # is cached.
+    # Every "the model's output is unusable" condition raises ModelOutputInvalid, a
+    # degraded-MODEL signal the router may fall back on. Errors in OUR code below
+    # (reconciliation, grounding) are deliberately NOT wrapped — they must surface.
     try:
         parsed = json.loads(cleaned)
     except json.JSONDecodeError:
@@ -251,13 +255,17 @@ RULES:
         # salvage the outermost {...} before giving up.
         match = re.search(r"\{.*\}", cleaned, re.DOTALL)
         if not match:
-            raise ValueError(
+            raise ModelOutputInvalid(
                 f"parse_resume: LLM output was not valid JSON (step_id={step_id})"
             )
-        parsed = json.loads(match.group())
+        try:
+            parsed = json.loads(match.group())
+        except json.JSONDecodeError as e:
+            raise ModelOutputInvalid(
+                f"parse_resume: LLM output was not valid JSON (step_id={step_id})") from e
 
     if not isinstance(parsed, dict):
-        raise ValueError(
+        raise ModelOutputInvalid(
             f"parse_resume: expected a JSON object, got "
             f"{type(parsed).__name__} (step_id={step_id})"
         )
@@ -271,16 +279,27 @@ RULES:
     else:
         skills = []
 
-    normalized = {
-        "skills": skills,
-        "years_experience": _to_float_or_default(parsed.get("years_experience")),
-        "education": _normalize_education(parsed.get("education")),
-        "projects": _normalize_projects(parsed.get("projects")),
-        "experience": _normalize_experience(parsed.get("experience")),
-    }
+    try:
+        # _strict_float raises ValueError on garbage durations ("about two") — that
+        # is unusable MODEL output, not a bug in this module.
+        normalized = {
+            "skills": skills,
+            "years_experience": _to_float_or_default(parsed.get("years_experience")),
+            "education": _normalize_education(parsed.get("education")),
+            "projects": _normalize_projects(parsed.get("projects")),
+            "experience": _normalize_experience(parsed.get("experience")),
+        }
+    except ValueError as e:
+        raise ModelOutputInvalid(f"parse_resume: unusable value in model output: {e} "
+                                 f"(step_id={step_id})") from e
 
     # --- Schema validation (core fields) ----------------------------------
-    validated = ParsedResume.model_validate(normalized).model_dump()
+    try:
+        validated = ParsedResume.model_validate(normalized).model_dump()
+    except ValidationError as e:
+        raise ModelOutputInvalid(
+            f"parse_resume: model output failed schema validation ({e.error_count()} "
+            f"error(s), step_id={step_id})") from e
 
     # --- Cross-check stated vs summed experience (adds audit metadata) ----
     validated = _reconcile_experience(validated)

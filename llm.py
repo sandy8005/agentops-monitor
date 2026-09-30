@@ -43,6 +43,19 @@ class BudgetExceeded(Exception):
     pass
 
 
+class CostUnknown(BudgetExceeded):
+    """A hard USD cost limit is set but the configured model has no known price, so
+    the call's cost could not be accounted for. Refused BEFORE the HTTP request
+    (fail closed). Subclasses BudgetExceeded so every caller treats it as a
+    non-retryable budget stop and takes its rules fallback."""
+
+
+class ModelOutputInvalid(ValueError):
+    """The model answered, but its output is unusable (not JSON, wrong shape, fails
+    schema validation). A degraded-MODEL condition with a rules fallback — distinct
+    from a programming error in our own code."""
+
+
 class QuotaCircuitOpen(RuntimeError):
     """The provider already reported an exhausted (daily/project) quota for this
     model. Calls are refused locally — no HTTP request, no budget reservation —
@@ -82,6 +95,27 @@ def _open_quota_breaker(model):
 class ModelNotConfigured(RuntimeError):
     """No model credentials configured. Terminal for the model path; every caller
     has (or is given) a rules fallback."""
+
+
+# Exceptions that mean "the MODEL path is degraded" — every caller that has a rules
+# fallback may take it for these, and ONLY these. Anything else (a psycopg error, a
+# TypeError, a cache-schema regression) is a bug or an infrastructure failure and
+# must propagate so it is visible, not silently converted into "rules parser used".
+_PROVIDER_MODULES = ("google.genai", "google.api_core", "google.auth", "httpx", "httpcore")
+
+
+def is_degraded_model_error(exc):
+    """True if `exc` is a model-side degradation with a legitimate rules fallback:
+    not configured, quota/budget/cost stop, provider unavailable / rate limited, or
+    unusable model output. Database and programming errors return False."""
+    if isinstance(exc, (ModelNotConfigured, QuotaCircuitOpen, BudgetExceeded,
+                        InvalidProviderResponse, ModelOutputInvalid,
+                        TimeoutError, ConnectionError)):
+        return True
+    # Provider SDK / HTTP transport exceptions (google-genai uses httpx). Matched by
+    # the defining module so an unrelated error whose MESSAGE happens to contain
+    # "timeout" or "503" is never mistaken for a provider outage.
+    return (type(exc).__module__ or "").startswith(_PROVIDER_MODULES)
 
 
 def llm_available():
@@ -388,9 +422,14 @@ def finish_run(run_id, status="success", stop_reason=None, error_code=None):
                 total_tokens = (SELECT COALESCE(SUM(prompt_tokens + completion_tokens), 0)
                                 FROM llm_calls WHERE run_id = %s),
                 -- R15: NULL when no call has a known price (unknown is not $0).
-                total_cost = (SELECT SUM(cost_usd) FROM llm_calls WHERE run_id = %s)
+                total_cost = (SELECT SUM(cost_usd) FROM llm_calls WHERE run_id = %s),
+                -- ...and a PARTIAL total is marked as partial: how many successful
+                -- calls had no known price and are missing from total_cost.
+                unknown_cost_calls = (SELECT COUNT(*) FROM llm_calls WHERE run_id = %s
+                                      AND cost_usd IS NULL AND status = 'success')
             WHERE id = %s
-        """, (utcnow(), status, redact_secrets(stop_reason), error_code_val, run_id, run_id, run_id))
+        """, (utcnow(), status, redact_secrets(stop_reason), error_code_val,
+              run_id, run_id, run_id, run_id))
 
 
 def _log_llm_attempt(run_id, step_id, operation, prompt, response_text,

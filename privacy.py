@@ -70,6 +70,8 @@ def _scrub_run_payloads(cur, run_ids):
     # review requests carry comments/answers, suggestions quote the resume.
     cur.execute("UPDATE agent_actions SET arguments = NULL, observation = NULL, reason = NULL, "
                 "error = NULL WHERE run_id = ANY(%s)", (run_ids,))
+    cur.execute("UPDATE agent_action_attempts SET observation = NULL, error = NULL "
+                "WHERE run_id = ANY(%s)", (run_ids,))
     cur.execute("UPDATE review_requests SET payload = NULL, comment = NULL, answer = NULL "
                 "WHERE run_id = ANY(%s)", (run_ids,))
     cur.execute("DELETE FROM resume_suggestions WHERE run_id = ANY(%s)", (run_ids,))
@@ -132,7 +134,7 @@ def delete_run(run_id, user_id):
             raise ErasureConflict("run is still in progress; cancel it first")
         _scrub_run_payloads(cur, [run_id])       # checkpoints live outside the FK graph
         for table in ("evaluations", "llm_calls", "tool_calls", "run_rankings", "run_advice",
-                      "agent_actions", "agent_searches", "review_requests",
+                      "agent_action_attempts", "agent_actions", "agent_searches", "review_requests",
                       "resume_suggestions"):
             cur.execute(f"DELETE FROM {table} WHERE run_id = %s", (run_id,))
         cur.execute("DELETE FROM steps WHERE run_id = %s", (run_id,))

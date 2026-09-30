@@ -33,6 +33,8 @@ from agent_goal import AgentGoal
 from agent_tools import ToolContext, ToolRejected, execute, qualified_count
 from error_codes import ErrorCode, classify_exception
 from logging_config import get_logger
+from pricing import price_known
+from settings import settings
 
 log = get_logger(__name__)
 
@@ -88,11 +90,20 @@ class DurableBudget:
     still counts and a retry/replay can never reset the allowance; spend() is a
     no-op. exhausted() is a read-only check for gating decisions."""
 
-    def __init__(self, run_id, limit):
+    def __init__(self, run_id, limit, max_cost_usd=0.0):
         self.run_id = run_id
         self.limit = int(limit)
+        self.max_cost_usd = float(max_cost_usd or 0)
 
     def can_spend(self):
+        # Fail closed BEFORE reserving: a cost-bounded run never makes a call whose
+        # cost it cannot account for (the price may have been removed, or
+        # GEMINI_MODEL changed, after the run started).
+        if self.max_cost_usd > 0 and not price_known():
+            from llm import CostUnknown
+            raise CostUnknown(f"cost_unknown: no price is configured for model "
+                              f"{settings.gemini_model!r}; the ${self.max_cost_usd} cost "
+                              f"limit cannot be enforced")
         return store.reserve_llm_call(self.run_id, self.limit)
 
     def spend(self):
@@ -109,26 +120,59 @@ def _ctx(state, config, iteration=None):
     run_lock.check_owner(run_id)                        # node-boundary ownership check
     goal = AgentGoal(**state["goal"])
     gen = config["configurable"]["generation"]
-    budget = DurableBudget(run_id, goal.limits.max_llm_calls)
+    budget = DurableBudget(run_id, goal.limits.max_llm_calls, goal.limits.max_cost_usd)
     return run_id, goal, gen, budget
 
 
 # ------------------------------------------------------------------- guard ----
 
+def cost_preflight(goal):
+    """None, or a stop dict when a hard USD cap is set but the model the run would
+    call has no known price. A cap whose accounting is unknown is not a cap, so a
+    cost-bounded run that could call the model is refused before any call."""
+    lim = goal.limits
+    if lim.max_cost_usd <= 0 or goal.model_policy == "rules_only":
+        return None
+    if not settings.gemini_api_key:
+        return None                      # no model calls can happen at all
+    if price_known():
+        return None
+    return {"by": "limit", "cost_unknown": True,
+            "reason": (f"cost_unknown: max_cost_usd=${lim.max_cost_usd} is set but no price is "
+                       f"configured for model {settings.gemini_model!r}. Add it to pricing.py, "
+                       f"set LLM_INPUT_PRICE_PER_MILLION and LLM_OUTPUT_PRICE_PER_MILLION, set "
+                       f"max_cost_usd to 0 (no cost cap), or use model_policy=rules_only.")}
+
+
 def check_limits(run_id, goal, state):
     """None, or a stop dict. Called before EVERY controller decision and EVERY tool
     execution (R13), so an accepted cancellation or an exhausted limit is honoured
-    at each side-effect boundary."""
+    at each side-effect boundary.
+
+    Runtime is ACTIVE execution time (runs.active_runtime_seconds + the open
+    interval), not wall-clock since the first start: time paused for a human, or
+    waiting in the queue, is never charged."""
     if state.get("cancel_seen") or store.is_cancel_requested(run_id):
         return {"by": "user", "reason": "cancelled by user", "cancel": True}
     lim = goal.limits
     if int(state.get("iteration") or 1) > lim.max_iterations:
         return {"by": "limit", "reason": f"iteration limit reached ({lim.max_iterations})"}
     usage = store.run_usage(run_id)
-    if usage["elapsed_seconds"] > lim.max_runtime_seconds:
-        return {"by": "limit", "reason": f"runtime limit reached ({lim.max_runtime_seconds}s)"}
-    if lim.max_cost_usd > 0 and usage["known_cost_usd"] >= lim.max_cost_usd:
-        return {"by": "limit", "reason": f"estimated cost limit reached (${lim.max_cost_usd})"}
+    if usage["active_runtime_seconds"] > lim.max_runtime_seconds:
+        return {"by": "limit", "reason": f"runtime limit reached ({lim.max_runtime_seconds}s "
+                                         f"of active execution)"}
+    if lim.max_cost_usd > 0:
+        pre = cost_preflight(goal)
+        if pre:
+            return pre
+        if usage["unknown_cost_calls"] > 0:
+            # Fail closed: some spend cannot be counted, so the cap cannot be proven.
+            return {"by": "limit", "cost_unknown": True,
+                    "reason": (f"cost_unknown: {usage['unknown_cost_calls']} model call(s) have "
+                               f"no known price; the ${lim.max_cost_usd} cost limit cannot be "
+                               f"enforced (known spend ${usage['known_cost_usd']:.6f})")}
+        if usage["known_cost_usd"] >= lim.max_cost_usd:
+            return {"by": "limit", "reason": f"estimated cost limit reached (${lim.max_cost_usd})"}
     if int(state.get("no_progress") or 0) >= lim.no_progress_limit:
         return {"by": "limit", "reason": f"no progress in {lim.no_progress_limit} consecutive "
                                          f"search/evaluation actions"}
@@ -191,6 +235,9 @@ def node_setup(state: LoopState, config):
     if state.get("setup_done"):
         return {}
     run_id, goal, gen, budget = _ctx(state, config)
+    pre = cost_preflight(goal)
+    if pre:                        # before the resume parse, which may call the model
+        return {"stop": {**pre, "setup_failed": True}}
     from router import load_resume, do_parse_resume
     s = _adapter(run_id, goal, budget, state)
     load_resume(s, run_id)
@@ -226,9 +273,13 @@ def node_decide(state: LoopState, config):
     i = int(state.get("iteration") or 1)
 
     recorded = store.get_action(run_id, i)
-    if recorded is not None:                            # replay: never re-ask the model
+    if recorded is not None:
+        # Replay: this iteration was already DECIDED (by an earlier node run or an
+        # earlier worker generation). Never re-ask the model; the execution that
+        # follows is recorded as a NEW attempt of this same decision.
         return {"pending": {"action": recorded["action"], "arguments": recorded["arguments"],
-                            "reason": recorded["reason"], "decided_by": recorded["decided_by"]}}
+                            "reason": recorded["reason"], "decided_by": recorded["decided_by"],
+                            "replayed": True}}
 
     qualified = qualified_count(ToolContext(run_id, gen, goal, state, budget, i))
     allowed = allowed_actions_for(goal, state, qualified)
@@ -282,7 +333,8 @@ def node_decide(state: LoopState, config):
         decided_by = "rules"
     store.record_proposed_action(run_id, gen, i, decision.action, decision.arguments,
                                  decision.reason, decided_by)
-    updates.update({"pending": {**decision.model_dump(), "decided_by": decided_by},
+    updates.update({"pending": {**decision.model_dump(), "decided_by": decided_by,
+                                "replayed": False},
                     "controller_mode": mode, "controller_note": note})
     return updates
 
@@ -291,14 +343,20 @@ def node_act(state: LoopState, config):
     run_id, goal, gen, budget = _ctx(state, config)
     i = int(state.get("iteration") or 1)
     pending = state.get("pending") or {}
+    replayed = bool(pending.get("replayed"))
     work = copy.deepcopy(dict(state))
     stop = check_limits(run_id, goal, work)
     if stop:                                            # R13: re-check right before execution
         store.record_action_outcome(run_id, gen, i, "rejected",
-                                    {"stopped_before_execution": stop["reason"]})
+                                    {"stopped_before_execution": stop["reason"]},
+                                    replayed=replayed)
         return {"stop": stop, "pending": None}
 
     action, args = pending.get("action"), pending.get("arguments") or {}
+    # Durable "attempt started" marker for THIS generation: a worker that dies
+    # mid-tool leaves a visible 'running' attempt, and a retry in a new generation
+    # becomes attempt N+1 of the same decision instead of vanishing.
+    store.begin_action_attempt(run_id, gen, i, replayed=replayed)
     ctx = ToolContext(run_id, gen, goal, work, budget, i,
                       limit_check=lambda: check_limits(run_id, goal, work))
     obs_entry = {"iteration": i, "action": action, "decided_by": pending.get("decided_by")}
@@ -310,7 +368,8 @@ def node_act(state: LoopState, config):
             if action not in allowed:
                 raise ToolRejected(f"action {action!r} is not allowed now; allowed: {allowed}")
         obs, step_id, progressed = execute(ctx, action, args)
-        store.record_action_outcome(run_id, gen, i, "executed", obs, step_id=step_id)
+        store.record_action_outcome(run_id, gen, i, "executed", obs, step_id=step_id,
+                                    replayed=replayed)
         obs_entry["result"] = obs
         work["failure_streak"] = 0
         if pending.get("decided_by") == "llm":
@@ -318,7 +377,8 @@ def node_act(state: LoopState, config):
         if action in ("search_jobs", "evaluate_jobs"):
             work["no_progress"] = 0 if progressed else int(work.get("no_progress") or 0) + 1
     except ToolRejected as e:
-        store.record_action_outcome(run_id, gen, i, "rejected", {"rejected": str(e)})
+        store.record_action_outcome(run_id, gen, i, "rejected", {"rejected": str(e)},
+                                    replayed=replayed)
         obs_entry["rejected"] = str(e)
         if pending.get("decided_by") == "llm":
             streak = int(work.get("rejection_streak") or 0) + 1
@@ -335,7 +395,8 @@ def node_act(state: LoopState, config):
     except Exception as e:
         from sanitize import safe_exception_summary
         msg = safe_exception_summary(e)
-        store.record_action_outcome(run_id, gen, i, "failed", {"failed": msg}, error=msg)
+        store.record_action_outcome(run_id, gen, i, "failed", {"failed": msg}, error=msg,
+                                    replayed=replayed)
         obs_entry["failed"] = msg
         work["failure_streak"] = int(work.get("failure_streak") or 0) + 1
         if action == "rank_jobs":
@@ -456,6 +517,10 @@ def node_finalize(state: LoopState, config):
 
     if stop.get("cancel"):
         status, code = "cancelled", ErrorCode.CANCELLED
+    elif stop.get("cost_unknown"):
+        # Fail closed: stopped because spend could not be accounted for. Matches
+        # already verified are kept (partial), but the run is never "success".
+        status, code = ("partial_success" if q else "failed"), ErrorCode.COST_UNKNOWN
     elif stop.get("setup_failed"):
         from autonomous_graph import _stage_error_code
         status, code = "failed", _stage_error_code(stop.get("reason"))
@@ -678,7 +743,9 @@ def resume_agent_loop(run_id, payload, queue_attempt=1, checkpointer_factory=Non
                 # Stale job (retry after the graph moved on, or an old tab). Restore
                 # a consistent run status from the CHECKPOINT; apply nothing.
                 if pending:
-                    store.mark_waiting(run_id, gen, pending)
+                    store.mark_waiting(run_id, gen, pending)    # also closes the interval
+                else:
+                    store.suspend_execution(run_id, gen)     # nothing ran: charge nothing more
                 log.warning("stale resume for review %s ignored (checkpoint waits on %s)",
                             rid, (pending or {}).get("review_id"), extra={"run_id": run_id})
                 return {"stale": True}

@@ -155,8 +155,10 @@ class FakeStore:
             "cancel_requested": s.cancel, "status": s.status})
         mp.setattr(agent_store, "is_cancel_requested", lambda rid: s.cancel)
         mp.setattr(agent_store, "run_usage", lambda rid: {
-            "elapsed_seconds": 1, "llm_calls_reserved": 0, "llm_call_budget": 0,
-            "known_cost_usd": 0.0, "unknown_cost_calls": 0})
+            "elapsed_seconds": 1, "active_runtime_seconds": 1, "llm_calls_reserved": 0,
+            "llm_call_budget": 0, "known_cost_usd": 0.0, "unknown_cost_calls": 0})
+        mp.setattr(agent_store, "begin_action_attempt", lambda rid, g, i, replayed=False: 1)
+        mp.setattr(agent_store, "suspend_execution", lambda rid, g: None)
         mp.setattr(agent_store, "reserve_llm_call", lambda rid, b: False)
         mp.setattr(agent_store, "set_controller_mode", lambda *a: None)
         mp.setattr(agent_store, "get_action", lambda rid, i: s.actions.get(i))
@@ -165,7 +167,7 @@ class FakeStore:
                        "action": a, "arguments": args, "reason": r, "decided_by": d,
                        "status": "proposed", "observation": None, "error": None}))
         mp.setattr(agent_store, "record_action_outcome",
-                   lambda rid, g, i, st, obs=None, error=None, step_id=None:
+                   lambda rid, g, i, st, obs=None, error=None, step_id=None, replayed=False:
                    s.actions[i].update(status=st, observation=obs))
         mp.setattr(agent_store, "qualified_job_ids", lambda rid, d, verified_only=False: list(s.qualified))
         mp.setattr(agent_store, "unverified_qualified_count", lambda rid, d: 0)
@@ -232,8 +234,8 @@ def test_N03_setup_retry_does_not_reuse_old_failure(env, monkeypatch):
     mp.setattr(llm, "create_step", lambda *a: 1)
     mp.setattr(llm, "finish_step", lambda *a, **k: None)
     mp.setattr(llm, "fail_step", lambda *a, **k: None)
-    mp.setattr(agent_store, "get_search", lambda *a: None)
-    mp.setattr(agent_store, "record_search", lambda *a: None)
+    mp.setattr(agent_store, "search_history", lambda *a: [])
+    mp.setattr(agent_store, "record_search", lambda *a, **k: None)
     agent_loop.run_agent_loop(510, checkpointer_factory=factory)
     assert fs.final[0] == "failed"
     agent_loop.run_agent_loop(510, queue_attempt=2, checkpointer_factory=factory)

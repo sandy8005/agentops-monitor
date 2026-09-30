@@ -117,18 +117,29 @@ def do_parse_resume(state, run_id):
             return
         parsed = None
         if _llm_allowed(state):
+            from llm import ModelOutputInvalid, is_degraded_model_error
             try:
                 parsed = parse_resume(state.resume_text, run_id, step_id, budget=state)
                 # A parse that yields no usable dict must NOT flow downstream as None;
                 # never cache a non-dict (it would poison the parse cache).
                 if not isinstance(parsed, dict):
-                    raise ValueError("resume parse returned no usable data")
-                _parse_cache_put(rhash, parsed)
+                    raise ModelOutputInvalid("resume parse returned no usable data")
             except Exception as llm_err:
+                # ONLY a degraded model (not configured, quota/budget/cost stop,
+                # provider outage or rate limit, unusable output) falls back to the
+                # rules parser. A database error, a TypeError or any other bug in our
+                # own code propagates and fails the step VISIBLY instead of being
+                # disguised as "rules parser used".
+                if not is_degraded_model_error(llm_err):
+                    raise
                 from error_codes import summarize_error
                 log.warning("model resume parse unavailable (%s) — using rules parse",
                             summarize_error(llm_err), extra={"step_id": step_id})
                 parsed = None
+            if parsed is not None:
+                # Outside the fallback try: a cache-write failure is an infrastructure
+                # error, never a reason to discard a good model parse silently.
+                _parse_cache_put(rhash, parsed)
         if parsed is None:
             # N01: deterministic extraction — zero model calls. Never cached under
             # the model-parse key, so a later model-enabled run still gets a model parse.

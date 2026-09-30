@@ -323,25 +323,40 @@ def delete_resume(resume_id: int, user: dict = Depends(require_auth),
     return {"resume_id": resume_id, "deleted": True, "erased": True}
 
 
+def _cost_fields(known, unknown_calls):
+    """One cost shape for every endpoint. total_cost is only a number when it is
+    COMPLETE; otherwise the known part and the count of unpriced calls are explicit
+    (SUM() ignores NULL, so a bare sum of a partly-unpriced run looks complete)."""
+    known = float(known or 0)
+    unknown_calls = int(unknown_calls or 0)
+    complete = unknown_calls == 0
+    return {"total_cost": known if complete else None, "known_cost_usd": known,
+            "unknown_cost_calls": unknown_calls, "cost_complete": complete,
+            "cost_basis": "estimated_paid_tier"}
+
+
 @app.get("/runs")
 def list_runs(limit: int = Query(20, ge=1, le=100), user: dict = Depends(require_auth)):
     with get_connection() as conn:
         cur = conn.cursor()
         cur.execute("""
-            SELECT id, status, started_at, total_tokens, total_cost,
-                   target_role, location, work_mode, error_code
-            FROM runs WHERE user_id = %s ORDER BY id DESC LIMIT %s
+            SELECT r.id, r.status, r.started_at, r.total_tokens,
+                   r.target_role, r.location, r.work_mode, r.error_code,
+                   COALESCE(c.known, 0), COALESCE(c.unknown_calls, 0)
+            FROM runs r
+            LEFT JOIN LATERAL (
+                SELECT SUM(cost_usd) AS known,
+                       COUNT(*) FILTER (WHERE cost_usd IS NULL AND status = 'success')
+                           AS unknown_calls
+                FROM llm_calls WHERE run_id = r.id) c ON TRUE
+            WHERE r.user_id = %s ORDER BY r.id DESC LIMIT %s
         """, (user["id"], limit))
         rows = cur.fetchall()
-        return [
-            {"id": r[0], "status": r[1],
-             "started_at": r[2].isoformat() if r[2] else None,
-             "total_tokens": r[3], "total_cost": float(r[4]) if r[4] is not None else None,
-             "cost_basis": "estimated_paid_tier",
-             "target_role": r[5], "location": r[6], "work_mode": r[7],
-             "error_code": r[8]}
-            for r in rows
-        ]
+        return [{"id": r[0], "status": r[1],
+                 "started_at": r[2].isoformat() if r[2] else None,
+                 "total_tokens": r[3], "target_role": r[4], "location": r[5],
+                 "work_mode": r[6], "error_code": r[7], **_cost_fields(r[8], r[9])}
+                for r in rows]
 
 
 class AgentGoalRequest(BaseModel):
@@ -402,7 +417,7 @@ def _build_agent_goal(body):
     from agent_goal import AgentGoal
     g = body.goal or AgentGoalRequest()
     try:
-        return AgentGoal(
+        goal = AgentGoal(
             description=f"Find {g.target_count} suitable {g.seniority + ' ' if g.seniority else ''}"
                         f"{body.target_role.strip()} roles",
             target_role=body.target_role.strip(),
@@ -425,6 +440,13 @@ def _build_agent_goal(body):
         )
     except Exception as e:
         raise HTTPException(status_code=422, detail=f"invalid agent goal: {e}")
+    from agent_loop import cost_preflight
+    blocked = cost_preflight(goal)
+    if blocked:
+        # Fail closed at submission: a hard USD cap cannot be enforced for a model
+        # whose price is unknown (see pricing.py).
+        raise HTTPException(status_code=422, detail=blocked["reason"])
+    return goal
 
 
 @app.get("/reviews/pending")
@@ -611,6 +633,10 @@ def get_run(run_id: int, user: dict = Depends(require_auth)):
         run = cur.fetchone()
         if not run:
             raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
+        cur.execute("""SELECT COALESCE(SUM(cost_usd), 0),
+                              COUNT(*) FILTER (WHERE cost_usd IS NULL AND status = 'success')
+                       FROM llm_calls WHERE run_id = %s""", (run_id,))
+        cost_row = cur.fetchone()
 
         # Bulk-load the whole trace in a CONSTANT number of queries (steps, tool
         # calls, LLM calls, evaluations — each filtered by run_id and served by the
@@ -699,9 +725,9 @@ def get_run(run_id: int, user: dict = Depends(require_auth)):
             "ended_at": run[3].isoformat() if run[3] else None,
             "input_summary": run[4],
             "total_tokens": run[5],
-            # NULL total = no call had a known price (R15) — never shown as $0.
-            "total_cost": float(run[6]) if run[6] is not None else None,
-            "cost_basis": "estimated_paid_tier",
+            # total_cost is NULL unless complete; the partial known sum and the
+            # number of unpriced calls are always explicit (R15).
+            **_cost_fields(*cost_row),
             "resume_id": run[7], "target_role": run[8], "location": run[9],
             "work_mode": run[10], "employment_type": run[11],
             "pending_review": run[12],
@@ -876,6 +902,9 @@ def _safe_action(a):
     # A model-written justification is free text; backend/rules reasons are ours.
     if a.get("decided_by") == "llm":
         out["reason"] = _redact(a.get("reason"))
+    out["attempts"] = [{**t, "error": _redact(t.get("error")),
+                        "observation": _redact_tree(t.get("observation"))}
+                       for t in (a.get("attempts") or [])]
     return out
 
 
@@ -906,6 +935,8 @@ def get_agent_timeline(run_id: int, user: dict = Depends(require_auth)):
     return {"run_id": run_id, "mode": "agent", "goal": row[1], "controller_mode": row[2],
             "progress": row[3], "status": row[6], "error_code": row[7],
             "llm_calls": {"reserved": row[4], "budget": row[5]},
+            "runtime": {"active_seconds": usage["active_runtime_seconds"],
+                        "wall_clock_seconds": usage["elapsed_seconds"]},
             "cost": {"known_estimated_usd": usage["known_cost_usd"],
                      "calls_with_unknown_cost": usage["unknown_cost_calls"],
                      "complete": usage["unknown_cost_calls"] == 0,

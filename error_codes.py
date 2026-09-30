@@ -51,6 +51,8 @@ class ErrorCode(str, Enum):
     # Control / lifecycle.
     CANCELLED = "cancelled"                       # user cancelled
     BUDGET_EXCEEDED = "budget_exceeded"           # per-run LLM request budget spent
+    COST_UNKNOWN = "cost_unknown"                 # a hard USD cap is set but the model's
+                                                  # price is unknown — fail closed
     WORKER_LOST = "worker_lost"                   # worker died / stopped heartbeating
                                                   # and the job ran out of attempts
     DATABASE_UNAVAILABLE = "database_unavailable" # connection / operational DB error —
@@ -111,6 +113,8 @@ def classify_exception(exc):
         return ErrorCode.LLM_RATE_LIMITED
     if "503" in msg or "UNAVAILABLE" in msg or "timeout" in low or "timed out" in low:
         return ErrorCode.LLM_UNAVAILABLE
+    if name == "CostUnknown" or "cost_unknown" in low:
+        return ErrorCode.COST_UNKNOWN
     if "budget" in low:
         return ErrorCode.BUDGET_EXCEEDED
     return ErrorCode.INTERNAL
