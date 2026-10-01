@@ -21,7 +21,8 @@ import time
 import threading
 
 import job_queue
-from autonomous_graph import run_agent_graph, resume_agent_graph
+import agent_loop
+import sys
 from error_codes import ErrorCode, classify_exception
 from database import get_connection
 from logging_config import get_logger
@@ -144,39 +145,41 @@ def _run_outcome(run_id):
 
 
 def _run_job(job):
-    """Dispatch a claimed job to the right agent entrypoint. Runs synchronously in
-    the worker (this is the worker's whole purpose)."""
+    """Dispatch a claimed job to the agent engine — the ONLY execution engine.
+
+    A run created for the retired fixed-sequence "pipeline" engine is never
+    executed by a different engine than the one it was configured for: it is
+    closed as failed/engine_retired (terminal), with a clear stop reason."""
     kind = job["kind"]
     p = job["payload"]
-    if _run_mode(job.get("run_id") or p.get("run_id")) == "agent":
-        import agent_loop
-        if kind == "start_run":
-            agent_loop.run_agent_loop(p["run_id"], queue_attempt=job.get("attempts", 1))
-        elif kind == "resume_run":
-            agent_loop.resume_agent_loop(p["run_id"], p, queue_attempt=job.get("attempts", 1))
-        else:
-            raise ValueError(f"unknown job kind: {kind}")
+    run_id = job.get("run_id") or p.get("run_id")
+    if kind not in ("start_run", "resume_run"):
+        raise ValueError(f"unknown job kind: {kind}")
+    if _run_mode(run_id) != "agent":
+        _retire_legacy_run(run_id)
         return
     if kind == "start_run":
-        run_agent_graph(
-            resume_id=p["resume_id"],
-            target_role=p.get("target_role"),
-            location=p.get("location"),
-            work_mode=p.get("work_mode"),
-            employment_type=p.get("employment_type"),
-            evaluate=p.get("evaluate", False),
-            run_id=p["run_id"],
-            live_only=p.get("live_only", False),
-            model_policy=p.get("model_policy", "auto"),
-        )
-    elif kind == "resume_run":
-        resume_agent_graph(p["run_id"], p["decision"], p.get("comment", ""),
-                           reviewer_user_id=p.get("reviewer_user_id"),
-                           reviewer=p.get("reviewer"),
-                           queue_attempt=job.get("attempts", 1),
-                           review_id=p.get("review_id"))
+        agent_loop.run_agent_loop(p["run_id"], queue_attempt=job.get("attempts", 1))
     else:
-        raise ValueError(f"unknown job kind: {kind}")
+        agent_loop.resume_agent_loop(p["run_id"], p, queue_attempt=job.get("attempts", 1))
+
+
+def _retire_legacy_run(run_id):
+    """Close a run of the retired engine without executing it. A cancel the user
+    requested wins: such a run ends 'cancelled', otherwise failed/engine_retired."""
+    with get_connection() as conn:
+        conn.cursor().execute(
+            "UPDATE runs SET status = CASE WHEN cancel_requested THEN 'cancelled' ELSE 'failed' END, "
+            "ended_at = NOW(), pending_review = NULL, "
+            "error_code = CASE WHEN cancel_requested THEN %s ELSE %s END, "
+            "stop_reason = CASE WHEN cancel_requested THEN 'cancelled by user' ELSE "
+            "'engine_retired: this run was queued for the retired pipeline engine and was not "
+            "executed; start a new run' END "
+            "WHERE id = %s AND status NOT IN ('success', 'partial_success', 'no_matches', "
+            "'completed_with_errors', 'cancelled', 'failed')",
+            (ErrorCode.CANCELLED.value, ErrorCode.ENGINE_RETIRED.value, run_id))
+    log.warning("legacy pipeline run closed without executing (engine retired)",
+                extra={"run_id": run_id})
 
 
 class DatabaseUnavailable(RuntimeError):
@@ -185,21 +188,18 @@ class DatabaseUnavailable(RuntimeError):
 
 def _run_mode(run_id):
     """
-    'agent' or 'pipeline'. Only a database that genuinely predates migration 0010
-    (no runs.mode column) falls back to 'pipeline'. ANY other failure raises
-    DatabaseUnavailable (retryable) — a transient error must never route an agent
-    run into the legacy engine (N08).
+    The run's engine ('agent', or 'pipeline' for legacy rows). Any failure raises
+    DatabaseUnavailable (retryable): a transient error must never be read as a
+    routing decision (N08). migrate.py is required, so runs.mode always exists.
     """
     if run_id is None:
-        return "pipeline"
+        raise ValueError("job has no run_id")
     try:
         with get_connection() as conn:
             cur = conn.cursor()
             cur.execute("SELECT mode FROM runs WHERE id = %s", (run_id,))
             row = cur.fetchone()
     except Exception as e:
-        if getattr(e, "pgcode", None) == "42703":        # undefined_column: pre-0010 schema
-            return "pipeline"
         raise DatabaseUnavailable(f"database_unavailable: run mode lookup failed "
                                   f"({type(e).__name__})") from e
     if not row:
@@ -313,9 +313,9 @@ def _process_locked(job, lock):
                 # visible: a DB problem that keeps heartbeats failing makes the job
                 # look stale and triggers orphan recovery, and this is the trail
                 # that explains why.
-                hb_warner.warn("job %s: heartbeat failed (%s: %s) — will retry; "
+                hb_warner.warn("job %s: heartbeat failed (%s) — will retry; "
                                "job may be reclaimed as an orphan if this persists",
-                               job["id"], type(e).__name__, e,
+                               job["id"], type(e).__name__,
                                extra={"run_id": job["run_id"]})
 
     beat = threading.Thread(target=_beat, daemon=True)
@@ -332,8 +332,10 @@ def _process_locked(job, lock):
         except Exception as e:
             code = classify_exception(e)
             outcome = RETRYABLE_FAILURE if code in RETRYABLE_ERROR_CODES else TERMINAL_FAILURE
-            log.exception("job %s (%s) raised (code=%s)", job["id"], job["kind"], code,
-                          extra={"run_id": job["run_id"]})
+            # Type + code only (logging policy): exception text can carry database
+            # row values or provider payloads. The step trace keeps the redacted text.
+            log.error("job %s (%s) raised %s (code=%s)", job["id"], job["kind"],
+                      type(e).__name__, code, extra={"run_id": job["run_id"]})
 
         # Record the outcome — only if we still hold the lease.
         if lost_lease.is_set():
@@ -361,13 +363,18 @@ def _process_locked(job, lock):
 
 def main():
     log.info("worker %s starting", job_queue.WORKER_ID)
-    # LangGraph checkpoint schema: normally created by `python migrate.py`; run once
-    # here as a safety net — NOT on every graph execution (it's DDL).
+    # LangGraph checkpoint schema: normally created by `python migrate.py`; checked
+    # once here. A worker that cannot checkpoint cannot execute ANY run, so this is
+    # a FATAL startup error: exit non-zero and let the supervisor (systemd, Docker,
+    # Kubernetes) restart it or mark it unhealthy — instead of reporting itself
+    # alive while claiming jobs it will only fail.
     try:
         from checkpointing import setup_schema
         setup_schema()
     except Exception as e:
-        log.error("langgraph checkpoint schema setup failed: %s", e)
+        log.critical("langgraph checkpoint schema setup failed (%s) — worker exiting",
+                     type(e).__name__)
+        sys.exit(2)
     sweep_warner = _RateLimitedWarner()
     # Startup orphan recovery: a previous worker may have died mid-job.
     try:
@@ -375,7 +382,7 @@ def main():
         if n:
             log.info("reclaimed %s orphaned job(s) on startup", n)
     except Exception as e:
-        log.warning("orphan recovery failed on startup: %s", e)
+        log.warning("orphan recovery failed on startup (%s)", type(e).__name__)
 
     last_sweep = time.time()
     last_retention = 0.0
@@ -388,7 +395,7 @@ def main():
                     from settings import settings
                     purge_expired_traces(settings.trace_retention_days)
                 except Exception as e:
-                    log.warning("trace retention purge failed: %s", e)
+                    log.warning("trace retention purge failed (%s)", type(e).__name__)
                 last_retention = time.time()
 
             # Periodic orphan sweep (in case a sibling worker died).
@@ -398,8 +405,7 @@ def main():
                     if n:
                         log.info("orphan sweep reclaimed %s job(s)", n)
                 except Exception as e:
-                    sweep_warner.warn("periodic orphan sweep failed (%s: %s)",
-                                      type(e).__name__, e)
+                    sweep_warner.warn("periodic orphan sweep failed (%s)", type(e).__name__)
                 last_sweep = time.time()
 
             job = job_queue.claim_next()
@@ -413,7 +419,7 @@ def main():
             break
         except Exception as e:
             # A failure in the loop itself (e.g. DB blip) — log and keep going.
-            log.error("worker loop error: %s", e)
+            log.error("worker loop error (%s)", type(e).__name__)
             time.sleep(POLL_INTERVAL)
 
 

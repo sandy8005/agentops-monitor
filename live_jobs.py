@@ -94,7 +94,7 @@ def fetch_live_jobs(role, location=None, limit=10):
     except requests.exceptions.RequestException as e:
         from sanitize import safe_exception_summary
         msg = "network error: " + safe_exception_summary(e)
-        log.warning("remotive fetch failed (%s) — continuing with existing pool", msg)
+        log.warning("remotive fetch failed (%s)", msg)
         return ([], "network_error", msg)
     if resp.status_code == 429:
         return ([], "rate_limited", "Remotive rate limit (HTTP 429)")
@@ -107,7 +107,7 @@ def fetch_live_jobs(role, location=None, limit=10):
     try:
         body = resp.json()
     except ValueError as e:
-        log.warning("remotive returned malformed JSON (%s)", e)
+        log.warning("remotive returned malformed JSON (%s)", type(e).__name__)
         return ([], "invalid_response", f"invalid response: malformed JSON ({e})")
     if not isinstance(body, dict) or not isinstance(body.get("jobs", []), list):
         return ([], "invalid_response", "invalid response: unexpected JSON shape")
@@ -156,16 +156,6 @@ def upsert_live_jobs(jobs, conn=None):
     return upsert_postings(jobs, conn=conn)
 
 
-def fetch_and_upsert(role, location=None, limit=10):
-    """Fetch live jobs and upsert them in their own transaction (no run scope).
-    Returns (inserted, skipped)."""
-    jobs, _status, _err = fetch_live_jobs(role, location, limit)
-    inserted, skipped, _ = upsert_live_jobs(jobs)
-    if jobs:
-        log.info("live: fetched %d, added %d new, %d already known", len(jobs), inserted, skipped)
-    return (inserted, skipped)
-
-
 def _log_remotive_call(run_id, step_id, role, location, latency_ms,
                        fetched, inserted, duplicates, status, error_message):
     """Write an AgentOps trace row for the Remotive external API call, mirroring the
@@ -180,15 +170,18 @@ def _log_remotive_call(run_id, step_id, role, location, latency_ms,
                        "location_filter_applied": False},
                       latency_ms, status, error_message, "live_fetch")
     except Exception as log_err:
-        log.warning("remotive trace log failed: %s", log_err)
+        log.warning("remotive trace log failed (%s)", type(log_err).__name__)
 
 
 def fetch_and_upsert_remotive(role, location=None, limit=10, run_id=None, step_id=None):
     """
-    Fetch live Remotive jobs for `role` and upsert them, RUN-SCOPED like the Adzuna
-    layer: the fetched postings are associated with THIS run's search (via
-    job_search_results) so a `live_only` run actually sees them. Returns
+    Fetch live Remotive jobs for `role` and upsert them, RUN-SCOPED: the fetched
+    postings are associated with THIS run's search (job_search_results). Returns
     (inserted, skipped, status).
+
+    Provider fetch/parsing problems come back as a classified status. Database
+    persistence errors are NOT converted into a provider status: the trace row
+    records them, then they propagate (database_unavailable / internal).
     """
     import time
     from job_search import create_search, associate_jobs
@@ -213,9 +206,10 @@ def fetch_and_upsert_remotive(role, location=None, limit=10, run_id=None, step_i
             finally:
                 conn.close()
     except Exception as e:
-        status = "failed"
-        from sanitize import redact_secrets
-        error_message = redact_secrets(e)
+        from sanitize import safe_exception_summary
+        _log_remotive_call(run_id, step_id, role, location, int((time.time() - start) * 1000),
+                           fetched, 0, 0, "persistence_failed", safe_exception_summary(e))
+        raise
     latency_ms = int((time.time() - start) * 1000)
     _log_remotive_call(run_id, step_id, role, location, latency_ms,
                        fetched, inserted, skipped, status, error_message)

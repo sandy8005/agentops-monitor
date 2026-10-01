@@ -51,7 +51,13 @@ def open_checkpointer():
 
 
 def setup_schema():
-    """Create / migrate LangGraph's checkpoint tables. Idempotent. Deployment-time."""
-    with open_checkpointer() as cp:
-        cp.setup()
+    """Create / migrate LangGraph's checkpoint tables. Idempotent. Deployment-time.
+
+    Serialized across processes with the same PostgreSQL advisory lock as the app
+    migrations (migrate.schema_lock): two replicas deploying at once would
+    otherwise both see a checkpoint migration as pending and race its DDL."""
+    from migrate import schema_lock
+    with schema_lock():
+        with open_checkpointer() as cp:
+            cp.setup()
     log.info("langgraph checkpoint schema is up to date")

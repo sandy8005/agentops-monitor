@@ -11,7 +11,7 @@ import pydantic
 from schemas import _strict_float, Evaluation, ParsedResume
 from scorer import calculate_match_score
 from parser import _reconcile_experience
-from job_source import search_jobs, _role_matcher
+from job_source import _role_matcher
 
 
 # ----------------------- schema / validation -----------------------
@@ -137,19 +137,5 @@ def test_role_matcher_short_term_whole_word_only():
     # "ml" must not match inside "HTML"
     assert m({"title": "Frontend Dev", "description": "expert in HTML and CSS"}) is False
 
-
-# ----------------------- search filters (need DB; skip if unavailable) -----------------------
-
-@pytest.fixture
-def db_available():
-    try:
-        search_jobs(target_role="engineer")
-        return True
-    except Exception:
-        pytest.skip("database not available for search filter tests")
-
-def test_zero_match_returns_empty(db_available):
-    assert search_jobs(target_role="xyzzy plugh frobnicate") == []   # truly nonsense tokens
-
-def test_engineer_search_returns_matches(db_available):
-    assert len(search_jobs(target_role="engineer")) >= 0
+# Search-filter tests against the database live in tests/test_search_fields.py
+# (run-scoped: the global practice pool no longer exists).

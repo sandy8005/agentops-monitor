@@ -39,3 +39,16 @@ def _reset_quota_breaker():
         llm.reset_quota_breaker()
     except Exception:
         pass
+
+@pytest.fixture(autouse=True)
+def _deterministic_model_settings(monkeypatch):
+    """Tests never depend on the developer's .env for MODEL settings: a fake API key
+    (no test makes a real provider request — they monkeypatch real_llm_once) and
+    the default pricing, so pass/fail is identical on a laptop and in CI. Tests
+    that need "no key configured" override it themselves."""
+    from settings import settings
+    monkeypatch.setattr(settings, "gemini_api_key", "test-key-not-real", raising=False)
+    monkeypatch.setattr(settings, "gemini_model", "gemini-3.6-flash", raising=False)
+    monkeypatch.setattr(settings, "llm_input_price_per_million", None, raising=False)
+    monkeypatch.setattr(settings, "llm_output_price_per_million", None, raising=False)
+    yield

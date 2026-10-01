@@ -97,7 +97,7 @@ def fetch_adzuna_jobs(role, location=None, limit=10):
         # DNS / connection refused / timeout — request never got an HTTP response.
         from sanitize import safe_exception_summary
         msg = "network error: " + safe_exception_summary(e)
-        log.warning("Adzuna fetch failed (%s) — continuing with existing pool", msg)
+        log.warning("Adzuna fetch failed (%s)", msg)
         return ([], "network_error", msg)
 
     # Classify by HTTP status BEFORE trying to parse the body.
@@ -111,11 +111,11 @@ def fetch_adzuna_jobs(role, location=None, limit=10):
         return ([], "rate_limited", msg)
     if resp.status_code >= 500:
         msg = f"server error: HTTP {resp.status_code}"
-        log.warning("Adzuna %s — continuing with existing pool", msg)
+        log.warning("Adzuna %s", msg)
         return ([], "server_error", msg)
     if not resp.ok:
         msg = f"http error: HTTP {resp.status_code}"
-        log.warning("Adzuna %s — continuing with existing pool", msg)
+        log.warning("Adzuna %s", msg)
         return ([], "http_error", msg)
 
     try:
@@ -123,7 +123,7 @@ def fetch_adzuna_jobs(role, location=None, limit=10):
     except ValueError as e:
         # 2xx but unparseable body — the request worked; the RESPONSE is bad.
         msg = f"invalid response: malformed JSON ({e})"
-        log.warning("Adzuna %s — continuing with existing pool", msg)
+        log.warning("Adzuna %s", msg)
         return ([], "invalid_response", msg)
     if not isinstance(body, dict) or not isinstance(body.get("results", []), list):
         return ([], "invalid_response", "invalid response: unexpected JSON shape")
@@ -192,32 +192,31 @@ def _log_adzuna_call(run_id, step_id, role, location, latency_ms,
                        "location_filter_applied": bool(location and location.strip())},
                       latency_ms, status, error_message, "live_fetch")
     except Exception as log_err:
-        log.warning("adzuna trace log failed: %s", log_err)
+        log.warning("adzuna trace log failed (%s)", type(log_err).__name__)
 
 
 def fetch_and_upsert_adzuna(role, location=None, limit=10, run_id=None, step_id=None):
     """
-    Fetch real Adzuna jobs for role+location and upsert them. The single call the
-    agent makes. Now OBSERVED with a CLASSIFIED status (success / empty /
-    missing_keys / auth_error / rate_limited / http_error / network_error) rather
-    than collapsing every non-result into "empty", so the trace shows WHY a fetch
-    produced nothing. Returns (inserted, skipped, status).
+    Fetch real Adzuna jobs for role+location and upsert them. Returns
+    (inserted, skipped, status).
+
+    Three phases, kept apart so a failure is attributed to the right layer:
+      1. provider fetch + 2. response parsing  (fetch_adzuna_jobs) — never raise;
+         problems come back as a classified provider status (auth_error,
+         rate_limited, server_error, invalid_response, network_error, ...).
+      3. database persistence — NOT caught here. A PostgreSQL failure is an
+         infrastructure failure (database_unavailable / internal), never a
+         "job source" failure: the trace row records it, then it propagates.
     """
     from job_search import create_search, associate_jobs
     start = time.time()
-    status = "success"
-    error_message = None
-    fetched = inserted = skipped = 0
+    inserted = skipped = 0
+    jobs, status, error_message = fetch_adzuna_jobs(role, location, limit)
+    fetched = len(jobs)
     try:
-        jobs, fetch_status, fetch_error = fetch_adzuna_jobs(role, location, limit)
-        fetched = len(jobs)
-        # Carry the fetch's classified status/message straight through to the trace.
-        status = fetch_status
-        error_message = fetch_error
         if jobs:
             # One transaction: upsert the postings, record THIS search, associate the
-            # returned postings to it. The search (not the job row) now carries the
-            # role/location intent, so the same posting can join multiple searches.
+            # returned postings to it.
             conn = _get_connection()
             try:
                 inserted, skipped, job_ids = upsert_adzuna_jobs(jobs, conn=conn)
@@ -228,18 +227,16 @@ def fetch_and_upsert_adzuna(role, location=None, limit=10, run_id=None, step_id=
             finally:
                 conn.close()
     except Exception as e:
-        # Only reaches here for UNEXPECTED errors (e.g. DB failure during upsert);
-        # fetch-level problems are already classified and returned as status above.
-        from sanitize import redact_secrets
-        status = "failed"
-        error_message = redact_secrets(e)
+        from sanitize import safe_exception_summary
+        _log_adzuna_call(run_id, step_id, role, location, int((time.time() - start) * 1000),
+                         fetched, 0, 0, "persistence_failed", safe_exception_summary(e))
+        raise
     latency_ms = int((time.time() - start) * 1000)
-
     _log_adzuna_call(run_id, step_id, role, location, latency_ms,
                      fetched, inserted, skipped, status, error_message)
-
     if fetched:
-        log.info("adzuna: fetched %s, added %s new, %s already known (%sms)", fetched, inserted, skipped, latency_ms)
+        log.info("adzuna: fetched %s, added %s new, %s already known (%sms)",
+                 fetched, inserted, skipped, latency_ms)
     return (inserted, skipped, status)
 
 

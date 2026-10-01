@@ -1,12 +1,11 @@
 """
 Legacy monolithic agent, retired.
 
-The old run_agent() loop and its CLI entrypoint were replaced by the autonomous
-planner/router and, now, the LangGraph runner (autonomous_graph.run_agent_graph,
-which /runs dispatches). Those dead paths, plus load_resume_from_db (superseded by
-router.load_resume) and their now-unused imports, have been removed.
+The old run_agent() loop, the planner/router loop and the LangGraph "pipeline"
+engine have all been retired; the controller agent (agent_loop.py) is the only
+execution engine.
 
-What remains are the TWO helpers still used by the live pipeline:
+What remains are the TWO helpers still used by job evaluation:
   - build_prompt():   the job-judge prompt, imported by router.do_process_job.
   - parse_decision(): parse the judge's JSON verdict; used by test_decision_parse.
 Keep this module small and focused on those two.

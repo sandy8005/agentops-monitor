@@ -193,14 +193,13 @@ def parse_resume(resume_text, run_id, step_id, budget=None):
     # human-review route here), so writing needs_human_review would make the Monitor
     # claim "human review required" for a review that will never happen. The
     # structural defense (delimiting + hardening) below is what protects the prompt.
-    flags = detect_injection(resume_text)
-    if flags:
-        try:
-            from llm import flag_security
-            flag_security(step_id, reason="possible_prompt_injection(resume)")
-        except Exception:
-            log.warning("could not record resume security flag", exc_info=True)
-        log.warning("[prompt-safety] injection-like patterns in resume: %s", flags, extra={"step_id": step_id})
+    try:
+        from prompt_safety import apply_injection_policy
+        apply_injection_policy(detect_injection(resume_text), step_id, source="resume",
+                               run_id=run_id, review_allowed=False)
+    except Exception:
+        # Observability must not break parsing; log the failure TYPE only.
+        log.warning("could not record resume security signal", extra={"step_id": step_id})
     prompt = f"""
 {HARDENING_PREAMBLE}
 

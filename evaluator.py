@@ -1,23 +1,18 @@
 import json
-from llm import logged_llm_call
+from pydantic import ValidationError
+from llm import logged_llm_call, ModelOutputInvalid
 from schemas import Evaluation
-from prompt_safety import wrap_untrusted, HARDENING_PREAMBLE, detect_injection
+from prompt_safety import wrap_untrusted, HARDENING_PREAMBLE
 
 
 def evaluate_decision(resume_text, job, agent_response, run_id, step_id, budget=None):
     # The evaluator is the component that is supposed to CATCH hallucinations and
     # quality problems, so it must not itself be hijacked. Its inputs are
-    # untrusted: resume_text (candidate-uploaded) and the job posting. Log any
-    # injection-looking patterns, then fence every untrusted block below.
-    flags = detect_injection(f"{resume_text}\n{job.get('title', '')}\n{job.get('description', '')}")
-    if flags:
-        try:
-            from llm import flag_for_review
-            flag_for_review(step_id, reason="possible_prompt_injection(evaluator_input)")
-        except Exception:
-            pass
-        print(f"    [prompt-safety] injection-like patterns in evaluator input: {flags}")
-
+    # untrusted: resume_text (candidate-uploaded) and the job posting.
+    # Injection scanning for this input happens ONCE per item, where the policy
+    # can act on it: job text in router.do_process_job (every evaluation, cache hit
+    # or not), resume text in parser.parse_resume. The structural defense below
+    # (hardening preamble + fenced data) is what protects this prompt.
     prompt = f"""
 {HARDENING_PREAMBLE}
 
@@ -53,6 +48,11 @@ Return ONLY valid JSON, no markdown fences, no explanation, in exactly this shap
 }}
 """
     raw = logged_llm_call(prompt, run_id, step_id, operation="evaluate_decision", budget=budget)
-    cleaned = raw.strip().replace("```json", "").replace("```", "").strip()
-    data = json.loads(cleaned)
-    return Evaluation(**data).model_dump()
+    cleaned = (raw or "").strip().replace("```json", "").replace("```", "").strip()
+    # Unusable MODEL output -> ModelOutputInvalid: the caller flags the job
+    # (evaluation_failed) instead of failing it as if our code had a bug.
+    try:
+        return Evaluation(**json.loads(cleaned)).model_dump()
+    except (json.JSONDecodeError, ValidationError, TypeError) as e:
+        raise ModelOutputInvalid(f"evaluate_decision: unusable model output "
+                                 f"({type(e).__name__}, step_id={step_id})") from None

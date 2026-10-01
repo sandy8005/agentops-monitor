@@ -32,15 +32,27 @@ def get_client():
 
 
 class InvalidProviderResponse(RuntimeError):
-    """The provider returned a response without the fields we need (no text, no
-    usage metadata) — typically a blocked / safety-filtered / truncated response.
-    Not transient: retrying the same prompt yields the same block."""
+    """The provider returned a response without the fields we need (no text) —
+    typically a blocked / safety-filtered / truncated response. Not transient:
+    retrying the same prompt yields the same block. The request WAS processed, so
+    any usage the provider reported is attached (prompt_tokens/completion_tokens,
+    None when missing) and the attempt is priced from it."""
+
+    def __init__(self, message, prompt_tokens=None, completion_tokens=None):
+        super().__init__(message)
+        self.prompt_tokens = prompt_tokens
+        self.completion_tokens = completion_tokens
 
 
 class BudgetExceeded(Exception):
     """Raised when an LLM call is refused because the run's request budget is spent.
     NOT a transient error — must not be retried."""
     pass
+
+
+class CostLimitReached(BudgetExceeded):
+    """The run's hard USD cap would be exceeded by this request's maximum possible
+    cost. Refused BEFORE the HTTP request; callers take their rules fallback."""
 
 
 class CostUnknown(BudgetExceeded):
@@ -136,7 +148,7 @@ def reset_quota_breaker(model=None):
 
 
 # get_connection is imported (pooled) from database at the top of this module, so
-# every `from llm import get_connection` (router.py, autonomous_graph.py, ...) now
+# every `from llm import get_connection` (router.py, agent_store.py, ...) now
 # draws from the shared ThreadedConnectionPool instead of opening a fresh socket.
 
 
@@ -146,16 +158,47 @@ def fake_llm(prompt):
             "completion_tokens": random.randint(5, 20)}
 
 
+def _usage_tokens(response):
+    """(prompt_tokens, completion_tokens) from the provider's usage metadata, each
+    None when the provider did not report it. Billing semantics:
+      prompt     = prompt_token_count + tool_use_prompt_token_count
+      completion = candidates_token_count + thoughts_token_count (thinking tokens
+                   are billed at the output rate)
+    A MISSING count is never turned into 0 — unknown usage means unknown cost."""
+    usage = getattr(response, "usage_metadata", None)
+    if usage is None:
+        return None, None
+    prompt = getattr(usage, "prompt_token_count", None)
+    cand = getattr(usage, "candidates_token_count", None)
+    thoughts = getattr(usage, "thoughts_token_count", None)
+    tool_prompt = getattr(usage, "tool_use_prompt_token_count", None)
+    prompt_tokens = None if prompt is None else int(prompt) + int(tool_prompt or 0)
+    if cand is None and thoughts is None:
+        completion_tokens = None
+    else:
+        completion_tokens = int(cand or 0) + int(thoughts or 0)
+    return prompt_tokens, completion_tokens
+
+
+def _generation_config():
+    """Every request carries a hard output cap. It bounds what one request can cost
+    (thinking tokens count against it), which is what makes the pre-dispatch dollar
+    reservation a real upper bound."""
+    from google.genai import types
+    return types.GenerateContentConfig(max_output_tokens=settings.llm_max_output_tokens)
+
+
 def real_llm_once(prompt):
     """Single LLM attempt — no retry. Raises on failure. Retry lives in logged_llm_call.
 
     Defensive about the SDK response shape: a blocked or abnormal response can have
-    text=None, usage_metadata=None, or None token counts. Those become an explicit
-    InvalidProviderResponse here instead of a confusing None.strip() far downstream.
-    Missing token counts are recorded as 0 (the call still happened)."""
+    text=None or no usage metadata. No text becomes InvalidProviderResponse (with
+    whatever usage was reported attached). Missing token counts stay None and are
+    flagged usage_missing — the call happened, its cost is UNKNOWN, not zero."""
     response = get_client().models.generate_content(
-        model=settings.gemini_model, contents=prompt
+        model=settings.gemini_model, contents=prompt, config=_generation_config()
     )
+    prompt_tokens, completion_tokens = _usage_tokens(response)
     text = getattr(response, "text", None)
     if not isinstance(text, str) or not text.strip():
         reason = None
@@ -168,10 +211,8 @@ def real_llm_once(prompt):
         except Exception:
             reason = None
         raise InvalidProviderResponse(
-            f"provider returned no text (block/finish reason: {reason or 'unknown'})")
-    usage = getattr(response, "usage_metadata", None)
-    prompt_tokens = getattr(usage, "prompt_token_count", None) if usage else None
-    completion_tokens = getattr(usage, "candidates_token_count", None) if usage else None
+            f"provider returned no text (block/finish reason: {reason or 'unknown'})",
+            prompt_tokens=prompt_tokens, completion_tokens=completion_tokens)
     request_id = None
     try:
         request_id = getattr(response, "response_id", None) or getattr(response, "_request_id", None)
@@ -179,9 +220,9 @@ def real_llm_once(prompt):
         request_id = None
     return {
         "text": text,
-        "prompt_tokens": int(prompt_tokens or 0),
-        "completion_tokens": int(completion_tokens or 0),
-        "usage_missing": usage is None or prompt_tokens is None or completion_tokens is None,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "usage_missing": prompt_tokens is None or completion_tokens is None,
         "provider_request_id": request_id
     }
 
@@ -197,7 +238,7 @@ def create_run_tx(cur, input_summary, resume_id=None, target_role=None,
     # A new run is 'queued', NOT 'running': at creation it is only waiting in
     # job_queue for a worker to claim it. started_at is left NULL and is stamped
     # only when the worker actually begins executing (see _mark_run_running in
-    # autonomous_graph), so queue-wait time is never counted as execution latency.
+    # agent_store.begin_execution), so queue-wait time is never counted as execution time.
     cur.execute("""
         INSERT INTO runs (started_at, status, input_summary, resume_id,
                           target_role, location, work_mode, employment_type, user_id)
@@ -421,12 +462,12 @@ def finish_run(run_id, status="success", stop_reason=None, error_code=None):
                 stop_reason = %s, error_code = %s,
                 total_tokens = (SELECT COALESCE(SUM(prompt_tokens + completion_tokens), 0)
                                 FROM llm_calls WHERE run_id = %s),
-                -- R15: NULL when no call has a known price (unknown is not $0).
-                total_cost = (SELECT SUM(cost_usd) FROM llm_calls WHERE run_id = %s),
-                -- ...and a PARTIAL total is marked as partial: how many successful
-                -- calls had no known price and are missing from total_cost.
+                -- NULL when no call has a known price (unknown is not $0) ...
+                total_cost = (SELECT SUM(cost_usd) FROM llm_calls
+                              WHERE run_id = %s AND cost_status = 'priced'),
+                -- ... and a PARTIAL total is marked as partial.
                 unknown_cost_calls = (SELECT COUNT(*) FROM llm_calls WHERE run_id = %s
-                                      AND cost_usd IS NULL AND status = 'success')
+                                      AND cost_status = 'unknown')
             WHERE id = %s
         """, (utcnow(), status, redact_secrets(stop_reason), error_code_val,
               run_id, run_id, run_id, run_id))
@@ -435,29 +476,55 @@ def finish_run(run_id, status="success", stop_reason=None, error_code=None):
 def _log_llm_attempt(run_id, step_id, operation, prompt, response_text,
                      prompt_tokens, completion_tokens, latency_ms, cost,
                      status, error_message, attempt_number, retry_count, provider_request_id,
-                     logical_call_id=None, pricing_version=None):
+                     logical_call_id=None, pricing_version=None, cost_status="priced",
+                     cost_upper_bound=None, usage_missing=False, reservation=None,
+                     generation=None):
     """One llm_calls row per HTTP attempt. Three counters make retries explainable
     in the Monitor ("why did this run call Gemini 11 times?"):
       logical_call_id  groups every HTTP attempt of ONE logical LLM call;
       attempt_number   which HTTP attempt this is within that logical call;
       run_attempt      which worker execution attempt of the RUN wrote it.
-    cost_usd is the ESTIMATED paid-tier cost (pricing.py), stamped with the model
-    and pricing_version so it stays interpretable after prices change."""
+
+    cost_status is explicit: 'priced' (cost_usd is the estimate from provider
+    usage), 'unknown' (usage missing or the request failed after dispatch —
+    cost_usd NULL, cost_upper_bound_usd = what was reserved), or 'not_billed' (the
+    provider rejected the request before doing work).
+
+    If the attempt holds a cost reservation it is SETTLED IN THE SAME TRANSACTION
+    as this insert: the in-flight amount moves into the recorded call exactly once,
+    with no window in which it is counted twice or not at all."""
+    reservation_id = (reservation or {}).get("reservation_id")
     with get_connection() as conn:
         cur = conn.cursor()
+        if reservation_id is not None:
+            # Lock order matches the reservation path: run row first.
+            cur.execute("SELECT 1 FROM runs WHERE id = %s FOR UPDATE", (run_id,))
+            cur.execute("""
+                UPDATE llm_cost_reservations r SET status = 'settled', settled_at = NOW()
+                FROM (SELECT id, status AS old_status FROM llm_cost_reservations
+                      WHERE id = %s FOR UPDATE) o
+                WHERE r.id = o.id AND o.old_status IN ('open', 'abandoned')
+                RETURNING o.old_status, r.amount_usd
+            """, (reservation_id,))
+            settled = cur.fetchone()
+            if settled and settled[0] == "open" and settled[1] is not None:
+                cur.execute("UPDATE runs SET cost_reserved_usd = GREATEST(0, cost_reserved_usd - %s) "
+                            "WHERE id = %s", (settled[1], run_id))
         cur.execute("""
             INSERT INTO llm_calls
             (run_id, step_id, model, prompt, response,
              prompt_tokens, completion_tokens, latency_ms, cost_usd, created_at,
              status, error_message, operation_name, attempt_number, retry_count, provider_request_id,
-             logical_call_id, pricing_version, run_attempt)
+             logical_call_id, pricing_version, cost_status, cost_upper_bound_usd, usage_missing,
+             reservation_id, execution_generation, run_attempt)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
-                    (SELECT attempt FROM runs WHERE id = %s))
+                    %s, %s, %s, %s, %s, (SELECT attempt FROM runs WHERE id = %s))
         """, (
             run_id, step_id, settings.gemini_model, prompt, response_text,
             prompt_tokens, completion_tokens, latency_ms, cost, utcnow(),
             status, error_message, operation, attempt_number, retry_count, provider_request_id,
-            logical_call_id, pricing_version, run_id
+            logical_call_id, pricing_version, cost_status, cost_upper_bound, bool(usage_missing),
+            reservation_id, generation, run_id
         ))
 
 
@@ -469,6 +536,23 @@ LLM_HTTP_MAX_ATTEMPTS = 4
 LLM_BACKOFF_BASE = 1.0      # seconds; exponential: 1, 2, 4 ...
 LLM_BACKOFF_CAP = 30.0      # never sleep longer than this between HTTP attempts
 _TRANSIENT_CODES = {ErrorCode.LLM_UNAVAILABLE, ErrorCode.LLM_RATE_LIMITED}
+_SLEEP_SLICE = 0.5          # retry sleeps wake this often to check run ownership
+
+# Failures where the provider REJECTED the request before doing any work, so
+# nothing was billed. Everything else that fails after dispatch (timeout,
+# connection reset, 5xx, unexpected SDK error) may have been processed and billed:
+# its cost is UNKNOWN, bounded by the reservation.
+_NOT_BILLED_CODES = {ErrorCode.LLM_RATE_LIMITED, ErrorCode.LLM_QUOTA_EXHAUSTED,
+                     ErrorCode.LLM_NOT_CONFIGURED}
+_NOT_BILLED_MARKERS = ("401", "403", "400 ", "400:", "invalid_argument", "permission_denied",
+                       "unauthenticated", "api key not valid")
+
+
+def _failure_not_billed(exc, code):
+    if code in _NOT_BILLED_CODES:
+        return True
+    low = str(exc).lower()
+    return any(m in low for m in _NOT_BILLED_MARKERS)
 
 
 def _backoff_seconds(attempt, exc=None):
@@ -485,9 +569,35 @@ def _backoff_seconds(attempt, exc=None):
     return random.uniform(0, ceiling)
 
 
+def _interruptible_sleep(seconds, budget):
+    """Sleep between HTTP attempts. With a durable budget the sleep is cut into
+    _SLEEP_SLICE pieces and run ownership is checked before each one, so a worker
+    that lost the run stops immediately instead of sleeping up to 30s and then
+    making another request (the next reservation is generation-fenced as well)."""
+    seconds = max(0.0, float(seconds))
+    check = getattr(budget, "check_owner", None)
+    if check is None:
+        time.sleep(seconds)
+        return
+    remaining = seconds
+    while remaining > 0:
+        check()                                  # raises ExecutionLost
+        step = min(_SLEEP_SLICE, remaining)
+        time.sleep(step)
+        remaining -= step
+    check()
+
+
 def logged_llm_call(prompt, run_id, step_id, operation="llm_call",
                     max_retries=LLM_HTTP_MAX_ATTEMPTS, budget=None):
-    from pricing import estimate_cost
+    """One LOGICAL model call: up to max_retries HTTP attempts, each one
+      1. budget-checked AND reserved immediately before dispatch — with a durable
+         budget (budget.reserve_attempt) this is one fenced transaction that proves
+         ownership and reserves the request's MAXIMUM cost against the USD cap;
+      2. recorded as exactly one llm_calls row whose reservation is settled in the
+         same transaction, with an explicit cost_status.
+    """
+    from pricing import estimate_cost, max_request_cost
     logical_call_id = str(uuid.uuid4())
     last_error = None
     if not settings.gemini_api_key:
@@ -497,9 +607,18 @@ def logged_llm_call(prompt, run_id, step_id, operation="llm_call",
         # Refused locally: no HTTP request and no budget reservation.
         raise QuotaCircuitOpen(
             f"quota exhausted (circuit open for {remaining:.0f}s more) — {operation} skipped")
+    prompt_bytes = len((prompt or "").encode("utf-8"))
+    reserve = getattr(budget, "reserve_attempt", None)
+    generation = getattr(budget, "generation", None)
     for attempt in range(1, max_retries + 1):
-        # Budget enforced HERE at the true unit (one HTTP attempt); retries count.
-        if budget is not None:
+        # Upper bound of THIS request's cost, priced at dispatch time.
+        projected = max_request_cost(settings.gemini_model, prompt_bytes,
+                                     settings.llm_max_output_tokens)
+        reservation = None
+        if reserve is not None:
+            reservation = reserve(projected, operation)   # raises BudgetExceeded family /
+                                                          # ExecutionLost; never returns None
+        elif budget is not None:
             if not budget.can_spend():
                 raise BudgetExceeded(
                     f"LLM budget reached before attempt {attempt} of {operation}")
@@ -507,34 +626,31 @@ def logged_llm_call(prompt, run_id, step_id, operation="llm_call",
         start = time.time()
         try:
             result = real_llm_once(prompt)
-            latency_ms = int((time.time() - start) * 1000)
-            prompt_tokens = result["prompt_tokens"]
-            completion_tokens = result["completion_tokens"]
-            cost, pricing_version = estimate_cost(settings.gemini_model,
-                                                  prompt_tokens, completion_tokens)
-            if result.get("usage_missing"):
-                log.warning("llm %s: provider response had no usage metadata — "
-                            "tokens/cost recorded as 0", operation,
-                            extra={"run_id": run_id, "step_id": step_id})
-            _log_llm_attempt(
-                run_id, step_id, operation, prompt, result["text"],
-                prompt_tokens, completion_tokens, latency_ms, cost,
-                "success", None, attempt, attempt - 1, result.get("provider_request_id"),
-                logical_call_id=logical_call_id, pricing_version=pricing_version,
-            )
-            return result["text"]
-        except BudgetExceeded:
-            raise   # budget stop is not transient — propagate, no retry
         except Exception as e:
             latency_ms = int((time.time() - start) * 1000)
             last_error = e
             code = classify_exception(e)
             transient = code in _TRANSIENT_CODES   # quota exhaustion is NOT transient
+            pt = getattr(e, "prompt_tokens", None)
+            ct = getattr(e, "completion_tokens", None)
+            if pt is not None and ct is not None:
+                cost, pricing_version = estimate_cost(settings.gemini_model, pt, ct)
+                cost_status = "priced" if cost is not None else "unknown"
+            elif _failure_not_billed(e, code):
+                cost, pricing_version, cost_status = None, None, "not_billed"
+            else:
+                # Failed AFTER dispatch with no usage: the provider may have
+                # processed (and billed) it. Unknown, bounded by the reservation.
+                cost, pricing_version, cost_status = None, None, "unknown"
             _log_llm_attempt(
                 run_id, step_id, operation, prompt, None,
-                0, 0, latency_ms, 0,
+                pt, ct, latency_ms, cost,
                 "failed", redact_secrets(e), attempt, attempt - 1, None,
-                logical_call_id=logical_call_id,
+                logical_call_id=logical_call_id, pricing_version=pricing_version,
+                cost_status=cost_status,
+                cost_upper_bound=projected if cost_status == "unknown" else None,
+                usage_missing=cost_status == "unknown", reservation=reservation,
+                generation=generation,
             )
             if code == ErrorCode.LLM_QUOTA_EXHAUSTED:
                 _open_quota_breaker(settings.gemini_model)
@@ -543,7 +659,28 @@ def logged_llm_call(prompt, run_id, step_id, operation="llm_call",
             wait = _backoff_seconds(attempt, e)
             log.warning("llm %s: %s — retry %s/%s in %.1fs", operation, code,
                         attempt, max_retries - 1, wait)
-            time.sleep(wait)
+            _interruptible_sleep(wait, budget)
+            continue
+        latency_ms = int((time.time() - start) * 1000)
+        prompt_tokens = result["prompt_tokens"]
+        completion_tokens = result["completion_tokens"]
+        cost, pricing_version = estimate_cost(settings.gemini_model,
+                                              prompt_tokens, completion_tokens)
+        if result.get("usage_missing"):
+            log.warning("llm %s: provider response had no usage metadata — cost recorded "
+                        "as UNKNOWN (bounded by the reservation)", operation,
+                        extra={"run_id": run_id, "step_id": step_id})
+        _log_llm_attempt(
+            run_id, step_id, operation, prompt, result["text"],
+            prompt_tokens, completion_tokens, latency_ms, cost,
+            "success", None, attempt, attempt - 1, result.get("provider_request_id"),
+            logical_call_id=logical_call_id, pricing_version=pricing_version,
+            cost_status="priced" if cost is not None else "unknown",
+            cost_upper_bound=projected if cost is None else None,
+            usage_missing=bool(result.get("usage_missing")), reservation=reservation,
+            generation=generation,
+        )
+        return result["text"]
     if last_error:
         raise last_error
 

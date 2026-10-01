@@ -160,8 +160,16 @@ def heartbeat(job_id, lease_token):
         cur.execute("""
             UPDATE job_queue SET heartbeat_at = %s
             WHERE id = %s AND status = 'running' AND lease_token = %s
+            RETURNING run_id
         """, (utcnow(), job_id, lease_token))
-        owned = cur.rowcount == 1
+        row = cur.fetchone()
+        owned = row is not None
+        if owned and row[0] is not None:
+            # Runtime accounting: the latest moment this worker was provably alive
+            # while executing. If it dies, begin_execution() charges its open
+            # interval only up to here + EXECUTION_HEARTBEAT_GRACE_SECONDS.
+            cur.execute("UPDATE runs SET execution_heartbeat_at = NOW() "
+                        "WHERE id = %s AND execution_started_at IS NOT NULL", (row[0],))
         return owned
 
 

@@ -21,6 +21,7 @@ Fresh install:  `python migrate.py` on an EMPTY database applies 0001_baseline a
 Existing DB:    `python migrate.py` applies only what's pending. 0001_baseline is
                 idempotent (IF NOT EXISTS) so a pre-migration DB is adopted safely.
 """
+from contextlib import contextmanager
 from timeutil import utcnow
 import os
 import re
@@ -39,6 +40,40 @@ _FILE_RE = re.compile(r"^(\d{4})_([A-Za-z0-9_]+)\.py$")
 def _connect():
     settings.validate_db()
     return psycopg2.connect(**settings.db_kwargs())
+
+
+# Advisory-lock key for ALL schema changes (app migrations + LangGraph checkpoint
+# setup). Namespace 0x4147 ("AG") is shared with run_lock; key 0 is reserved for the
+# schema and can never collide with a run id (run ids start at 1).
+SCHEMA_LOCK_KEY = (0x4147, 0)
+SCHEMA_LOCK_TIMEOUT_SECONDS = 600
+
+
+@contextmanager
+def schema_lock(timeout=SCHEMA_LOCK_TIMEOUT_SECONDS):
+    """Hold the global schema-migration lock for the duration of the block.
+
+    A SESSION-level advisory lock on a dedicated connection: it spans every
+    per-migration transaction (discover -> read applied -> apply -> record), so two
+    replicas deploying at the same time cannot both apply the same migration — the
+    second one waits, then re-reads schema_migrations and finds nothing pending. If
+    the holder dies, PostgreSQL releases the lock with its session."""
+    conn = _connect()
+    conn.autocommit = True
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SET lock_timeout = %s", (f"{int(timeout)}s",))
+            cur.execute("SELECT pg_advisory_lock(%s, %s)", SCHEMA_LOCK_KEY)
+        try:
+            yield
+        finally:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT pg_advisory_unlock(%s, %s)", SCHEMA_LOCK_KEY)
+            except Exception:
+                pass                         # closing the session releases it anyway
+    finally:
+        conn.close()
 
 
 def _ensure_tracking_table(cur):
@@ -89,10 +124,18 @@ def status():
 
 
 def migrate():
+    """Apply every pending migration, holding the global schema lock throughout."""
+    with schema_lock():
+        _migrate_locked()
+
+
+def _migrate_locked():
     conn = _connect()
     cur = conn.cursor()
     _ensure_tracking_table(cur)
     conn.commit()
+    # Read the applied set only AFTER taking the lock: a concurrent deployer that
+    # held it first has already applied (and recorded) what it found pending.
     applied = _applied_versions(cur)
 
     pending = [(v, n, p) for (v, n, p) in _discover() if v not in applied]
@@ -108,7 +151,7 @@ def migrate():
             upgrade(cur)                     # each migration is one transaction
             cur.execute(
                 "INSERT INTO schema_migrations (version, migration_name, applied_at) "
-                "VALUES (%s, %s, %s) ON CONFLICT (version) DO NOTHING",
+                "VALUES (%s, %s, %s)",
                 (version, name, utcnow()),
             )
             conn.commit()

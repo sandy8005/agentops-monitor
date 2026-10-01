@@ -199,6 +199,12 @@ def _tech_terms_in(text):
     return found
 
 
+_CREDENTIAL_RE = re.compile(
+    r"\b(certified|certification|certificate|licen[cs]ed|licen[cs]e|accredited|"
+    r"chartered|ph\.?d|doctorate|master'?s|mba|m\.?sc|bachelor'?s|b\.?sc|degree|"
+    r"diploma|award(?:ed)?|patent(?:ed)?|pmp|cissp|cfa|cpa)\b", re.IGNORECASE)
+
+
 def validate_rewrite(original, suggested, resume_text, job_terms=()):
     """(status, notes). 'rejected' for invented facts; 'needs_confirmation' for
     changes a human must check; 'validated' otherwise."""
@@ -229,6 +235,20 @@ def validate_rewrite(original, suggested, resume_text, job_terms=()):
     # Polarity must not change: "Never built X" -> "Built X" inverts the claim (N02).
     if _has_negation(original) != _has_negation(suggested):
         return "rejected", "changes a negative statement into a positive one (or vice versa)"
+
+    # Competency level must not be upgraded: "currently learning Kubernetes" ->
+    # "experienced in Kubernetes" invents experience exactly like a polarity flip.
+    from skills import _UNCERTAIN_CUE_RE
+    if _UNCERTAIN_CUE_RE.search(original.lower()) and not _UNCERTAIN_CUE_RE.search(suggested.lower()):
+        return "rejected", "turns an aspirational/learning mention into a claim of experience"
+
+    # Credentials are facts: a certification, licence, degree or award that the
+    # original line does not state is never added by a rewrite.
+    orig_low = original.lower()
+    new_creds = sorted({m.group(0).lower() for m in _CREDENTIAL_RE.finditer(suggested)
+                        if m.group(0).lower() not in orig_low})
+    if new_creds:
+        return "rejected", f"adds a credential not in the original: {new_creds[:3]}"
 
     orig_words = set(re.findall(r"[a-z]+", original.lower()))
     inflated = [w for w in re.findall(r"[a-z]+", suggested.lower())
@@ -278,9 +298,14 @@ CANDIDATE LINES: {wrap_untrusted(json.dumps(facts), "RESUME_LINES")}
 JOB TITLE: {wrap_untrusted(job.get("title", ""), "JOB_TITLE")}
 REQUIRED SKILLS: {wrap_untrusted(json.dumps((requirements or {}).get("required_skills", [])), "REQUIRED")}
 """
+    from llm import ModelOutputInvalid
     raw = logged_llm_call(prompt, run_id, step_id, operation="resume_rewrite", budget=budget)
-    cleaned = raw.strip().replace("```json", "").replace("```", "").strip()
-    return _RewriteList(**json.loads(cleaned)).rewrites
+    cleaned = (raw or "").strip().replace("```json", "").replace("```", "").strip()
+    try:
+        return _RewriteList(**json.loads(cleaned)).rewrites
+    except (json.JSONDecodeError, ValidationError, TypeError) as e:
+        # Unusable MODEL output — a degraded-model condition, distinct from a bug.
+        raise ModelOutputInvalid(f"rewrite output invalid ({type(e).__name__})") from None
 
 
 def build_suggestions(parsed_resume, resume_text, job, requirements, score_result,
@@ -324,10 +349,18 @@ def build_suggestions(parsed_resume, resume_text, job, requirements, score_resul
                 "method": "gemini", "status": status, "validation_notes": vnotes,
             })
         note = "rules + gemini wording"
-    except (ValidationError, ValueError) as e:
-        note = f"rules (gemini output invalid: {type(e).__name__})"
-    except Exception as e:     # budget, quota, outage — explicit, not silent
-        note = f"rules (gemini unavailable: {type(e).__name__})"
+    except Exception as e:
+        # ONLY a degraded model keeps the rule suggestions and moves on: invalid
+        # model output, or not configured / budget / cost / quota / outage. A
+        # database error, lost ownership or a programming error propagates — the
+        # advice step fails visibly instead of silently shipping "rules only".
+        from llm import ModelOutputInvalid, is_degraded_model_error
+        if isinstance(e, ModelOutputInvalid):
+            note = "rules (gemini output invalid)"
+        elif is_degraded_model_error(e):
+            note = f"rules (gemini unavailable: {type(e).__name__})"
+        else:
+            raise
     return suggestions, note
 
 

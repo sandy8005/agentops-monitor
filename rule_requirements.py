@@ -46,10 +46,49 @@ def _skill_in(skill, text_lower, tokens):
     return s in tokens
 
 
+_YEARS_RE = re.compile(r"(\d{1,2})\s*(?:\+|plus)?\s*(?:(?:-|–|to)\s*\d{1,2}\s*)?years?\b")
+# Sentence-level context that makes a "N years" mention NOT a minimum requirement.
+_YEARS_NOT_REQUIRED = re.compile(
+    r"\b(preferred|nice to have|nice-to-have|bonus|a plus|is a plus|ideally|desirable|"
+    r"advantageous|would be great)\b")
+_YEARS_CONDITIONAL = re.compile(
+    r"\b(for (the )?(manager|management|lead|leadership|senior|principal|staff)\b|"
+    r"if applying|for this level)")
+_YEARS_NOT_EXPERIENCE = re.compile(
+    r"\b(years? old|years? ago|past \d{1,2} years|last \d{1,2} years|founded|in business|"
+    r"for over \d{1,2} years|we have been|our company|growing for|contract length|"
+    r"(\d{1,2})[- ]year (contract|term|warranty|commitment))")
+
+
 def _years_from_text(text_lower):
-    """Find a 'N years' minimum-experience mention, if any."""
-    m = re.search(r"(\d+)\+?\s*years?", text_lower)
-    return float(m.group(1)) if m else 0.0
+    """Minimum years of experience from a posting, as a DEGRADED fallback.
+
+    Each "N years" / "N+ years" / "N-M years" mention is judged by its own
+    SENTENCE, not by a small character window:
+      * skipped when the sentence marks it as preferred / a bonus,
+      * skipped when it is conditional on another role ("5 years ... for the
+        manager track"),
+      * skipped when it is not about experience (company age, "years ago",
+        contract length).
+    Among the remaining mentions the SMALLEST is returned: when a posting states
+    several ("3 years Python, 5 years overall") the lowest one is the only value
+    that is a stated minimum for the whole role; a range "3-5 years" counts as 3.
+    Returns 0.0 when nothing qualifies (unknown, not "requires zero years").
+
+    This cannot build required_any_of groups or read structure; the extraction is
+    tagged requirements_method=rule_based wherever it is used, and matches that
+    rest only on it can be excluded (require_verified_matches)."""
+    found = []
+    for sentence in re.split(r"(?<=[.;!?\n])\s+|\n+|•|\u2022", text_lower):
+        for m in _YEARS_RE.finditer(sentence):
+            n = int(m.group(1))
+            if not 0 < n <= 30:
+                continue
+            if (_YEARS_NOT_REQUIRED.search(sentence) or _YEARS_CONDITIONAL.search(sentence)
+                    or _YEARS_NOT_EXPERIENCE.search(sentence)):
+                continue
+            found.append(float(n))
+    return min(found) if found else 0.0
 
 
 def extract_requirements_rule_based(job):

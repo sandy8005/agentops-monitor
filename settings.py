@@ -151,6 +151,11 @@ class Settings:
         # memory:// storage is per-process, so N processes allow N x the limit.
         self.rate_limit_login = r.str("RATE_LIMIT_LOGIN", "5/minute")
         self.rate_limit_runs = r.str("RATE_LIMIT_RUNS", "20/minute")
+        self.rate_limit_upload = r.str("RATE_LIMIT_UPLOAD", "10/minute")
+        # Hard cap on the /upload request body (bytes), enforced while streaming —
+        # before the body is buffered. Keep the reverse proxy's limit at or below it.
+        self.max_upload_bytes = r.int("MAX_UPLOAD_BYTES", 5 * 1024 * 1024,
+                                      min_value=1024, max_value=50 * 1024 * 1024)
         self.rate_limit_storage_uri = r.str("RATE_LIMIT_STORAGE_URI", "memory://")
 
         # Trace retention: sensitive payloads of runs that ended more than this many
@@ -174,6 +179,20 @@ class Settings:
                                                    None, min_value=0.0)
         self.llm_output_price_per_million = r.float("LLM_OUTPUT_PRICE_PER_MILLION",
                                                     None, min_value=0.0)
+        # Hard output cap sent with EVERY model request (max_output_tokens; thinking
+        # tokens count against it). It is also the output side of the dollar
+        # reservation made before each request, so a USD cap can be proven.
+        self.llm_max_output_tokens = r.int("LLM_MAX_OUTPUT_TOKENS", 8192,
+                                           min_value=256, max_value=65536)
+        # Input-token upper bound used for the reservation: prompt UTF-8 bytes /
+        # this value. 1.0 is a true bound (a token never covers less than a byte).
+        self.llm_reserve_bytes_per_token = r.float("LLM_RESERVE_BYTES_PER_TOKEN", 1.0,
+                                                   min_value=0.5, max_value=4.0)
+        # Runtime accounting after a worker crash: the dead worker's open execution
+        # interval is charged up to its LAST HEARTBEAT plus this grace (not up to
+        # the moment a replacement starts).
+        self.execution_heartbeat_grace_seconds = r.int("EXECUTION_HEARTBEAT_GRACE_SECONDS",
+                                                       45, min_value=0, max_value=3600)
 
         # --- LangGraph checkpoint hardening (see os.environ.setdefault above) ---
         self.langgraph_strict_msgpack = r.bool("LANGGRAPH_STRICT_MSGPACK", True)

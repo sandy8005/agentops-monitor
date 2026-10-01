@@ -17,14 +17,11 @@ GENERIC_ROLE_WORDS = {
 
 STALE_AFTER_DAYS = 14   # jobs not seen in this many days drop out of search
 
-# Which sources count as LIVE (real-time feeds) vs. practice data (seed/CSV/scraped).
-# Live Mode reads ONLY live sources, so a live search is never polluted by the
-# built-in sample/practice pool.
-# "live" is the LEGACY name Remotive rows were stored under; migration 0009 renames
-# them to "remotive". It stays recognised so an un-migrated row is still classified
-# correctly (never as practice data).
-LIVE_SOURCES = {"adzuna", "remotive", "live"}
-PRACTICE_SOURCES = {"seed", "csv", "scraped", "api"}
+# The only job sources in scope are the two live providers. Seed / CSV / scraped
+# "practice" data and the mixed "pool" mode were removed: every search reads live
+# postings that THIS run fetched, nothing else. Rows with any other source (left
+# over from an old database) are never returned.
+LIVE_SOURCES = frozenset({"adzuna", "remotive"})
 
 
 # --- Role aliases: expand a query term into equivalent phrases/abbreviations. ---
@@ -156,9 +153,8 @@ def _role_matcher(target_role):
 
 
 # Source preference: when two rows are the same posting, keep the better one.
-# Adzuna (real search) > Remotive > api > scraped > csv > seed.
-_SOURCE_RANK = {"adzuna": 5, "remotive": 4, "live": 4, "api": 3, "scraped": 2,
-                "csv": 1, "seed": 0}
+# Adzuna (real role+location search) > Remotive (remote-only feed).
+_SOURCE_RANK = {"adzuna": 1, "remotive": 0}
 
 # Seniority is BUSINESS-SIGNIFICANT: "Senior AI Engineer" and "Junior AI Engineer" at
 # the same company/location are different requisitions, so seniority stays in the
@@ -446,22 +442,56 @@ _REGION_TERMS = {
               "argentina", "colombia", "chile"},
     "uk": {"uk", "u.k.", "united kingdom", "great britain", "britain", "england",
            "scotland", "wales"},
-    "europe": {"europe", "eu", "european union", "eea", "emea", "germany", "france",
+    # EUROPE is a continent. "EMEA" is NOT a synonym for it: EMEA is a larger
+    # region that also contains the Middle East and Africa (see _REGION_PARENTS).
+    "europe": {"europe", "eu", "european union", "eea", "germany", "france",
                "spain", "italy", "netherlands", "poland", "portugal", "ireland",
                "sweden", "switzerland", "austria", "belgium", "denmark", "norway",
                "finland"},
+    "emea": {"emea"},
     "apac": {"apac", "asia", "asia pacific", "india", "japan", "singapore",
              "australia", "new zealand", "philippines", "indonesia", "vietnam",
              "china", "korea"},
     "africa": {"africa", "nigeria", "kenya", "south africa", "egypt"},
     "middle_east": {"middle east", "uae", "saudi arabia", "israel", "qatar"},
 }
-# Regions that CONTAIN others (a posting open to "North America" accepts a US
-# candidate; "EMEA"/"Europe" accept the UK).
+# Containment hierarchy, child -> ALL ancestors (transitively closed):
+#
+#   north_america ── us, canada
+#   emea ─┬─ europe ── uk
+#         ├─ middle_east
+#         └─ africa
+#
+# A posting open to a PARENT accepts a candidate in any CHILD ("EMEA" accepts a
+# UAE candidate; "Europe" accepts a UK candidate). SIBLINGS never accept each
+# other: a Middle East posting does NOT accept a German candidate, and an Africa
+# posting does NOT accept a French one.
 _REGION_PARENTS = {
-    "us": {"north_america"}, "canada": {"north_america"},
-    "uk": {"europe"}, "middle_east": {"europe"}, "africa": {"europe"},
+    "us": {"north_america"},
+    "canada": {"north_america"},
+    "uk": {"europe", "emea"},
+    "europe": {"emea"},
+    "middle_east": {"emea"},
+    "africa": {"emea"},
 }
+
+
+# Terms that name a REGION itself (not one country inside it). Only a candidate who
+# names a region can be "broader" than a posting; one who names a country is not.
+_REGION_LEVEL_TERMS = {
+    "north_america": {"north america", "americas"},
+    "latam": {"latam", "latin america", "south america"},
+    "europe": {"europe", "eu", "european union", "eea"},
+    "emea": {"emea"},
+    "apac": {"apac", "asia", "asia pacific"},
+    "africa": {"africa"},
+    "middle_east": {"middle east"},
+}
+
+
+def _region_level_named(text):
+    low = f" {' '.join(re.split(r'[^a-z0-9.]+', (text or '').lower()))} "
+    return {r for r, terms in _REGION_LEVEL_TERMS.items() if any(f" {t} " in low for t in terms)}
 
 
 def _regions_in(text):
@@ -492,53 +522,50 @@ def geo_eligibility(job, requested_location):
     req_regions = _regions_in(req)
     if not req_regions:
         return "unknown"
-    expanded_req = set(req_regions)
+    # The candidate is eligible when the posting's region is the candidate's own
+    # region OR one of its ANCESTORS (a "Europe" posting accepts a UK candidate).
+    # The reverse is not true: a "UK only" posting does not accept a candidate who
+    # only said "Europe" — unless the candidate's text ALSO names a region the
+    # posting covers. Siblings (Europe vs Middle East) never match.
+    candidate_scope = set(req_regions)
     for r in req_regions:
-        expanded_req |= _REGION_PARENTS.get(r, set())
-    expanded_job = set(job_regions)
-    for r in job_regions:
-        expanded_job |= _REGION_PARENTS.get(r, set())
-    if expanded_req & job_regions or req_regions & expanded_job:
+        candidate_scope |= _REGION_PARENTS.get(r, set())
+    if job_regions & candidate_scope:
         return "eligible"
+    # The candidate named a BROADER region than the posting ("EMEA" vs a
+    # "Europe only" posting): they may or may not be inside it — ambiguous, kept.
+    named = _region_level_named(req)
+    for jr in job_regions:
+        if _REGION_PARENTS.get(jr, set()) & named:
+            return "unknown"
     return "ineligible"
 
 
 def search_jobs(target_role=None, location=None, work_mode=None,
-                employment_type=None, live_only=False, run_id=None):
+                employment_type=None, run_id=None):
     """
-    Search the job pool.
+    Search the postings THIS run fetched from the live providers (Adzuna/Remotive).
 
-    Sources are now separated:
-      - live_only=True  → LIVE MODE: read ONLY live-sourced jobs (Adzuna/Remotive),
-        never the seed/CSV/scraped practice pool. When run_id is given, scope further
-        to just the postings THIS run fetched live (its per-search associations), so
-        a live search returns exactly what this run pulled — nothing stale, nothing
-        from other runs, no practice data.
-      - live_only=False → MIXED MODE (default/back-compat): the combined pool, with
-        practice data treated as location-agnostic (kept for every location).
+    run_id is required: a search returns exactly what this run's own provider
+    searches returned (job_search_results), filtered by role / location / work
+    mode / employment type, freshness-checked and de-duplicated. Nothing from
+    other runs and nothing from a non-live source is ever returned.
 
-    Location filtering uses the PER-SEARCH ASSOCIATION (job_search_results), not a
-    permanent search_location column: a job matches a location if some search for
-    that location returned it. Practice jobs (no association) stay location-agnostic
-    in mixed mode. Remote postings from a provider that doesn't geo-filter are kept
+    Location uses the PER-SEARCH ASSOCIATION: a posting matches a location if one
+    of this run's GEO-FILTERED searches (Adzuna) returned it for that location.
+    Remote postings from a provider that does not geo-filter (Remotive) are kept
     unless their stated candidate region clearly excludes the requested location
     (geo_eligibility); each returned job is annotated with "geo_eligibility".
-
-    target_role is optional: without it, every fresh job passes the role filter, but
-    the location / work-mode / employment-type filters and de-duplication still run.
     """
+    if run_id is None:
+        raise ValueError("search_jobs requires the run_id whose searches to read")
     with get_connection() as conn:
         cur = conn.cursor()
-        # Pull provenance (source) and, via the association join, the set of locations
-        # any search has ever returned this posting for. search_location is no longer
-        # read for filtering (kept only until a later migration drops it).
         cur.execute("""
             SELECT p.id, p.title, p.company, p.description, p.location, p.work_mode,
                    p.employment_type, p.source, p.external_id, p.last_seen_at, p.apply_url,
                    -- Only searches whose provider actually GEO-FILTERED count as
-                   -- "returned for this location". Remotive is remote-only and
-                   -- ignores location, so its searches carry
-                   -- location_filter_applied = FALSE and are not a location match.
+                   -- "returned for this location" (Remotive ignores location).
                    COALESCE(
                        ARRAY_AGG(DISTINCT lower(s.location))
                        FILTER (WHERE s.location IS NOT NULL
@@ -546,128 +573,88 @@ def search_jobs(target_role=None, location=None, work_mode=None,
                        '{}'
                    ) AS assoc_locations
             FROM job_postings p
-            LEFT JOIN job_search_results r ON r.job_id = p.id
-            LEFT JOIN job_searches s ON s.id = r.search_id
+            JOIN job_search_results r ON r.job_id = p.id
+            JOIN job_searches s ON s.id = r.search_id
+            WHERE s.run_id = %s AND lower(p.source) = ANY(%s)
             GROUP BY p.id
             ORDER BY p.id
-        """)
+        """, (run_id, sorted(LIVE_SOURCES)))
         rows = cur.fetchall()
 
-        # For Live Mode scoped to a single run, which postings did THIS run fetch?
-        run_job_ids = set()
-        if live_only and run_id is not None:
-            cur.execute("""
-                SELECT DISTINCT r.job_id
-                FROM job_search_results r
-                JOIN job_searches s ON s.id = r.search_id
-                WHERE s.run_id = %s
-            """, (run_id,))
-            run_job_ids = {row[0] for row in cur.fetchall()}
+    all_jobs = [
+        {"id": r[0], "title": r[1], "company": r[2], "description": r[3],
+         "location": r[4], "work_mode": r[5], "employment_type": r[6], "source": r[7],
+         "external_id": r[8], "last_seen_at": r[9], "apply_url": r[10],
+         "assoc_locations": set(r[11] or [])}
+        for r in rows
+    ]
 
-        all_jobs = [
-            {"id": r[0], "title": r[1], "company": r[2], "description": r[3],
-             "location": r[4], "work_mode": r[5], "employment_type": r[6], "source": r[7],
-             "external_id": r[8], "last_seen_at": r[9], "apply_url": r[10],
-             "assoc_locations": set(r[11] or [])}
-            for r in rows
-        ]
+    # --- freshness: a live posting must have been seen within the window; a row
+    # with no last_seen_at is treated as STALE, never as "fresh forever".
+    cutoff = utcnow() - timedelta(days=STALE_AFTER_DAYS)
 
-        # --- source separation: Live Mode excludes all practice data ---
-        if live_only:
-            all_jobs = [j for j in all_jobs if (j.get("source") or "").lower() in LIVE_SOURCES]
-            # When a run_id is given, restrict to postings THIS run actually fetched.
-            if run_id is not None:
-                all_jobs = [j for j in all_jobs if j["id"] in run_job_ids]
+    def _is_fresh(job):
+        ls = job.get("last_seen_at")
+        if ls is None:
+            return False
+        if ls.tzinfo is None:   # defensive: legacy naive value
+            ls = ls.replace(tzinfo=cutoff.tzinfo)
+        return ls >= cutoff
+    all_jobs = [j for j in all_jobs if _is_fresh(j)]
 
-        # --- freshness filter: drop jobs not seen recently ---
-        # Practice data (seed/csv/scraped) has no sighting time and is always kept.
-        # A LIVE posting must have been seen within the window; a live row with no
-        # last_seen_at is treated as STALE, never as "fresh forever".
-        cutoff = utcnow() - timedelta(days=STALE_AFTER_DAYS)
-        def _is_fresh(job):
-            ls = job.get("last_seen_at")
-            if ls is None:
-                return (job.get("source") or "").lower() not in LIVE_SOURCES
-            if ls.tzinfo is None:   # defensive: legacy naive value
-                ls = ls.replace(tzinfo=cutoff.tzinfo)
-            return ls >= cutoff
-        all_jobs = [j for j in all_jobs if _is_fresh(j)]
+    # --- role filter: whole-word specializing-term match (optional) ---
+    if target_role and target_role.strip():
+        role_matches = _role_matcher(target_role)
+        filtered = [j for j in all_jobs if role_matches(j)]
+    else:
+        filtered = list(all_jobs)
 
-        # --- role filter: whole-word specializing-term match ---
-        # OPTIONAL: with no target role every (fresh) job is a role match, but the
-        # location / work-mode / employment-type filters and de-duplication below
-        # still apply — the function's contract doesn't change with the role.
-        if target_role and target_role.strip():
-            role_matches = _role_matcher(target_role)
-            filtered = [j for j in all_jobs if role_matches(j)]
-        else:
-            filtered = list(all_jobs)
+    # --- location filter (via PER-SEARCH association) ---
+    if location and location.strip():
+        loc = location.strip().lower()
 
-        # --- location filter (via PER-SEARCH association, not a permanent column) ---
-        # A job matches the requested location if SOME search for that location
-        # returned it (its assoc_locations contains the request). A job with no
-        # association at all (seed/csv/scraped practice data) is location-agnostic and
-        # kept — but only in mixed mode; in Live Mode there is no practice data and
-        # every live job carries the association from the search that fetched it.
-        if location and location.strip():
-            loc = location.strip().lower()
+        def location_ok(job):
+            assoc = job.get("assoc_locations") or set()
+            if assoc:
+                return loc in assoc
+            # A remote-only provider that doesn't filter by location. "Remote" is a
+            # WORK MODE, not worldwide eligibility: exclude only when the posting's
+            # stated candidate region clearly excludes the requested location.
+            return geo_eligibility(job, location) != "ineligible"
 
-            def location_ok(job):
-                assoc = job.get("assoc_locations") or set()
-                if assoc:
-                    return loc in assoc  # matched by at least one geo-filtered search
-                # No geo-filtered association: practice data, or a remote-only
-                # provider that doesn't filter by location. "Remote" is a WORK MODE,
-                # not worldwide eligibility: exclude only when the posting's stated
-                # candidate region clearly excludes the requested location.
-                return geo_eligibility(job, location) != "ineligible"
+        filtered = [j for j in filtered if location_ok(j)]
+        for j in filtered:
+            j["geo_eligibility"] = ("matched_search" if j.get("assoc_locations")
+                                    else geo_eligibility(j, location))
 
-            filtered = [j for j in filtered if location_ok(j)]
-            for j in filtered:
-                j["geo_eligibility"] = ("matched_search" if j.get("assoc_locations")
-                                        else geo_eligibility(j, location))
+    # --- work_mode filter (compatibility, not "remote is always OK") ---
+    if work_mode:
+        wm = work_mode.lower().strip()
 
-        # --- work_mode filter (compatibility, not "remote is always OK") ---
-        # A job matches if: its mode is unknown (soft — don't exclude), OR equals the
-        # request, OR hybrid is involved (partial match either way). A remote job is
-        # correctly EXCLUDED from an onsite request (and vice versa).
-        if work_mode:
-            wm = work_mode.lower().strip()
+        def mode_ok(job):
+            jm = (job.get("work_mode") or "").lower().strip()
+            jl = (job.get("location") or "").lower()
+            if not jm and "remote" in jl:
+                jm = "remote"
+            if not jm:
+                return True          # unknown mode → don't exclude (soft filter)
+            if wm == jm:
+                return True
+            if "hybrid" in (wm, jm):
+                return True          # hybrid is a partial match either direction
+            return False
 
-            def mode_ok(job):
-                jm = (job.get("work_mode") or "").lower().strip()
-                jl = (job.get("location") or "").lower()
-                if not jm and "remote" in jl:
-                    jm = "remote"
-                if not jm:
-                    return True          # unknown mode → don't exclude (soft filter)
-                if wm == jm:
-                    return True          # exact match
-                if "hybrid" in (wm, jm):
-                    return True          # hybrid is a partial match either direction
-                return False             # clear conflict (e.g. remote job, onsite request)
+        filtered = [j for j in filtered if mode_ok(j)]
 
-            filtered = [j for j in filtered if mode_ok(j)]
+    # --- employment_type filter (SOFT: keep unknown-type, exclude known mismatch) ---
+    if employment_type:
+        et = employment_type.lower().strip()
+        filtered = [j for j in filtered
+                    if not (j.get("employment_type") or "").strip()
+                    or (j.get("employment_type") or "").lower().strip() == et]
 
-        # --- employment_type filter (SOFT: keep unknown-type, exclude known mismatch) ---
-        if employment_type:
-            et = employment_type.lower().strip()
-
-            def type_ok(job):
-                jt = (job.get("employment_type") or "").lower().strip()
-                if not jt:
-                    return True
-                return jt == et
-
-            filtered = [j for j in filtered if type_ok(j)]
-
-        # Collapse same-posting duplicates that entered via multiple sources.
-        filtered = _dedupe_jobs(filtered)
-
-        # --- results handling: honest empty result, never manufactured jobs ---
-        if len(filtered) == 0:
-            log.info("no jobs matched '%s' with the given filters", target_role)
-            return []
-
-        log.info("%d of %d job(s) matched your criteria", len(filtered), len(all_jobs))
-        return filtered
+    filtered = _dedupe_jobs(filtered)
+    # Counts only — the query text is user input and stays out of the logs.
+    log.info("search matched %d of %d fetched posting(s)", len(filtered), len(all_jobs),
+             extra={"run_id": run_id})
+    return filtered

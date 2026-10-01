@@ -1,10 +1,12 @@
 // Cost cell: a total is only shown as a total when it is COMPLETE. A run with
-// unpriced model calls shows its known part as a lower bound plus the gap.
+// calls of unknown cost (usage missing / failed after dispatch) shows the known
+// part as a lower bound and the conservative upper bound.
 function formatCost(r) {
   if (r.cost_complete === false) {
-    return '<span title="partial: some calls have no known price">est. \u2265 $' +
-      escapeHtml(Number(r.known_cost_usd || 0).toFixed(6)) + ' (+' +
-      escapeHtml(r.unknown_cost_calls) + ' unpriced call(s))</span>';
+    return '<span title="partial: some calls have unknown cost">est. $' +
+      escapeHtml(Number(r.known_cost_usd || 0).toFixed(6)) + ' \u2013 $' +
+      escapeHtml(Number(r.cost_upper_bound_usd || 0).toFixed(6)) + ' (' +
+      escapeHtml(r.unknown_cost_calls) + ' call(s) with unknown cost)</span>';
   }
   return r.total_cost == null ? 'unknown' : 'est. $' + escapeHtml(Number(r.total_cost).toFixed(6));
 }
@@ -145,12 +147,13 @@ var NL = String.fromCharCode(10);
                 '<option value="rules_only">Rules only — no Gemini calls</option>' +
               '</select></div>' +
               '<div class="agent-opts">' +
-                '<label style="color:#e4e6eb;"><input type="checkbox" id="agent_' + r.id + '" style="width:auto;margin-right:6px;">Autonomous agent mode (adapts titles and providers until the goal is met or limits are reached)</label>' +
+                '<div style="color:#8b8f9c;">The agent adapts titles and providers until the goal is met, the search space is exhausted, or a hard limit is reached.</div>' +
                 '<div class="row" style="margin-top:6px;">' +
                   '<div><label>Target matches</label><br><input type="number" id="count_' + r.id + '" value="10" min="1" max="50" style="width:90%;"></div>' +
                   '<div><label>Seniority (fixed)</label><br><select id="sen_' + r.id + '" style="width:100%;">' +
                     '<option value="">(any)</option><option value="intern">intern</option><option value="entry">entry</option><option value="junior">junior</option><option value="mid">mid</option><option value="senior">senior</option>' +
                   '</select></div>' +
+                  '<div><label>Cost limit (USD, hard; 0 = none)</label><br><input type="number" id="cost_' + r.id + '" value="0.5" min="0" max="20" step="0.05" style="width:90%;"></div>' +
                 '</div>' +
                 '<label style="color:#e4e6eb;"><input type="checkbox" id="maybe_' + r.id + '" style="width:auto;margin-right:6px;">Count "Maybe" matches toward the goal</label><br>' +
                 '<label style="color:#e4e6eb;"><input type="checkbox" id="verified_' + r.id + '" style="width:auto;margin-right:6px;">Only count matches verified by the model or a human</label><br>' +
@@ -180,16 +183,16 @@ var NL = String.fromCharCode(10);
       const payload = { resume_id: Number(id), target_role: role, location: loc,
                         work_mode: mode, employment_type: emp, evaluate: doEval,
                         model_policy: document.getElementById('policy_' + id).value };
-      if (document.getElementById('agent_' + id).checked) {
-        payload.mode = 'agent';
-        payload.goal = {
-          target_count: Math.max(1, Math.min(50, Number(document.getElementById('count_' + id).value) || 10)),
-          seniority: document.getElementById('sen_' + id).value,
-          include_maybe: document.getElementById('maybe_' + id).checked,
-          require_verified_matches: document.getElementById('verified_' + id).checked,
-          use_llm_advice: document.getElementById('llmadv_' + id).checked
-        };
-      }
+      // Every run uses the controller agent (the only execution engine).
+      const costRaw = Number(document.getElementById('cost_' + id).value);
+      payload.goal = {
+        target_count: Math.max(1, Math.min(50, Number(document.getElementById('count_' + id).value) || 10)),
+        seniority: document.getElementById('sen_' + id).value,
+        include_maybe: document.getElementById('maybe_' + id).checked,
+        require_verified_matches: document.getElementById('verified_' + id).checked,
+        use_llm_advice: document.getElementById('llmadv_' + id).checked,
+        max_cost_usd: Number.isFinite(costRaw) ? Math.max(0, Math.min(20, costRaw)) : 0.5
+      };
       try {
         const run = await csrfFetch('/runs', {
           method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -317,7 +320,10 @@ var NL = String.fromCharCode(10);
         (p.controller_note ? ' <span class="reason">(' + escapeHtml(p.controller_note) + ')</span>' : '') + '</div>' +
         '<div class="note">LLM calls reserved ' + escapeHtml(a.llm_calls.reserved) + '/' + escapeHtml(a.llm_calls.budget) +
         ' &nbsp; est. cost $' + escapeHtml((a.cost.known_estimated_usd || 0).toFixed(6)) +
-        (a.cost.complete ? '' : ' (+' + escapeHtml(a.cost.calls_with_unknown_cost) + ' call(s) with unknown cost)') + '</div>' +
+        (a.cost.complete ? '' : ' (+' + escapeHtml(a.cost.calls_with_unknown_cost) + ' call(s) with unknown cost, bound $' +
+          escapeHtml((a.cost.unknown_cost_upper_bound_usd || 0).toFixed(6)) + ')') +
+        (a.cost.limit_usd ? ' &nbsp; committed $' + escapeHtml((a.cost.committed_usd || 0).toFixed(6)) +
+          ' of $' + escapeHtml(a.cost.limit_usd) + ' hard limit' : '') + '</div>' +
         (a.runtime ? '<div class="note">Active runtime ' + escapeHtml(Math.round(a.runtime.active_seconds)) + 's' +
           ' (wall clock ' + escapeHtml(Math.round(a.runtime.wall_clock_seconds)) + 's; waiting for a human is not counted)</div>' : '') +
         '<div class="note">Fixed constraints: ' + escapeHtml(JSON.stringify((a.goal && a.goal.constraints) || {})) + '</div></div>';
@@ -477,7 +483,7 @@ var NL = String.fromCharCode(10);
             let io = 'PROMPT:' + NL + escapeHtml(l.prompt || '') + NL + NL + 'RESPONSE:' + NL + escapeHtml(l.response || '');
             if (l.error_message) io += NL + NL + 'ERROR: ' + escapeHtml(l.error_message);
             if (l.provider_request_id) io += NL + NL + 'REQUEST_ID: ' + escapeHtml(l.provider_request_id);
-            html += '<div class="call ' + fc + '"><span class="op">' + escapeHtml(l.operation || 'llm') + '</span> &middot; llm' + attemptLabel + ': ' + escapeHtml(l.prompt_tokens) + '+' + escapeHtml(l.completion_tokens) + ' tok, ' + escapeHtml(l.latency_ms) + 'ms, ' + (l.cost_usd == null ? 'cost unknown' : 'est. $' + escapeHtml(l.cost_usd)) + ' [' + escapeHtml(l.status) + ']' +
+            html += '<div class="call ' + fc + '"><span class="op">' + escapeHtml(l.operation || 'llm') + '</span> &middot; llm' + attemptLabel + ': ' + escapeHtml(l.prompt_tokens) + '+' + escapeHtml(l.completion_tokens) + ' tok, ' + escapeHtml(l.latency_ms) + 'ms, ' + (l.cost_usd == null ? (l.cost_status === 'not_billed' ? 'not billed' : 'cost unknown' + (l.cost_upper_bound_usd != null ? ' (\u2264 $' + escapeHtml(Number(l.cost_upper_bound_usd).toFixed(6)) + ')' : '')) : 'est. $' + escapeHtml(l.cost_usd)) + ' [' + escapeHtml(l.status) + ']' +
               (l.logical_call_id ? ' <span class="note" title="logical call ' + escapeHtml(l.logical_call_id) + '">call ' + escapeHtml(String(l.logical_call_id).slice(0, 8)) + ' / run attempt ' + escapeHtml(l.run_attempt) + '</span>' : '') +
               '<details><summary>view prompt/response</summary><pre class="io">' + io + '</pre></details></div>';
           }

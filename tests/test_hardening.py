@@ -115,16 +115,35 @@ def test_resume_review_payload_carries_reviewer_identity():
     rid = _resume(uid)
     with get_connection() as conn:
         cur = conn.cursor()
-        cur.execute("INSERT INTO runs (status, input_summary, user_id, resume_id) "
-                    "VALUES ('waiting_for_human', 't', %s, %s) RETURNING id", (uid, rid))
+        rev = "r-" + uuid.uuid4().hex[:8]
+        cur.execute("INSERT INTO runs (status, input_summary, user_id, resume_id, mode, "
+                    "pending_review) VALUES ('waiting_for_human', 't', %s, %s, 'agent', %s) "
+                    "RETURNING id", (uid, rid, json.dumps({"type": "review_request",
+                                                           "review_id": rev})))
         run_id = cur.fetchone()[0]
-    assert c.post(f"/runs/{run_id}/resume", json={"decision": "Apply", "comment": "ok"}).status_code == 200
+        cur.execute("INSERT INTO review_requests (review_id, run_id, kind, payload) "
+                    "VALUES (%s, %s, 'job_review', '{}')", (rev, run_id))
+    assert c.post(f"/runs/{run_id}/resume", json={"decision": "Apply", "comment": "ok",
+                                                   "review_id": rev}).status_code == 200
     with get_connection() as conn:
         cur = conn.cursor()
         cur.execute("SELECT payload FROM job_queue WHERE run_id = %s", (run_id,))
         payload = cur.fetchone()[0]
     payload = payload if isinstance(payload, dict) else json.loads(payload)
     assert payload["reviewer_user_id"] == uid and payload["reviewer"]
+
+
+def test_legacy_pipeline_run_cannot_be_resumed():
+    c, uid = _client()
+    rid = _resume(uid)
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("INSERT INTO runs (status, input_summary, user_id, resume_id, mode) "
+                    "VALUES ('waiting_for_human', 't', %s, %s, 'pipeline') RETURNING id",
+                    (uid, rid))
+        run_id = cur.fetchone()[0]
+    r = c.post(f"/runs/{run_id}/resume", json={"decision": "Apply", "comment": "ok"})
+    assert r.status_code == 409 and "retired" in r.json()["detail"]
 
 
 # ------------------------------------------------------ live persistence ------
@@ -178,14 +197,35 @@ def test_remotive_payload_fields_are_extracted(monkeypatch):
     assert jobs[0]["posted_at"].year == 2026 and jobs[0]["posted_at"].tzinfo is not None
 
 
+def _agent_run_with(title):
+    """A run whose own search returned the posting with this title (if given)."""
+    from job_search import create_search, associate_jobs
+    _c, uid = _client()
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("INSERT INTO runs (status, input_summary, user_id, mode) "
+                    "VALUES ('running', 't', %s, 'agent') RETURNING id", (uid,))
+        run_id = cur.fetchone()[0]
+        ids = []
+        if title:
+            cur.execute("SELECT id FROM job_postings WHERE title = %s", (title,))
+            ids = [r[0] for r in cur.fetchall()]
+    if ids:
+        sid = create_search(run_id, "zyxwv", None, "remotive", location_filter_applied=False)
+        associate_jobs(sid, ids)
+    return run_id
+
+
 def test_live_posting_without_last_seen_is_not_fresh_forever():
     from job_source import search_jobs
     title = "Zyxwv Engineer " + uuid.uuid4().hex[:6]
     with get_connection() as conn:
         conn.cursor().execute(
             "INSERT INTO job_postings (title, company, description, source, external_id) "
-            "VALUES (%s, 'X', 'zyxwv role', 'remotive', %s)", (title, "remotive:" + uuid.uuid4().hex))
-    assert not [j for j in search_jobs("zyxwv") if j["title"] == title]
+            "VALUES (%s, 'X', 'zyxwv role', 'remotive', %s) RETURNING id",
+            (title, "remotive:" + uuid.uuid4().hex))
+    run_id = _agent_run_with(title)
+    assert not [j for j in search_jobs("zyxwv", run_id=run_id) if j["title"] == title]
 
 
 def test_remotive_association_is_not_a_location_match():
@@ -197,11 +237,12 @@ def test_remotive_association_is_not_a_location_match():
     job = {**_remotive_job("remotive:" + uuid.uuid4().hex), "title": f"{tag} Engineer",
            "description": f"{tag} role"}
     _, _, ids = upsert_postings([job])
-    sid = create_search(None, tag, None, "remotive", location_filter_applied=False)
+    run_id = _agent_run_with(None)
+    sid = create_search(run_id, tag, None, "remotive", location_filter_applied=False)
     associate_jobs(sid, ids)
     # Remote job with no GEO-filtered association: kept (location-agnostic), and its
     # association is not reported as a match for any location.
-    hits = [j for j in search_jobs(tag, location="Paris") if j["id"] == ids[0]]
+    hits = [j for j in search_jobs(tag, location="Paris", run_id=run_id) if j["id"] == ids[0]]
     assert hits and hits[0]["assoc_locations"] == set()
 
 

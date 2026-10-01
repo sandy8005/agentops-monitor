@@ -1,23 +1,16 @@
 import json
-from llm import logged_llm_call
+from pydantic import ValidationError
+from llm import logged_llm_call, ModelOutputInvalid
 from schemas import JobRequirements
-from prompt_safety import wrap_untrusted, HARDENING_PREAMBLE, detect_injection
+from prompt_safety import wrap_untrusted, HARDENING_PREAMBLE
 
 
 def extract_requirements(job, run_id, step_id, budget=None):
     # A job posting is untrusted input (a poisoned listing can carry injected
-    # instructions aimed at hijacking this extraction). Log any injection-looking
-    # patterns for observability, then rely on the structural defense (hardening
-    # preamble + fenced/labelled data) below — we still extract the requirements.
-    flags = detect_injection(f"{job.get('title', '')}\n{job.get('description', '')}")
-    if flags:
-        try:
-            from llm import flag_for_review
-            flag_for_review(step_id, reason="possible_prompt_injection(job)")
-        except Exception:
-            pass
-        print(f"    [prompt-safety] injection-like patterns in job posting: {flags}")
-
+    # instructions aimed at hijacking this extraction). Injection scanning for this input happens ONCE per item, where the policy
+    # can act on it: job text in router.do_process_job (every evaluation, cache hit
+    # or not), resume text in parser.parse_resume. The structural defense below
+    # (hardening preamble + fenced data) is what protects this prompt.
     prompt = f"""
 {HARDENING_PREAMBLE}
 
@@ -48,6 +41,11 @@ Return ONLY valid JSON, no markdown fences, no explanation, in exactly this shap
 If there are no "or" alternatives in the posting, return an empty list for required_any_of: [].
 """
     raw = logged_llm_call(prompt, run_id, step_id, operation="extract_requirements", budget=budget)
-    cleaned = raw.strip().replace("```json", "").replace("```", "").strip()
-    data = json.loads(cleaned)
-    return JobRequirements(**data).model_dump()
+    cleaned = (raw or "").strip().replace("```json", "").replace("```", "").strip()
+    # Unusable MODEL output is a degraded-model condition (ModelOutputInvalid), so
+    # the caller takes its rules fallback; it is never confused with a bug.
+    try:
+        return JobRequirements(**json.loads(cleaned)).model_dump()
+    except (json.JSONDecodeError, ValidationError, TypeError) as e:
+        raise ModelOutputInvalid(f"extract_requirements: unusable model output "
+                                 f"({type(e).__name__}, step_id={step_id})") from None

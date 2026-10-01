@@ -21,7 +21,7 @@ from typing import List, Literal
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
 
 import agent_store as store
-from agent_goal import AgentGoal, seniority_conflict, validate_search_query
+from agent_goal import AgentGoal, candidate_queries, seniority_conflict, validate_search_query
 from logging_config import get_logger
 
 log = get_logger(__name__)
@@ -40,7 +40,7 @@ class ToolRejected(Exception):
 
 class SearchArgs(BaseModel):
     model_config = ConfigDict(extra="forbid")
-    provider: Literal["adzuna", "remotive", "pool"]
+    provider: Literal["adzuna", "remotive"]
     query: str = Field(..., min_length=2, max_length=80)
 
 
@@ -111,7 +111,8 @@ TOOL_SPECS = {
     "request_human_input": {"arguments": {"question": "short question", "options": ["2-4 labels"]},
                             "purpose": "Pause for a necessary user decision. Use sparingly."},
     "finish": {"arguments": {"reason": "why you are stopping"},
-               "purpose": "Propose completion. The backend verifies progress from persisted results."},
+               "purpose": "End the run. Accepted only when the goal is met or the search "
+                          "space is exhausted (see search_space in BACKEND STATE)."},
 }
 
 
@@ -166,6 +167,14 @@ def _tool_state(ctx):
     g = ctx.goal
 
     class _ToolState(AgentState):
+        generation = ctx.generation
+
+        def reserve_attempt(self, projected_usd, operation=None):
+            return ctx.budget.reserve_attempt(projected_usd, operation)
+
+        def check_owner(self):
+            ctx.budget.check_owner()
+
         def can_spend(self):
             return ctx.budget.can_spend()
 
@@ -179,7 +188,7 @@ def _tool_state(ctx):
                     target_role=g.target_role, location=g.constraints.location or None,
                     work_mode=g.constraints.work_mode or None,
                     employment_type=g.constraints.employment_type or None,
-                    evaluate=g.evaluate_quality, live_only=True)
+                    evaluate=g.evaluate_quality)
     ts.resume_text = ctx.state.get("resume_text")
     ts.parsed_resume = ctx.state.get("parsed_resume")
     ts.model_policy = g.model_policy
@@ -189,15 +198,12 @@ def _tool_state(ctx):
 # ------------------------------------------------------------------- search --
 
 def _collect_candidates(ctx, provider, query):
-    from job_source import search_jobs as pool_search
+    """Postings THIS run fetched from `provider`, filtered by the fixed constraints."""
+    from job_source import search_jobs as run_search
     c = ctx.goal.constraints
-    jobs = pool_search(query, c.location or None, c.work_mode or None,
-                       c.employment_type or None, live_only=(provider in LIVE_PROVIDERS),
-                       run_id=ctx.run_id if provider in LIVE_PROVIDERS else None)
-    if provider in LIVE_PROVIDERS:
-        jobs = [j for j in jobs if (j.get("source") or "").lower() == provider]
-    else:
-        jobs = [j for j in jobs if (j.get("source") or "").lower() not in LIVE_PROVIDERS]
+    jobs = run_search(query, c.location or None, c.work_mode or None,
+                      c.employment_type or None, run_id=ctx.run_id)
+    jobs = [j for j in jobs if (j.get("source") or "").lower() == provider]
     # Deterministic, bounded selection (R14): newest ids first, capped.
     jobs = sorted(jobs, key=lambda j: j["id"], reverse=True)[:ctx.goal.limits.max_jobs_per_search]
     return jobs
@@ -245,6 +251,64 @@ def plan_search(history, iteration, generation):
             "retrying_generation": latest.get("execution_generation")}
 
 
+def search_space(goal, state):
+    """The run's SEARCH SPACE, computed by the backend from durable facts — never
+    from the model's opinion:
+
+        (candidate title) x (enabled provider), minus
+          * combinations already searched in this run (any outcome), and
+          * providers that failed NON-transiently (bad credentials, missing keys,
+            malformed responses — retrying them cannot help).
+
+    exhausted = the search limit is reached OR no untried combination remains.
+    `next` is the combination the rules policy would search next (providers that
+    failed transiently are tried last), or None when exhausted."""
+    searches = list(state.get("searches") or [])
+    dead = sorted({s.get("provider") for s in searches
+                   if s.get("provider_status") == "failed"
+                   and (s.get("provider_detail") or "") in NON_TRANSIENT_PROVIDER_FAILURES})
+    failed = {s.get("provider") for s in searches if s.get("provider_status") == "failed"}
+    providers = sorted((p for p in goal.providers if p not in dead), key=lambda p: p in failed)
+    tried = {(s.get("provider"), s.get("query")) for s in searches}
+    untried = [(p, q) for q in candidate_queries(goal) for p in providers if (p, q) not in tried]
+    limit_reached = len(searches) >= goal.limits.max_searches
+    exhausted = limit_reached or not untried
+    seen, untried_queries = set(), []
+    for _p, q in untried:
+        if q not in seen:
+            seen.add(q)
+            untried_queries.append(q)
+    return {"searches_done": len(searches), "max_searches": goal.limits.max_searches,
+            "search_limit_reached": limit_reached, "untried_combinations": len(untried),
+            "untried_queries": untried_queries, "unusable_providers": dead,
+            "exhausted": exhausted, "next": None if exhausted else untried[0]}
+
+
+def finish_permitted(goal, state, qualified):
+    """(ok, reason). The backend's completion invariant: a run may finish only when
+      * the goal is met (verified from persisted results), or
+      * the search space is exhausted (search limit reached, or every title x
+        provider combination attempted / unusable) AND no discovered eligible job
+        is left unevaluated.
+    Cancellation, hard limits and unrecoverable errors stop a run through the guard
+    and the failure streak — never through `finish`. A prompt telling the model not
+    to finish early is not an invariant; this is."""
+    if qualified >= goal.target_count:
+        return True, "goal met"
+    remaining = unevaluated_eligible_ids(state)
+    if remaining:
+        return False, (f"goal not met ({qualified}/{goal.target_count}) and {len(remaining)} "
+                       f"eligible discovered jobs are unevaluated")
+    space = search_space(goal, state)
+    if not space["exhausted"]:
+        return False, (f"goal not met ({qualified}/{goal.target_count}) and the search space "
+                       f"is not exhausted ({space['searches_done']}/{space['max_searches']} "
+                       f"searches, {space['untried_combinations']} untried title/provider "
+                       f"combinations)")
+    return True, ("search limit reached" if space["search_limit_reached"]
+                  else "every title/provider combination was searched")
+
+
 def tool_search_jobs(ctx, args: SearchArgs):
     goal, state = ctx.goal, ctx.state
     if args.provider not in goal.providers:
@@ -282,8 +346,8 @@ def tool_search_jobs(ctx, args: SearchArgs):
             _, _, provider_status = fetch_and_upsert_remotive(
                 args.query, goal.constraints.location or None,
                 limit=goal.limits.max_jobs_per_search, run_id=ctx.run_id, step_id=step_id)
-        else:
-            provider_status = "success"
+        else:                                   # unreachable: SearchArgs is a closed set
+            raise ToolRejected(f"unknown provider {args.provider!r}")
         fetched = plan["mode"] == "fetch"
         reused_from = None if fetched else prior.get("execution_generation")
 
@@ -482,6 +546,7 @@ def tool_generate_advice(ctx, args: AdviceArgs):
     postings = store.load_postings(args.job_ids)
     step_id = create_step(ctx.run_id, "agent_generate_advice", ctx.iteration)
     done, failed, notes = [], [], {}
+    interrupted = None
     resume_hash = resume_content_hash(state.get("resume_text") or "")
     try:
         for job_id in args.job_ids:
@@ -489,7 +554,14 @@ def tool_generate_advice(ctx, args: AdviceArgs):
                 done.append(job_id)          # already persisted: reuse, don't regenerate
                 notes[str(job_id)] = "reused"
                 continue
-            if ctx.limit_check():
+            stop = ctx.limit_check()                        # between work units
+            if stop:
+                # Same contract as evaluate_jobs: the stop is PROPAGATED (the loop
+                # finalizes with it) and the step is not reported as a clean success.
+                if stop.get("cancel"):
+                    state["cancel_seen"] = True
+                state["limit_stop"] = stop
+                interrupted = stop
                 break
             job = postings.get(job_id)
             if job is None:
@@ -516,18 +588,28 @@ def tool_generate_advice(ctx, args: AdviceArgs):
             except store.ExecutionLost:
                 raise
             except Exception as e:
+                from router import is_infrastructure_error
+                if is_infrastructure_error(e):
+                    raise            # database / ownership: the run fails, not "one job"
                 log.warning("advice failed for job %s: %s", job_id, type(e).__name__,
                             extra={"run_id": ctx.run_id, "step_id": step_id})
                 failed.append(job_id)
         advised = set(state.get("advised") or [])
         state["advised"] = sorted(advised | set(done))
-        finish_step(step_id, "success" if not failed else "failed")
+        if interrupted:
+            fail_step(step_id, f"advice stopped before completion: {interrupted.get('reason')}")
+        else:
+            finish_step(step_id, "success" if not failed else "failed")
     except Exception as e:
         fail_step(step_id, e)
         raise
     if failed:
         state["output_failures"] = int(state.get("output_failures") or 0) + len(failed)
-    return {"advised": done, "failed_job_ids": failed, "generation": notes}, step_id, False
+    obs = {"advised": done, "failed_job_ids": failed, "generation": notes}
+    if interrupted:
+        obs["stopped"] = interrupted.get("reason")
+        obs["not_advised"] = [i for i in args.job_ids if i not in done and i not in failed]
+    return obs, step_id, False
 
 
 # ------------------------------------------------------------- human input --
@@ -549,13 +631,13 @@ def tool_request_human_input(ctx, args: HumanInputArgs):
 # ------------------------------------------------------------------- finish --
 
 def tool_finish(ctx, args: FinishArgs):
-    remaining = unevaluated_eligible_ids(ctx.state)
     qualified = qualified_count(ctx)
-    if qualified < ctx.goal.target_count and remaining:
-        raise ToolRejected(f"goal not met ({qualified}/{ctx.goal.target_count}) and "
-                           f"{len(remaining)} eligible discovered jobs are unevaluated")
-    ctx.state["stop"] = {"by": "controller", "reason": args.reason}
-    return {"finish_accepted": True, "qualified": qualified,
+    ok, why = finish_permitted(ctx.goal, ctx.state, qualified)
+    if not ok:
+        raise ToolRejected(why)
+    ctx.state["search_exhausted"] = search_space(ctx.goal, ctx.state)["exhausted"]
+    ctx.state["stop"] = {"by": "controller", "reason": f"{args.reason} ({why})"}
+    return {"finish_accepted": True, "qualified": qualified, "basis": why,
             "target_count": ctx.goal.target_count}, None, False
 
 

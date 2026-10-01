@@ -1,10 +1,11 @@
+import sys
 # test_parser.py
 from pdf_reader import read_resume_file
 from llm import create_run, create_step, finish_step, finish_run
 from parser import parse_resume
 import json
 
-resume_text = read_resume_file("SANDEEP_BARIGE_Resume.pdf")
+resume_text = read_resume_file(sys.argv[1] if len(sys.argv) > 1 else "sample_resume.pdf")  # pass a SYNTHETIC resume path
 
 run_id = create_run("resume parsing test")
 step_id = create_step(run_id, "parse_resume", 0)

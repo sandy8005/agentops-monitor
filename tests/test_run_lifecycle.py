@@ -100,11 +100,11 @@ def test_retrying_clears_ended_at_and_keeps_last_attempt_end():
 
 
 def test_running_again_clears_ended_at_and_numbers_the_attempt():
-    from autonomous_graph import _mark_run_running
+    from agent_store import begin_execution
     from llm import create_step, log_tool_call
     run_id = _run("failed", ended=True)                  # attempt 1 failed
     s1 = create_step(run_id, "parse_resume", 0)
-    _mark_run_running(run_id, new_attempt=True)          # retry -> attempt 2
+    begin_execution(run_id, new_attempt=True)            # retry -> attempt 2
     status, ended_at, _, last_end, attempt = _run_row(run_id)
     assert status == "running" and ended_at is None and last_end is not None
     assert attempt == 2
@@ -117,7 +117,7 @@ def test_running_again_clears_ended_at_and_numbers_the_attempt():
         cur.execute("SELECT run_attempt FROM tool_calls WHERE step_id = %s", (s2,))
         assert cur.fetchone()[0] == 2
     # A resume continues the SAME attempt.
-    _mark_run_running(run_id, new_attempt=False)
+    begin_execution(run_id, new_attempt=False)
     assert _run_row(run_id)[4] == 2
 
 
@@ -167,11 +167,17 @@ def test_stale_job_for_finished_run_is_closed_without_executing(monkeypatch):
 
 
 def test_lost_ownership_stops_at_the_next_node_boundary():
-    from autonomous_graph import _hydrate
+    """Every agent node starts with the ownership check (agent_loop._ctx), and the
+    LLM budget checks again right before each HTTP request."""
+    import agent_loop
+    from agent_goal import AgentGoal
     run_id = 10_000_000 + uuid.uuid4().int % 1_000_000
     run_lock.mark_lost(run_id)
     try:
+        state = {"run_id": run_id, "goal": AgentGoal(target_role="AI Engineer").model_dump()}
         with pytest.raises(run_lock.ExecutionLost):
-            _hydrate({"run_id": run_id, "goal": "x", "resume_id": 1})
+            agent_loop.node_decide(state, {"configurable": {"generation": 1}})
+        with pytest.raises(run_lock.ExecutionLost):
+            agent_loop.DurableBudget(run_id, 5, generation=1).reserve_attempt(0.01, "x")
     finally:
         run_lock.clear(run_id)

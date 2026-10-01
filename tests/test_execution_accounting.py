@@ -24,15 +24,18 @@ from agent_goal import AgentGoal
 from agent_tools import ToolContext, plan_search
 
 
-def _usage(active, elapsed=None, unknown=0, known=0.0):
+def _usage(active, elapsed=None, unknown=0, known=0.0, unbounded=None, bound=0.0, open_=0.0):
     return {"elapsed_seconds": elapsed if elapsed is not None else active,
             "active_runtime_seconds": active, "llm_calls_reserved": 0,
-            "llm_call_budget": None, "known_cost_usd": known, "unknown_cost_calls": unknown}
+            "llm_call_budget": None, "known_cost_usd": known, "unknown_cost_calls": unknown,
+            "unknown_cost_bound_usd": bound,
+            "unbounded_unknown": unknown if unbounded is None else unbounded,
+            "reserved_open_usd": open_, "committed_usd": known + bound + open_}
 
 
 @pytest.fixture
 def goal():
-    return AgentGoal(target_role="AI Engineer", target_count=1, providers=["adzuna", "pool"],
+    return AgentGoal(target_role="AI Engineer", target_count=1, providers=["adzuna", "remotive"],
                      limits={"max_runtime_seconds": 1800, "max_cost_usd": 0.5})
 
 
@@ -88,8 +91,8 @@ def test_action_retry_history_keeps_both_attempts(monkeypatch, no_db_guard):
         return {"ok": True}, None, True
     monkeypatch.setattr(agent_loop, "execute", flaky)
 
-    g = AgentGoal(target_role="AI Engineer", model_policy="rules_only", providers=["pool"])
-    pending = {"action": "search_jobs", "arguments": {"provider": "pool", "query": "ai engineer"},
+    g = AgentGoal(target_role="AI Engineer", model_policy="rules_only", providers=["adzuna"])
+    pending = {"action": "search_jobs", "arguments": {"provider": "adzuna", "query": "ai engineer"},
                "reason": "r", "decided_by": "rules", "replayed": False}
     state = {"run_id": 100, "goal": g.model_dump(), "iteration": 2, "pending": pending}
     agent_loop.node_act(state, {"configurable": {"generation": 1}})
@@ -161,11 +164,26 @@ def test_unknown_price_blocks_cost_bounded_run(monkeypatch, goal, no_db_guard):
     assert stop["cost_unknown"]
 
 
-def test_unpriced_calls_stop_the_run(monkeypatch, goal, no_db_guard):
+def test_unbounded_unknown_cost_stops_the_run(monkeypatch, goal, no_db_guard):
     monkeypatch.setattr(agent_loop, "price_known", lambda *a: True)
     monkeypatch.setattr(agent_store, "run_usage", lambda rid: _usage(1, unknown=25))
     stop = agent_loop.check_limits(1, goal, {"iteration": 1})
     assert stop["cost_unknown"] and "25" in stop["reason"]
+
+
+def test_bounded_unknown_cost_counts_against_the_cap(monkeypatch, goal, no_db_guard):
+    """A timed-out call has unknown cost but a known upper bound: it counts at that
+    bound, so the run can continue while the cap still holds — and stops once
+    committed spend (known + bounds + in-flight) reaches it."""
+    monkeypatch.setattr(agent_loop, "price_known", lambda *a: True)
+    monkeypatch.setattr(agent_store, "run_usage",
+                        lambda rid: _usage(1, unknown=2, unbounded=0, known=0.10, bound=0.05))
+    assert agent_loop.check_limits(1, goal, {"iteration": 1}) is None
+    monkeypatch.setattr(agent_store, "run_usage",
+                        lambda rid: _usage(1, unknown=2, unbounded=0, known=0.35, bound=0.15,
+                                           open_=0.05))
+    stop = agent_loop.check_limits(1, goal, {"iteration": 1})
+    assert stop and "cost limit" in stop["reason"] and not stop.get("cost_unknown")
 
 
 def test_no_cost_cap_or_rules_only_is_not_blocked(monkeypatch):
@@ -180,12 +198,16 @@ def test_no_cost_cap_or_rules_only_is_not_blocked(monkeypatch):
 def test_budget_refuses_call_before_reserving_when_price_unknown(monkeypatch):
     import llm
     monkeypatch.setattr(agent_loop, "price_known", lambda *a: False)
+    monkeypatch.setattr(agent_loop.run_lock, "check_owner", lambda rid: None)
     reserved = []
-    monkeypatch.setattr(agent_store, "reserve_llm_call", lambda *a: reserved.append(a) or True)
+    monkeypatch.setattr(agent_store, "reserve_llm_call",
+                        lambda *a, **k: reserved.append((a, k)) or {"reservation_id": 1})
     with pytest.raises(llm.CostUnknown):
-        agent_loop.DurableBudget(1, 40, max_cost_usd=0.5).can_spend()
+        agent_loop.DurableBudget(1, 40, max_cost_usd=0.5, generation=1).reserve_attempt(0.01)
     assert not reserved
-    assert agent_loop.DurableBudget(1, 40, max_cost_usd=0).can_spend()
+    assert agent_loop.DurableBudget(1, 40, max_cost_usd=0, generation=1).reserve_attempt(0.01)
+    # the reservation is generation-fenced: the worker's generation is passed on
+    assert reserved[0][0][:2] == (1, 1)
 
 
 def test_cost_unknown_finalizes_failed_with_code(monkeypatch, goal, no_db_guard):
@@ -396,8 +418,9 @@ def test_db_partial_cost_is_marked_partial():
     rid = _db_run()
     gen = agent_store.begin_execution(rid, new_attempt=True)
     for cost in (0.01, None, 0.02):
-        _sql("INSERT INTO llm_calls (run_id, prompt_tokens, completion_tokens, cost_usd, status) "
-             "VALUES (%s, 10, 5, %s, 'success') RETURNING id", (rid, cost))
+        _sql("INSERT INTO llm_calls (run_id, prompt_tokens, completion_tokens, cost_usd, status, "
+             "cost_status) VALUES (%s, 10, 5, %s, 'success', %s) RETURNING id",
+             (rid, cost, "priced" if cost is not None else "unknown"))
     u = agent_store.run_usage(rid)
     assert u["unknown_cost_calls"] == 1 and abs(u["known_cost_usd"] - 0.03) < 1e-9
     agent_store.finalize(rid, gen, "success", "done", None, {})

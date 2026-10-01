@@ -43,43 +43,66 @@ CLOSE_EXECUTION_INTERVAL_SQL = """
     execution_started_at = NULL"""
 
 
+# Charge for a DEAD worker's still-open interval (worker crashed, lock lost): up to
+# its last heartbeat plus a grace period, capped at NOW(). We cannot know exactly
+# when it stopped; the last heartbeat is the latest moment it was provably alive,
+# and the grace (EXECUTION_HEARTBEAT_GRACE_SECONDS, default 45s, > the 30s
+# heartbeat interval) covers the time between heartbeats. Without any heartbeat
+# the interval is charged to NOW() (fail closed).
+DEAD_INTERVAL_SQL = """
+    COALESCE(GREATEST(0, EXTRACT(EPOCH FROM (
+        LEAST(NOW(), COALESCE(execution_heartbeat_at + make_interval(secs => %(grace)s),
+                              NOW()))
+        - execution_started_at)))::double precision, 0)"""
+
+
 def begin_execution(run_id, new_attempt):
     """Mark the run running, open a new ACTIVE execution interval and take a NEW
     execution generation, in one statement. Returns the generation this worker must
     present on every guarded write.
 
     If the previous interval was never closed (the worker died mid-execution), it is
-    charged up to NOW(): we cannot know when the dead worker stopped, and a runtime
-    budget must fail closed rather than silently forgive time. (All SET expressions
-    read the row's OLD values, so the carried interval is the previous one.)"""
+    charged up to that worker's last heartbeat + grace (DEAD_INTERVAL_SQL). Open
+    cost reservations of earlier generations become 'abandoned': their requests
+    may have been billed, so they keep counting against the USD cap (and are
+    reported as unknown cost) but can no longer be settled as in-flight."""
+    from settings import settings
+    grace = float(settings.execution_heartbeat_grace_seconds)
     with get_connection() as conn:
         cur = conn.cursor()
-        cur.execute("""
+        cur.execute(f"""
             UPDATE runs SET status = 'running',
                 started_at = COALESCE(started_at, NOW()),
                 last_attempt_ended_at = COALESCE(ended_at, last_attempt_ended_at),
                 ended_at = NULL,
-                attempt = CASE WHEN %s OR attempt = 0 THEN attempt + 1 ELSE attempt END,
+                attempt = CASE WHEN %(new)s OR attempt = 0 THEN attempt + 1 ELSE attempt END,
                 execution_generation = execution_generation + 1,
-                active_runtime_seconds = active_runtime_seconds + COALESCE(
-                    GREATEST(0, EXTRACT(EPOCH FROM (NOW() - execution_started_at)))::double precision, 0),
-                execution_started_at = NOW()
-            WHERE id = %s
+                active_runtime_seconds = active_runtime_seconds + {DEAD_INTERVAL_SQL},
+                execution_started_at = NOW(),
+                execution_heartbeat_at = NOW()
+            WHERE id = %(run)s
             RETURNING execution_generation
-        """, (bool(new_attempt), run_id))
+        """, {"new": bool(new_attempt), "run": run_id, "grace": grace})
         row = cur.fetchone()
         if not row:
             raise ExecutionLost(f"run {run_id} does not exist")
-        return int(row[0])
+        gen = int(row[0])
+        _abandon_open_reservations(cur, run_id, before_generation=gen)
+        return gen
 
 
-def suspend_execution(run_id, generation):
-    """Close the active interval WITHOUT changing status (e.g. a stale resume job
-    that applied nothing). Fenced like every other write of this generation."""
-    with get_connection() as conn:
-        cur = conn.cursor()
-        _check_generation(cur, run_id, generation, lock="FOR UPDATE")
-        cur.execute(f"UPDATE runs SET {CLOSE_EXECUTION_INTERVAL_SQL} WHERE id = %s", (run_id,))
+def _abandon_open_reservations(cur, run_id, before_generation=None):
+    """open -> abandoned (still counted against the cap); keep runs.cost_reserved_usd
+    equal to the sum of OPEN reservations."""
+    cur.execute("""
+        UPDATE llm_cost_reservations SET status = 'abandoned', settled_at = NOW()
+        WHERE run_id = %s AND status = 'open'
+          AND (%s::int IS NULL OR execution_generation < %s::int)
+    """, (run_id, before_generation, before_generation))
+    cur.execute("""UPDATE runs SET cost_reserved_usd = COALESCE((
+                       SELECT SUM(amount_usd) FROM llm_cost_reservations
+                       WHERE run_id = %s AND status = 'open'), 0)
+                   WHERE id = %s""", (run_id, run_id))
 
 
 def load_run_config(run_id):
@@ -104,6 +127,49 @@ def is_cancel_requested(run_id):
         return bool(row and row[0])
 
 
+# ------------------------------------------------------------------- cost ----
+
+def cost_summary(cur, run_id):
+    """THE definition of a run's spend, shared by the guard, the reservation check,
+    finalization and the API.
+
+      known_cost_usd          priced calls (provider usage known)
+      unknown_cost_calls      calls whose cost is unknown (usage missing, failed
+                              after dispatch) + abandoned reservations
+      unknown_cost_bound_usd  conservative upper bound of those unknown calls
+      unbounded_unknown       unknown calls with NO bound (legacy rows) — a cap
+                              cannot be proven while any exist (fail closed)
+      reserved_open_usd       requests in flight right now
+      committed_usd           known + unknown bound + open reservations: what a
+                              hard cap is enforced against
+    """
+    cur.execute("""
+        SELECT COALESCE(SUM(cost_usd) FILTER (WHERE cost_status = 'priced'), 0),
+               COUNT(*) FILTER (WHERE cost_status = 'unknown'),
+               COALESCE(SUM(cost_upper_bound_usd) FILTER (WHERE cost_status = 'unknown'), 0),
+               COUNT(*) FILTER (WHERE cost_status = 'unknown' AND cost_upper_bound_usd IS NULL)
+        FROM llm_calls WHERE run_id = %s
+    """, (run_id,))
+    known, unknown_calls, unknown_bound, unbounded = cur.fetchone()
+    cur.execute("""
+        SELECT COALESCE(SUM(amount_usd) FILTER (WHERE status = 'open'), 0),
+               COUNT(*) FILTER (WHERE status = 'abandoned'),
+               COALESCE(SUM(amount_usd) FILTER (WHERE status = 'abandoned'), 0),
+               COUNT(*) FILTER (WHERE status IN ('open', 'abandoned') AND amount_usd IS NULL)
+        FROM llm_cost_reservations WHERE run_id = %s
+    """, (run_id,))
+    open_amt, abandoned_n, abandoned_amt, unbounded_res = cur.fetchone()
+    known = float(known or 0)
+    bound = float(unknown_bound or 0) + float(abandoned_amt or 0)
+    open_amt = float(open_amt or 0)
+    return {"known_cost_usd": known,
+            "unknown_cost_calls": int(unknown_calls or 0) + int(abandoned_n or 0),
+            "unknown_cost_bound_usd": bound,
+            "unbounded_unknown": int(unbounded or 0) + int(unbounded_res or 0),
+            "reserved_open_usd": open_amt,
+            "committed_usd": known + bound + open_amt}
+
+
 def run_usage(run_id):
     """Durable usage snapshot used by the guard.
 
@@ -112,9 +178,7 @@ def run_usage(run_id):
                               backoff are not included. This is what the runtime
                               limit is enforced against.
       elapsed_seconds         wall-clock since the run first started (display only).
-      known_cost_usd          sum of PRICED calls only.
-      unknown_cost_calls      successful calls with no known price (R15 — unknown is
-                              never summed as zero; the guard fails closed on it).
+      + every field of cost_summary().
     """
     with get_connection() as conn:
         cur = conn.cursor()
@@ -126,29 +190,62 @@ def run_usage(run_id):
             FROM runs WHERE id = %s
         """, (run_id,))
         row = cur.fetchone() or (0, 0, 0, None)
-        cur.execute("""
-            SELECT COALESCE(SUM(cost_usd) FILTER (WHERE cost_usd IS NOT NULL), 0),
-                   COUNT(*) FILTER (WHERE cost_usd IS NULL AND status = 'success')
-            FROM llm_calls WHERE run_id = %s
-        """, (run_id,))
-        cost = cur.fetchone() or (0, 0)
+        cost = cost_summary(cur, run_id)
     return {"elapsed_seconds": float(row[0] or 0), "active_runtime_seconds": float(row[1] or 0),
-            "llm_calls_reserved": int(row[2] or 0), "llm_call_budget": row[3],
-            "known_cost_usd": float(cost[0] or 0), "unknown_cost_calls": int(cost[1] or 0)}
+            "llm_calls_reserved": int(row[2] or 0), "llm_call_budget": row[3], **cost}
 
 
-def reserve_llm_call(run_id, default_budget):
-    """Atomically reserve ONE LLM request against the run-wide budget (R16).
-    Returns True if reserved, False if the budget is spent. Called before every
-    provider HTTP attempt, including retries; a crash after reserving still counts."""
+def reserve_llm_call(run_id, generation, default_budget, projected_usd=None,
+                     max_cost_usd=0.0, operation=None):
+    """Atomically reserve ONE provider request — its request count AND its maximum
+    possible dollar cost — before it is dispatched.
+
+    In ONE transaction, under the run row lock:
+      * the worker must still own the run (execution_generation) — a superseded
+        worker gets ExecutionLost and makes no request;
+      * the request-count budget must have room (else returns None);
+      * with a USD cap: no unbounded unknown spend may exist (CostUnknown), the
+        request must have a known maximum cost (CostUnknown), and
+            known + unknown upper bounds + open reservations + projected <= cap
+        (else CostLimitReached — the request is refused BEFORE it is made).
+    Returns {"reservation_id", "amount_usd"}. The reservation is settled in the
+    same transaction that records the call (llm._log_llm_attempt); if the worker
+    dies first it stays counted (open, then abandoned) — fail closed."""
+    from llm import CostUnknown, CostLimitReached
+    cap = float(max_cost_usd or 0)
     with get_connection() as conn:
         cur = conn.cursor()
-        cur.execute("""
-            UPDATE runs SET llm_calls_reserved = llm_calls_reserved + 1
-            WHERE id = %s AND llm_calls_reserved < COALESCE(llm_call_budget, %s)
-            RETURNING llm_calls_reserved
-        """, (run_id, int(default_budget)))
-        return cur.fetchone() is not None
+        cur.execute("""SELECT execution_generation, llm_calls_reserved,
+                              COALESCE(llm_call_budget, %s)
+                       FROM runs WHERE id = %s FOR UPDATE""", (int(default_budget), run_id))
+        row = cur.fetchone()
+        if not row or int(row[0]) != int(generation):
+            raise ExecutionLost(f"run {run_id}: generation {generation} superseded "
+                                f"(current {row[0] if row else 'missing'}) — no model call")
+        if int(row[1]) >= int(row[2]):
+            return None
+        if cap > 0:
+            if projected_usd is None:
+                raise CostUnknown("cost_unknown: the request's maximum cost cannot be "
+                                  f"computed; the ${cap} cost limit cannot be enforced")
+            spent = cost_summary(cur, run_id)
+            if spent["unbounded_unknown"]:
+                raise CostUnknown(f"cost_unknown: {spent['unbounded_unknown']} earlier call(s) "
+                                  f"have unknown, unbounded cost; the ${cap} cost limit "
+                                  f"cannot be enforced")
+            if spent["committed_usd"] + float(projected_usd) > cap + 1e-12:
+                raise CostLimitReached(
+                    f"cost limit: ${spent['committed_usd']:.6f} committed + "
+                    f"${float(projected_usd):.6f} for this request would exceed ${cap}")
+        cur.execute("UPDATE runs SET llm_calls_reserved = llm_calls_reserved + 1, "
+                    "cost_reserved_usd = cost_reserved_usd + %s WHERE id = %s",
+                    (float(projected_usd or 0), run_id))
+        cur.execute("""INSERT INTO llm_cost_reservations (run_id, execution_generation,
+                           operation, amount_usd)
+                       VALUES (%s, %s, %s, %s) RETURNING id""",
+                    (run_id, int(generation), (operation or "")[:80], projected_usd))
+        return {"reservation_id": int(cur.fetchone()[0]),
+                "amount_usd": None if projected_usd is None else float(projected_usd)}
 
 
 def set_controller_mode(run_id, generation, mode, progress):
@@ -489,27 +586,36 @@ def persist_advice(run_id, generation, job_id, title, advice_text, suggestions,
                   sg["method"], sg["status"], sg.get("validation_notes")))
 
 
+FINAL_COST_TOTALS_SQL = """
+    total_tokens = (SELECT COALESCE(SUM(prompt_tokens + completion_tokens), 0)
+                    FROM llm_calls WHERE run_id = %(run)s),
+    total_cost = (SELECT SUM(cost_usd) FROM llm_calls
+                  WHERE run_id = %(run)s AND cost_status = 'priced'),
+    unknown_cost_calls = (SELECT COUNT(*) FROM llm_calls
+                          WHERE run_id = %(run)s AND cost_status = 'unknown')
+                       + (SELECT COUNT(*) FROM llm_cost_reservations
+                          WHERE run_id = %(run)s AND status = 'abandoned')"""
+
+
 def finalize(run_id, generation, status, stop_reason, error_code, progress):
-    """Terminal transition, fenced. Closes the active runtime interval. Cost totals
-    keep unknown cost visible (R15): total_cost is the sum of PRICED calls (NULL if
-    none were priced) and unknown_cost_calls says how many successful calls are
-    missing from it — a partial total is never presented as complete."""
+    """Terminal transition, fenced. Closes the active runtime interval. Any
+    reservation still open is abandoned (it stays counted). Cost totals keep
+    unknown cost visible: total_cost is the sum of PRICED calls (NULL if none) and
+    unknown_cost_calls says how many calls are missing from it — a partial total
+    is never presented as complete."""
     code = error_code.value if hasattr(error_code, "value") else error_code
     with get_connection() as conn:
         cur = conn.cursor()
         _check_generation(cur, run_id, generation, lock="FOR UPDATE")
+        _abandon_open_reservations(cur, run_id)
         cur.execute(f"""
-            UPDATE runs SET ended_at = NOW(), status = %s, stop_reason = %s, error_code = %s,
-                pending_review = NULL, goal_progress = %s,
-                total_tokens = (SELECT COALESCE(SUM(prompt_tokens + completion_tokens), 0)
-                                FROM llm_calls WHERE run_id = %s),
-                total_cost = (SELECT SUM(cost_usd) FROM llm_calls WHERE run_id = %s),
-                unknown_cost_calls = (SELECT COUNT(*) FROM llm_calls WHERE run_id = %s
-                                      AND cost_usd IS NULL AND status = 'success'),
+            UPDATE runs SET ended_at = NOW(), status = %(status)s, stop_reason = %(reason)s,
+                error_code = %(code)s, pending_review = NULL, goal_progress = %(progress)s,
+                {FINAL_COST_TOTALS_SQL},
                 {CLOSE_EXECUTION_INTERVAL_SQL}
-            WHERE id = %s
-        """, (status, redact_secrets(stop_reason, 500), code,
-              json.dumps(progress, default=str), run_id, run_id, run_id, run_id))
+            WHERE id = %(run)s
+        """, {"status": status, "reason": redact_secrets(stop_reason, 500), "code": code,
+              "progress": json.dumps(progress, default=str), "run": run_id})
         cur.execute("""UPDATE review_requests SET status = 'superseded'
                        WHERE run_id = %s AND status IN ('pending', 'submitted')""", (run_id,))
 

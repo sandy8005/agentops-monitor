@@ -1,7 +1,7 @@
 """
 Remotive live-fetch is RUN-SCOPED, like the Adzuna layer: fetched postings are
-associated with the run's search (job_search_results) so a live_only run actually
-sees them, and the external call is observed as a tool_call. Needs Postgres.
+associated with the run's search (job_search_results) so that run's searches
+actually see them, and the external call is observed as a tool_call. Needs Postgres.
 The network call is mocked (Remotive is remote-only and not reachable in CI).
 """
 import uuid
@@ -28,7 +28,7 @@ def _run_and_step(uid):
     return run_id, step_id
 
 
-def test_remotive_fetch_is_run_scoped_and_visible_in_live_only(monkeypatch):
+def test_remotive_fetch_is_run_scoped_and_visible_to_the_run(monkeypatch):
     uid = create_user("rmt_" + uuid.uuid4().hex[:10], "password-1234")
     run_id, step_id = _run_and_step(uid)
 
@@ -36,7 +36,7 @@ def test_remotive_fetch_is_run_scoped_and_visible_in_live_only(monkeypatch):
     sample = [{"external_id": eid, "title": "Remote Python Engineer", "company": "RemoteCo",
                "description": "Python Django AWS remote role with plenty of real content here",
                "location": "Worldwide", "work_mode": "remote",
-               "employment_type": "full-time", "source": "live"}]
+               "employment_type": "full-time", "source": "remotive"}]
     monkeypatch.setattr(live_jobs, "fetch_live_jobs",
                         lambda role, location=None, limit=10: (list(sample), "success", None))
 
@@ -44,8 +44,8 @@ def test_remotive_fetch_is_run_scoped_and_visible_in_live_only(monkeypatch):
         "python engineer", "USA", run_id=run_id, step_id=step_id)
     assert status == "success" and inserted >= 1
 
-    # the run-scoped live_only search now includes the Remotive posting
-    jobs = search_jobs("python engineer", "USA", None, None, live_only=True, run_id=run_id)
+    # the run-scoped search now includes the Remotive posting
+    jobs = search_jobs("python engineer", "USA", None, None, run_id=run_id)
     assert any("Remote Python Engineer" in j["title"] for j in jobs)
 
     # a remotive search row + a remotive_fetch trace were recorded (parity with Adzuna)

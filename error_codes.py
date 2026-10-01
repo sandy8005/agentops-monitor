@@ -53,6 +53,14 @@ class ErrorCode(str, Enum):
     BUDGET_EXCEEDED = "budget_exceeded"           # per-run LLM request budget spent
     COST_UNKNOWN = "cost_unknown"                 # a hard USD cap is set but the model's
                                                   # price is unknown — fail closed
+    LIMIT_REACHED = "limit_reached"               # a hard run limit (iterations, runtime,
+                                                  # searches, cost) stopped the run before
+                                                  # the goal or the search space was done
+    CHECKPOINT_ERROR = "checkpoint_error"         # the durable checkpoint is inconsistent
+                                                  # with the run (e.g. unfinished, no
+                                                  # interrupt, decision never applied)
+    ENGINE_RETIRED = "engine_retired"             # a run queued for the retired legacy
+                                                  # pipeline engine — never executed
     WORKER_LOST = "worker_lost"                   # worker died / stopped heartbeating
                                                   # and the job ran out of attempts
     DATABASE_UNAVAILABLE = "database_unavailable" # connection / operational DB error —
@@ -118,6 +126,30 @@ def classify_exception(exc):
     if "budget" in low:
         return ErrorCode.BUDGET_EXCEEDED
     return ErrorCode.INTERNAL
+
+
+def stage_error_code(error_text):
+    """
+    Map a setup-stage error string (resume load/parse) to an ErrorCode.
+
+    Provider failures are classified FIRST: a parse that failed *because Gemini was
+    down or rate-limited* is an infrastructure problem, not an "unparseable
+    resume". Only a genuine, non-provider stage failure falls through to the stage
+    code.
+    """
+    code = classify_exception(error_text)
+    if code in (ErrorCode.LLM_UNAVAILABLE, ErrorCode.LLM_RATE_LIMITED,
+                ErrorCode.LLM_QUOTA_EXHAUSTED, ErrorCode.LLM_INVALID_RESPONSE,
+                ErrorCode.JOB_SOURCE_RATE_LIMITED, ErrorCode.JOB_SOURCE_UNAVAILABLE,
+                ErrorCode.JOB_SOURCE_AUTH_FAILED, ErrorCode.JOB_SOURCE_INVALID_RESPONSE,
+                ErrorCode.DATABASE_UNAVAILABLE):
+        return code
+    t = (error_text or "").lower()
+    if t.startswith("parse") or "parse failed" in t:
+        return ErrorCode.PARSE_FAILED
+    if t.startswith("search") or "search failed" in t:
+        return ErrorCode.SEARCH_FAILED
+    return code
 
 
 _QUOTA_ID_RE = None

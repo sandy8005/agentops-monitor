@@ -11,8 +11,9 @@ from typing import Any, Dict, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
-from agent_goal import AgentGoal, normalize_query, validate_search_query, SENIORITY_WORDS
-from agent_tools import TOOL_NAMES, TOOL_SPECS, unevaluated_eligible_ids
+from agent_goal import AgentGoal, candidate_queries, title_variants  # noqa: F401 (re-export)
+from agent_tools import (TOOL_NAMES, TOOL_SPECS, finish_permitted, search_space,
+                         unevaluated_eligible_ids)
 from prompt_safety import HARDENING_PREAMBLE, wrap_untrusted
 
 
@@ -28,50 +29,6 @@ class ControllerOutputInvalid(ValueError):
     pass
 
 
-# Only the TITLE changes; seniority words from the user's own title are carried over.
-TITLE_VARIANTS = [
-    (r"\bai engineer\b", ["machine learning engineer", "ml engineer", "applied ai engineer"]),
-    (r"\bmachine learning engineer\b", ["ai engineer", "ml engineer", "applied scientist"]),
-    (r"\bml engineer\b", ["machine learning engineer", "ai engineer"]),
-    (r"\bdata scientist\b", ["machine learning scientist", "applied scientist"]),
-    (r"\bdata engineer\b", ["analytics engineer", "etl developer"]),
-    (r"\bsoftware engineer\b", ["software developer", "backend engineer"]),
-    (r"\bbackend engineer\b", ["backend developer", "software engineer"]),
-    (r"\bfrontend engineer\b", ["frontend developer", "ui engineer"]),
-    (r"\bdevops engineer\b", ["site reliability engineer", "platform engineer"]),
-    (r"\bdata analyst\b", ["business intelligence analyst", "analytics analyst"]),
-]
-_ALL_SENIORITY = sorted({w for ws in SENIORITY_WORDS.values() for w in ws if " " not in w},
-                        key=len, reverse=True)
-
-
-def title_variants(target_role):
-    base = normalize_query(target_role)
-    prefix_words = []
-    for w in base.split():
-        if w in _ALL_SENIORITY:
-            prefix_words.append(w)
-        else:
-            break
-    core = " ".join(base.split()[len(prefix_words):])
-    prefix = (" ".join(prefix_words) + " ") if prefix_words else ""
-    out = []
-    for pattern, variants in TITLE_VARIANTS:
-        if re.search(pattern, core):
-            out.extend(prefix + v for v in variants)
-    return out
-
-
-def candidate_queries(goal: AgentGoal):
-    seen, out = set(), []
-    for q in [goal.target_role] + list(goal.alternative_titles) + title_variants(goal.target_role):
-        ok, qn, _ = validate_search_query(q, goal)
-        if ok and qn not in seen:
-            seen.add(qn)
-            out.append(qn)
-    return out
-
-
 def rules_decide(goal: AgentGoal, state, qualified):
     unevaluated = unevaluated_eligible_ids(state)
     if qualified >= goal.target_count:
@@ -80,19 +37,13 @@ def rules_decide(goal: AgentGoal, state, qualified):
         batch = unevaluated[:goal.limits.max_evaluate_batch]
         return ControllerDecision(action="evaluate_jobs", arguments={"job_ids": batch},
                                   reason=f"{len(unevaluated)} eligible jobs are not evaluated yet")
-    tried = {(s["provider"], s["query"]) for s in state.get("searches") or []}
-    if len(state.get("searches") or []) < goal.limits.max_searches:
-        failed_providers = {s["provider"] for s in state.get("searches") or []
-                            if s.get("provider_status") == "failed"}
-        for q in candidate_queries(goal):
-            providers = sorted(goal.providers, key=lambda p: p in failed_providers)
-            for p in providers:
-                if (p, q) not in tried:
-                    why = ("first search" if not tried else
-                           f"only {qualified}/{goal.target_count} qualified matches; trying "
-                           f"'{q}' on {p}")
-                    return ControllerDecision(action="search_jobs",
-                                              arguments={"provider": p, "query": q}, reason=why)
+    space = search_space(goal, state)
+    if space["next"]:
+        p, q = space["next"]
+        why = ("first search" if not state.get("searches") else
+               f"only {qualified}/{goal.target_count} qualified matches; trying '{q}' on {p}")
+        return ControllerDecision(action="search_jobs", arguments={"provider": p, "query": q},
+                                  reason=why)
     if _has_ok_evaluations(state) and not state.get("ranked"):
         return ControllerDecision(action="rank_jobs", arguments={},
                                   reason="search options exhausted; rank what was found")
@@ -203,14 +154,14 @@ def build_prompt(goal: AgentGoal, state, qualified, allowed_actions, remaining):
         "search_outcomes": [{k: s[k] for k in ("provider", "provider_status", "new_jobs",
                                                "duplicates", "eligible_jobs")}
                             for s in searches],
+        "search_space": {k: v for k, v in search_space(goal, state).items() if k != "next"},
         "remaining": remaining,
         "allowed_actions": {a: TOOL_SPECS[a] for a in allowed_actions},
     }
     user_goal = {"description": goal.description, "target_role": goal.target_role,
                  "location": goal.constraints.location}
     search_queries = [{"provider": s["provider"], "query": s["query"]} for s in searches]
-    untried = [q for q in candidate_queries(goal)
-               if not any(s.get("query") == q for s in searches)][:6]
+    untried = search_space(goal, state)["untried_queries"][:6]
     observations = _compact_observations(state.get("observations"))
     human_inputs = [{"question": str(h.get("question") or "")[:300],
                      "answer": str(h.get("answer") or "")[:60]}
@@ -233,7 +184,8 @@ Rules:
 - You may try a different job TITLE or another allowed provider when results are poor.
 - Only use job ids that appear in unevaluated_eligible_job_ids.
 - A failed search is NOT evidence that no jobs exist.
-- Finish when the goal is met, when useful options are exhausted, or when limits are near.
+- `finish` is only offered once the goal is met or the search space is exhausted; the
+  backend enforces this regardless of what you propose.
 
 BACKEND STATE (JSON): {json.dumps(backend_state, default=str)}
 
@@ -280,11 +232,13 @@ def llm_decide(goal, state, qualified, allowed_actions, remaining, run_id, step_
 
 def allowed_actions_for(goal, state, qualified):
     """Actions that are POSSIBLE and USEFUL in the current state — the same checks
-    the rules policy uses, so the LLM controller is never offered an action the
-    tool would reject (each rejection feeds rejection_streak and can needlessly
-    demote the run to the rules controller)."""
+    the rules policy and the tools use, so the LLM controller is never offered an
+    action the backend would reject. In particular `finish` is offered only when
+    the backend's own completion criteria hold (finish_permitted): a model cannot
+    end a run that has not searched."""
     can_rank = _has_ok_evaluations(state) and not state.get("ranked")
     can_advise = bool(_top_unadvised(state))
+    can_finish, _why = finish_permitted(goal, state, qualified)
     if qualified >= goal.target_count:
         acts = []
         if can_rank:
@@ -294,7 +248,7 @@ def allowed_actions_for(goal, state, qualified):
         acts.append("finish")
         return acts
     acts = list(TOOL_NAMES)
-    if len(state.get("searches") or []) >= goal.limits.max_searches:
+    if not search_space(goal, state)["next"]:
         acts.remove("search_jobs")
     if not unevaluated_eligible_ids(state):
         acts.remove("evaluate_jobs")
@@ -304,4 +258,6 @@ def allowed_actions_for(goal, state, qualified):
         acts.remove("generate_advice")
     if int(state.get("input_requests") or 0) >= 2:
         acts.remove("request_human_input")
+    if not can_finish:
+        acts.remove("finish")
     return acts

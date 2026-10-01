@@ -1,57 +1,51 @@
 """
-Pure-logic tests for the autonomous agent: LangGraph routing, judge skipping,
-budget math, cancellation. No DB, no LLM — they run fast and free in CI.
+Pure-logic tests for the agent engine: graph routing, budget math, disagreement
+rules. No DB, no LLM — they run fast and free in CI.
 
-Routing is tested on the REAL routing functions in autonomous_graph.py (the
-runtime), not on the retired planner (moved to legacy/).
+Routing is tested on the REAL routing functions of agent_loop (the only engine;
+the fixed-sequence pipeline graph was retired).
 """
 import pytest
 from agent_state import AgentState
-from autonomous_graph import (
-    route_after_start, route_after_parse, route_after_search,
-    route_after_process_job, route_after_human_review, route_after_rank,
-)
+from agent_loop import route_after_setup, route_after_decide, route_after_act, route_after_review
+
+
+def _ready_state(**kw):
+    return AgentState(goal="m", resume_id=1, **kw)
 
 
 # ----------------------- graph routing -----------------------
 
-def _ready_state(**kw):
-    s = AgentState(goal="m", resume_id=1, **kw)
-    return s
-
-def _d(**kw):
-    """Flat graph-state dict, like LangGraph passes to routing functions."""
-    return _ready_state().to_dict() | kw
-
-def test_routing_walks_full_sequence():
-    assert route_after_start(_d(resume_text="r")) == "parse_resume"
-    assert route_after_parse(_d(parsed_resume={"skills": []})) == "search_jobs"
-    jobs = [{"title": "A"}, {"title": "B"}]
-    assert route_after_search(_d(jobs=jobs)) == "process_job"
-    assert route_after_process_job(_d(jobs=jobs, current_job_index=1)) == "process_job"
-    assert route_after_process_job(_d(jobs=jobs, current_job_index=2)) == "rank_jobs"
-    assert route_after_rank(_d(ranked=[])) == "generate_advice"   # empty ranking terminates
-
-def test_routing_no_matches_terminates():
-    assert route_after_search(_d(jobs=[])) == "no_matches"
-
-def test_routing_error_routes_to_fail():
-    for route in (route_after_start, route_after_parse, route_after_search):
-        assert route(_d(error="boom")) == "fail"
-
-def test_flagged_job_routes_to_human_review():
-    assert route_after_process_job(_d(jobs=[{"title": "A"}], current_job_index=1,
-                                      last_job_needs_review=True)) == "human_review"
+def test_setup_failure_goes_straight_to_finalize():
+    assert route_after_setup({"stop": {"by": "error", "setup_failed": True}}) == "finalize"
+    assert route_after_setup({"stop": None}) == "decide"
 
 
-# ----------------------- cancellation -----------------------
+def test_decide_stop_finalizes_otherwise_acts():
+    assert route_after_decide({"stop": {"by": "limit"}}) == "finalize"
+    assert route_after_decide({"stop": None}) == "act"
 
-def test_cancelled_takes_priority_over_normal_work_and_review():
-    jobs = [{"title": "A"}, {"title": "B"}]
-    assert route_after_process_job(_d(jobs=jobs, current_job_index=0, cancelled=True)) == "cancelled"
-    assert route_after_process_job(_d(jobs=jobs, current_job_index=1, cancelled=True,
-                                      last_job_needs_review=True)) == "cancelled"
-    assert route_after_human_review(_d(jobs=jobs, current_job_index=1, cancelled=True)) == "cancelled"
+
+def test_flagged_job_routes_to_review_before_anything_else():
+    assert route_after_act({"review_queue": [{"review_id": "r"}]}) == "review"
+    # a limit stop still lets the queued review happen first
+    assert route_after_act({"review_queue": [{"review_id": "r"}],
+                            "stop": {"by": "limit"}}) == "review"
+    assert route_after_act({"review_queue": []}) == "decide"
+
+
+def test_cancel_takes_priority_over_review():
+    assert route_after_act({"review_queue": [{"review_id": "r"}], "cancel_seen": True}) == "finalize"
+    assert route_after_act({"review_queue": [{"review_id": "r"}],
+                            "stop": {"cancel": True}}) == "finalize"
+    assert route_after_review({"review_queue": [{"review_id": "r2"}],
+                               "stop": {"cancel": True}}) == "finalize"
+
+
+def test_review_queue_drains_then_continues():
+    assert route_after_review({"review_queue": [{"review_id": "r2"}]}) == "review"
+    assert route_after_review({"review_queue": []}) == "decide"
+    assert route_after_review({"review_queue": [], "stop": {"by": "user"}}) == "finalize"
 
 
 # ----------------------- budget math (can_spend / spend) -----------------------
@@ -67,44 +61,35 @@ def test_budget_spend_and_can_spend():
     assert s.can_spend() is False           # 3/3 spent
     assert s.budget_exceeded() is True
 
-def test_routing_does_not_stop_on_budget():
-    # Budget must NOT halt routing — free work (ranking) still runs when quota is spent.
-    s = _ready_state()
-    d = _d(jobs=[{"title": "A"}], current_job_index=1, llm_calls_made=s.max_llm_calls)
-    assert route_after_process_job(d) == "rank_jobs"
-
-
-# ----------------------- judge skipping logic -----------------------
-
-def _judge_decision(score, budget_exceeded):
-    """Mirror of router's judge branch (which score bands skip the judge)."""
-    if not (20 <= score <= 80):
-        return "skipped", ("score_extreme_low" if score < 20 else "score_extreme_high"), False
-    elif budget_exceeded:
-        return "skipped", "budget", False
-    else:
-        return "ran", None, True
-
-@pytest.mark.parametrize("score,budget,exp_status,exp_reason,exp_called", [
-    (95, False, "skipped", "score_extreme_high", False),
-    (10, False, "skipped", "score_extreme_low", False),
-    (50, True,  "skipped", "budget", False),
-    (50, False, "ran", None, True),
-    (20, False, "ran", None, True),   # boundary inclusive
-    (80, False, "ran", None, True),   # boundary inclusive
-])
-def test_judge_skip_matrix(score, budget, exp_status, exp_reason, exp_called):
-    status, reason, called = _judge_decision(score, budget)
-    assert status == exp_status
-    assert reason == exp_reason
-    assert called == exp_called
-
-
 # ----------------------- disagreement logic (record_score) -----------------------
 
 def _would_flag(score_decision, llm_decision):
-    real = {"Apply", "Maybe", "Skip"}
-    return (llm_decision in real) and (score_decision != llm_decision)
+    """Exercise the REAL rule in llm.record_score (no DB: flag_for_review and the
+    UPDATE are replaced)."""
+    import llm
+    flagged = []
+
+    class _Cur:
+        def execute(self, *a, **k):
+            pass
+
+    class _Conn:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def cursor(self):
+            return _Cur()
+
+    orig_conn, orig_flag = llm.get_connection, llm.flag_for_review
+    llm.get_connection = lambda: _Conn()
+    llm.flag_for_review = lambda step_id, reason=None: flagged.append(reason)
+    try:
+        return llm.record_score(1, 50.0, score_decision, llm_decision)
+    finally:
+        llm.get_connection, llm.flag_for_review = orig_conn, orig_flag
 
 def test_skipped_judge_is_not_a_disagreement():
     assert _would_flag("Skip", "skipped (budget)") is False

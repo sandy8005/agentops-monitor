@@ -31,7 +31,7 @@ from agent_controller import (ControllerDecision, ControllerOutputInvalid, allow
                               llm_decide, rules_decide)
 from agent_goal import AgentGoal
 from agent_tools import ToolContext, ToolRejected, execute, qualified_count
-from error_codes import ErrorCode, classify_exception
+from error_codes import ErrorCode, classify_exception, stage_error_code
 from logging_config import get_logger
 from pricing import price_known
 from settings import settings
@@ -78,33 +78,58 @@ class LoopState(TypedDict, total=False):
     limit_stop: Optional[dict]
     stop: Optional[dict]
     final: Optional[dict]
+    # Declared so LangGraph keeps them between nodes (undeclared keys are dropped).
+    search_exhausted: bool
+    last_failure_code: Optional[str]
 
 
 # ------------------------------------------------------------------ budget ----
 
 class DurableBudget:
-    """Run-wide LLM request budget stored in runs.llm_calls_reserved (R16).
+    """Run-wide LLM budget: request count AND dollars, stored durably (R16).
 
-    logged_llm_call() calls can_spend() immediately before EVERY HTTP attempt and
-    then spend(). can_spend() performs the atomic reservation, so a crash after it
-    still counts and a retry/replay can never reset the allowance; spend() is a
-    no-op. exhausted() is a read-only check for gating decisions."""
+    logged_llm_call() calls reserve_attempt(projected_usd, operation) immediately
+    before EVERY HTTP attempt (retries included). One fenced transaction then
+      * proves this worker still owns the run (execution_generation) — plus an
+        in-process ownership check first, so a worker that already knows it lost
+        the run never even touches the database;
+      * reserves one request against the request budget;
+      * with a USD cap, reserves the request's MAXIMUM possible cost so that
+        committed spend + this request can never exceed the cap.
+    A crash after reserving still counts; a retry/replay can never reset the
+    allowance. exhausted() is a read-only check for gating decisions."""
 
-    def __init__(self, run_id, limit, max_cost_usd=0.0):
+    def __init__(self, run_id, limit, max_cost_usd=0.0, generation=None):
         self.run_id = run_id
         self.limit = int(limit)
         self.max_cost_usd = float(max_cost_usd or 0)
+        self.generation = generation
 
-    def can_spend(self):
-        # Fail closed BEFORE reserving: a cost-bounded run never makes a call whose
-        # cost it cannot account for (the price may have been removed, or
-        # GEMINI_MODEL changed, after the run started).
+    def check_owner(self):
+        run_lock.check_owner(self.run_id)
+
+    def reserve_attempt(self, projected_usd, operation=None):
+        from llm import BudgetExceeded, CostUnknown
+        self.check_owner()
         if self.max_cost_usd > 0 and not price_known():
-            from llm import CostUnknown
+            # The price may have been removed, or GEMINI_MODEL changed, after the
+            # run started: a cap whose accounting is unknown is not a cap.
             raise CostUnknown(f"cost_unknown: no price is configured for model "
                               f"{settings.gemini_model!r}; the ${self.max_cost_usd} cost "
                               f"limit cannot be enforced")
-        return store.reserve_llm_call(self.run_id, self.limit)
+        if self.generation is None:
+            raise RuntimeError("DurableBudget needs the execution generation to reserve calls")
+        res = store.reserve_llm_call(self.run_id, self.generation, self.limit,
+                                     projected_usd=projected_usd,
+                                     max_cost_usd=self.max_cost_usd, operation=operation)
+        if res is None:
+            raise BudgetExceeded(f"LLM request budget reached ({self.limit}) before {operation}")
+        return res
+
+    # Legacy two-step protocol, kept for code that only asks "is there room?".
+    # It never reserves: every real request goes through reserve_attempt().
+    def can_spend(self):
+        return not self.exhausted()
 
     def spend(self):
         pass
@@ -112,7 +137,9 @@ class DurableBudget:
     def exhausted(self):
         u = store.run_usage(self.run_id)
         cap = u["llm_call_budget"] if u["llm_call_budget"] is not None else self.limit
-        return u["llm_calls_reserved"] >= cap
+        if u["llm_calls_reserved"] >= cap:
+            return True
+        return self.max_cost_usd > 0 and u.get("committed_usd", 0.0) >= self.max_cost_usd
 
 
 def _ctx(state, config, iteration=None):
@@ -120,7 +147,8 @@ def _ctx(state, config, iteration=None):
     run_lock.check_owner(run_id)                        # node-boundary ownership check
     goal = AgentGoal(**state["goal"])
     gen = config["configurable"]["generation"]
-    budget = DurableBudget(run_id, goal.limits.max_llm_calls, goal.limits.max_cost_usd)
+    budget = DurableBudget(run_id, goal.limits.max_llm_calls, goal.limits.max_cost_usd,
+                           generation=gen)
     return run_id, goal, gen, budget
 
 
@@ -165,13 +193,17 @@ def check_limits(run_id, goal, state):
         pre = cost_preflight(goal)
         if pre:
             return pre
-        if usage["unknown_cost_calls"] > 0:
-            # Fail closed: some spend cannot be counted, so the cap cannot be proven.
+        if usage.get("unbounded_unknown", 0) > 0:
+            # Fail closed: some spend has no known bound, so the cap cannot be proven.
             return {"by": "limit", "cost_unknown": True,
-                    "reason": (f"cost_unknown: {usage['unknown_cost_calls']} model call(s) have "
-                               f"no known price; the ${lim.max_cost_usd} cost limit cannot be "
-                               f"enforced (known spend ${usage['known_cost_usd']:.6f})")}
-        if usage["known_cost_usd"] >= lim.max_cost_usd:
+                    "reason": (f"cost_unknown: {usage['unbounded_unknown']} model call(s) have "
+                               f"unknown, unbounded cost; the ${lim.max_cost_usd} cost limit "
+                               f"cannot be enforced (known spend ${usage['known_cost_usd']:.6f})")}
+        # Enforced against COMMITTED spend: priced calls + upper bounds of calls
+        # whose cost is unknown + requests in flight. Each request also reserves
+        # its own maximum cost before dispatch (reserve_llm_call), so the cap holds
+        # even between these checks.
+        if usage.get("committed_usd", usage.get("known_cost_usd", 0.0)) >= lim.max_cost_usd:
             return {"by": "limit", "reason": f"estimated cost limit reached (${lim.max_cost_usd})"}
     if int(state.get("no_progress") or 0) >= lim.no_progress_limit:
         return {"by": "limit", "reason": f"no progress in {lim.no_progress_limit} consecutive "
@@ -216,6 +248,14 @@ def _adapter(run_id, goal, budget, state):
     from agent_state import AgentState
 
     class _S(AgentState):
+        generation = budget.generation
+
+        def reserve_attempt(self, projected_usd, operation=None):
+            return budget.reserve_attempt(projected_usd, operation)
+
+        def check_owner(self):
+            budget.check_owner()
+
         def can_spend(self):
             return budget.can_spend()
 
@@ -262,7 +302,8 @@ def node_setup(state: LoopState, config):
             "limit_stop": None, "advised": [], "advice_attempted": [], "ranked": False,
             "input_requests": 0, "output_failures": 0, "discovered": {}, "evaluated": {},
             "searches": [], "observations": [], "review_queue": [], "human_inputs": [],
-            "rejection_streak": 0, "failure_streak": 0, "no_progress": 0}
+            "rejection_streak": 0, "failure_streak": 0, "no_progress": 0,
+            "search_exhausted": False, "last_failure_code": None}
 
 
 def node_decide(state: LoopState, config):
@@ -393,15 +434,23 @@ def node_act(state: LoopState, config):
     except (store.ExecutionLost, run_lock.ExecutionLost):
         raise
     except Exception as e:
+        code = classify_exception(e)
+        if code == ErrorCode.DATABASE_UNAVAILABLE:
+            # Infrastructure, not a tool outcome: fail the run with a retryable code
+            # instead of recording a "failed action" the controller would react to.
+            raise
         from sanitize import safe_exception_summary
         msg = safe_exception_summary(e)
         store.record_action_outcome(run_id, gen, i, "failed", {"failed": msg}, error=msg,
                                     replayed=replayed)
         obs_entry["failed"] = msg
         work["failure_streak"] = int(work.get("failure_streak") or 0) + 1
+        work["last_failure_code"] = code.value if isinstance(code, ErrorCode) else code
         if action == "rank_jobs":
             work["output_failures"] = int(work.get("output_failures") or 0) + 1
 
+    from agent_tools import search_space
+    work["search_exhausted"] = search_space(goal, work)["exhausted"]
     if work.get("limit_stop"):                     # a limit/cancel hit INSIDE the tool
         work["stop"] = work.pop("limit_stop")
     elif work.get("cancel_seen"):
@@ -511,6 +560,9 @@ def node_finalize(state: LoopState, config):
     searches = work.get("searches") or []
     all_failed = bool(searches) and all(s.get("provider_status") == "failed" for s in searches)
     eval_failures = progress["evaluation_failures"]
+    from agent_tools import search_space
+    exhausted = search_space(goal, work)["exhausted"]
+    progress["search_exhausted"] = exhausted
     # N06: a cancel requested after the last action still wins.
     if not stop.get("cancel") and (work.get("cancel_seen") or store.is_cancel_requested(run_id)):
         stop = {"by": "user", "reason": "cancelled by user", "cancel": True}
@@ -522,19 +574,27 @@ def node_finalize(state: LoopState, config):
         # already verified are kept (partial), but the run is never "success".
         status, code = ("partial_success" if q else "failed"), ErrorCode.COST_UNKNOWN
     elif stop.get("setup_failed"):
-        from autonomous_graph import _stage_error_code
-        status, code = "failed", _stage_error_code(stop.get("reason"))
+        status, code = "failed", stage_error_code(stop.get("reason"))
     elif rank_error:
         status, code = "failed", ErrorCode.INTERNAL          # deliverable not persisted (R03)
         stop = {**stop, "reason": f"ranking could not be persisted: {rank_error}"}
     elif stop.get("by") == "error":
-        status, code = ("partial_success" if q else "failed"), (None if q else ErrorCode.INTERNAL)
+        last = work.get("last_failure_code")
+        status = "partial_success" if q else "failed"
+        code = None if q else (_as_code(last) or ErrorCode.INTERNAL)
     elif q >= goal.target_count:
         status, code = "success", None
     elif q > 0:
         status, code = "partial_success", None
     elif all_failed:
-        status, code = "failed", ErrorCode.JOB_SOURCE_UNAVAILABLE
+        # Keep the providers' specific failure: bad credentials are terminal
+        # (job_source_auth_failed), an outage is retryable (job_source_unavailable).
+        status, code = "failed", _provider_failure_code(searches)
+    elif not searches:
+        # Nothing was searched, so "no matches" would be a false claim.
+        status = "failed"
+        code = ErrorCode.LIMIT_REACHED if stop.get("by") == "limit" else ErrorCode.INTERNAL
+        stop = {**stop, "reason": f"{stop.get('reason')} (no job search was performed)"}
     elif eval_failures and not evaluated_ok:
         # Jobs were found but NONE could be evaluated: that is a failure, not
         # evidence that no suitable job exists.
@@ -542,6 +602,9 @@ def node_finalize(state: LoopState, config):
         stop = {**stop, "reason": f"{eval_failures} job evaluation(s) failed; none completed"}
     elif eval_failures:
         status, code = "completed_with_errors", None      # some coverage missing
+    elif not exhausted:
+        # A hard limit stopped the search before the search space was covered.
+        status, code = "no_matches", ErrorCode.LIMIT_REACHED
     else:
         status, code = "no_matches", ErrorCode.NO_MATCHES
     reason = f"{stop.get('reason')} — {q}/{goal.target_count} qualified"
@@ -553,6 +616,21 @@ def node_finalize(state: LoopState, config):
     work["final"] = {"status": status, "reason": reason,
                      "error_code": code.value if code else None, "progress": progress}
     return work
+
+
+def _as_code(value):
+    try:
+        return ErrorCode(value) if value else None
+    except ValueError:
+        return None
+
+
+def _provider_failure_code(searches):
+    """One run-level code for 'every search failed', from the providers' own
+    classified statuses (same mapping as the rest of the job-source layer)."""
+    from router import provider_failure_code
+    return provider_failure_code({f"{s.get('provider')}:{i}": s.get("provider_detail") or "failed"
+                                  for i, s in enumerate(searches)})
 
 
 # ----------------------------------------------------------------- routing ----
@@ -634,7 +712,9 @@ def _handle_result(run_id, gen, result):
                                             "error_code": ErrorCode.INTERNAL.value, "progress": {}}
     store.finalize(run_id, gen, final["status"], final["reason"], final["error_code"],
                    final["progress"])
-    log.info("agent run finished: %s (%s)", final["status"], final["reason"], extra={"run_id": run_id})
+    # Status + code only: the reason can embed model-written or goal text.
+    log.info("agent run finished: %s (code=%s)", final["status"], final.get("error_code"),
+             extra={"run_id": run_id})
     return result
 
 
@@ -650,14 +730,16 @@ def _repair_from_checkpoint(run_id, gen, final):
 
 def _fail(run_id, gen, e):
     if isinstance(e, (store.ExecutionLost, run_lock.ExecutionLost)) or run_lock.is_lost(run_id):
-        log.warning("agent execution abandoned: %s", e, extra={"run_id": run_id})
+        log.warning("agent execution abandoned (%s)", type(e).__name__, extra={"run_id": run_id})
         return {"abandoned": True}
     from sanitize import safe_exception_summary
     try:
         store.finalize(run_id, gen, "failed", safe_exception_summary(e), classify_exception(e), {})
     except Exception as fin:
-        log.error("could not finalize failed agent run: %s", fin, extra={"run_id": run_id})
-    log.error("agent run failed: %s", safe_exception_summary(e), extra={"run_id": run_id})
+        log.error("could not finalize failed agent run (%s)", type(fin).__name__,
+                  extra={"run_id": run_id})
+    log.error("agent run failed (%s, code=%s)", type(e).__name__, classify_exception(e),
+              extra={"run_id": run_id})
     return {"error": True}
 
 
@@ -702,6 +784,31 @@ def run_agent_loop(run_id, queue_attempt=1, checkpointer_factory=None):
         return _fail(run_id, gen, e)
 
 
+def _resume_without_interrupt(graph, config, run_id, gen, rid, snap):
+    """A resume job found the checkpoint NOT paused on any interrupt (and not
+    completed — that case is repaired from the checkpoint before we get here).
+    begin_execution() already set status='running', so every branch below must end
+    in a DETERMINISTIC status — never return with the run left 'running':
+
+      * the review was already consumed and the graph moved on (a previous worker
+        applied the decision, then died mid-graph): CONTINUE the graph — every node
+        is replay-safe, exactly like run_agent_loop's interrupted-mid-graph case;
+      * anything else (no checkpoint, or an unfinished checkpoint whose review was
+        never applied): the durable state is inconsistent -> failed/checkpoint_error.
+    """
+    rec = store.review_status(rid) if rid else None
+    if snap and snap.next and rec and rec.get("status") == "consumed":
+        log.warning("resume for consumed review %s: continuing the graph from its checkpoint",
+                    rid, extra={"run_id": run_id})
+        return _handle_result(run_id, gen, graph.invoke(None, config=config))
+    reason = ("checkpoint_error: the run has no checkpoint to resume" if not (snap and snap.next)
+              else f"checkpoint_error: checkpoint is not paused on review {rid!r} and that "
+                   f"review was never applied")
+    store.finalize(run_id, gen, "failed", reason, ErrorCode.CHECKPOINT_ERROR, {})
+    log.error("%s", reason, extra={"run_id": run_id})
+    return {"stale": True, "status": "failed"}
+
+
 def resume_agent_loop(run_id, payload, queue_attempt=1, checkpointer_factory=None):
     """Worker entrypoint for a resume_run job of an agent run. The decision is bound
     to payload['review_id']; if the checkpoint is paused on a DIFFERENT interrupt the
@@ -739,16 +846,15 @@ def resume_agent_loop(run_id, payload, queue_attempt=1, checkpointer_factory=Non
                 # N04: the review was consumed and the graph completed, but the process
                 # died before the run row was finalized. Repair from the checkpoint.
                 return _repair_from_checkpoint(run_id, gen, final)
-            if not pending or pending.get("review_id") != rid:
-                # Stale job (retry after the graph moved on, or an old tab). Restore
-                # a consistent run status from the CHECKPOINT; apply nothing.
-                if pending:
-                    store.mark_waiting(run_id, gen, pending)    # also closes the interval
-                else:
-                    store.suspend_execution(run_id, gen)     # nothing ran: charge nothing more
+            if pending and pending.get("review_id") != rid:
+                # Stale job (an old tab, or a retry after the graph moved on to the
+                # NEXT review). The checkpoint is waiting: restore that; apply nothing.
+                store.mark_waiting(run_id, gen, pending)    # also closes the interval
                 log.warning("stale resume for review %s ignored (checkpoint waits on %s)",
-                            rid, (pending or {}).get("review_id"), extra={"run_id": run_id})
-                return {"stale": True}
+                            rid, pending.get("review_id"), extra={"run_id": run_id})
+                return {"stale": True, "status": "waiting_for_human"}
+            if not pending:
+                return _resume_without_interrupt(graph, config, run_id, gen, rid, snap)
             result = graph.invoke(Command(resume={"review_id": rid}), config=config)
             return _handle_result(run_id, gen, result)
     except Exception as e:

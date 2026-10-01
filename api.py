@@ -13,6 +13,7 @@ from llm import create_run, create_run_tx, request_cancel
 from job_queue import enqueue, enqueue_tx
 from pdf_reader import read_resume_file_isolated, PdfExtractionError
 from auth import authenticate
+from error_codes import classify_exception
 from csrf import get_or_create_token, require_csrf
 
 from slowapi import Limiter
@@ -79,7 +80,8 @@ def _rate_limit_handler(request: Request, exc: RateLimitExceeded):
     return JSONResponse(status_code=429,
                         content={"detail": "Too many requests — slow down."})
 
-MAX_UPLOAD_BYTES = 5 * 1024 * 1024
+MAX_UPLOAD_BYTES = settings.max_upload_bytes
+UPLOAD_CHUNK_BYTES = 64 * 1024
 
 from logging_config import get_logger
 log = get_logger("api")
@@ -224,8 +226,30 @@ def whoami(user: dict = Depends(require_auth)):
     return {"username": user["username"]}
 
 
+class _UploadTooLarge(Exception):
+    pass
+
+
+async def _read_capped(file, limit):
+    """Read an upload in CHUNKS and stop as soon as it exceeds `limit`, so a huge
+    body is never held in memory in full. (Starlette spools the multipart part to
+    a temporary file; this bounds what WE buffer. The reverse proxy's body limit —
+    e.g. nginx client_max_body_size — must be set as well: it is the only layer
+    that can refuse the bytes before they are received.)"""
+    chunks, total = [], 0
+    while True:
+        chunk = await file.read(UPLOAD_CHUNK_BYTES)
+        if not chunk:
+            return b"".join(chunks)
+        total += len(chunk)
+        if total > limit:
+            raise _UploadTooLarge()
+        chunks.append(chunk)
+
+
 @app.post("/upload")
-async def upload_resume(file: UploadFile = File(...), name: str = Form(""),
+@limiter.limit(settings.rate_limit_upload)
+async def upload_resume(request: Request, file: UploadFile = File(...), name: str = Form(""),
                         user: dict = Depends(require_auth),
                         _csrf: None = Depends(require_csrf)):
     filename = file.filename or ""          # multipart parts may omit the filename
@@ -233,9 +257,15 @@ async def upload_resume(file: UploadFile = File(...), name: str = Form(""),
         raise HTTPException(status_code=400, detail="Please upload a PDF file")
     _check_len("name", name, MAX_NAME_CHARS)
 
-    contents = await file.read()
-    if len(contents) > MAX_UPLOAD_BYTES:
-        raise HTTPException(status_code=400, detail="File too large (max 5 MB)")
+    # Cheap early reject from the declared length (a client can lie, so the
+    # streamed cap below is what actually enforces the limit).
+    declared = request.headers.get("content-length")
+    if declared and declared.isdigit() and int(declared) > MAX_UPLOAD_BYTES + 64 * 1024:
+        raise HTTPException(status_code=413, detail="File too large")
+    try:
+        contents = await _read_capped(file, MAX_UPLOAD_BYTES)
+    except _UploadTooLarge:
+        raise HTTPException(status_code=413, detail="File too large")
     if not contents[:5].startswith(b"%PDF"):
         raise HTTPException(status_code=400, detail="File does not appear to be a valid PDF")
 
@@ -247,7 +277,7 @@ async def upload_resume(file: UploadFile = File(...), name: str = Form(""),
         # Parsed in a resource-limited child process, not in the API process.
         resume_text = read_resume_file_isolated(tmp_path)
     except PdfExtractionError as e:
-        log.warning("pdf extraction failed: %s", e)
+        log.warning("pdf extraction failed (%s)", type(e).__name__)
         raise HTTPException(status_code=400, detail="Could not read that PDF")
     finally:
         os.remove(tmp_path)
@@ -323,15 +353,37 @@ def delete_resume(resume_id: int, user: dict = Depends(require_auth),
     return {"resume_id": resume_id, "deleted": True, "erased": True}
 
 
-def _cost_fields(known, unknown_calls):
+# Per-run cost, one definition (matches agent_store.cost_summary): priced calls,
+# calls whose cost is unknown (usage missing / failed after dispatch) plus
+# reservations abandoned by a dead worker, and the conservative bound of those.
+_COST_LATERAL_SQL = """
+    LEFT JOIN LATERAL (
+        SELECT (SELECT SUM(cost_usd) FROM llm_calls
+                WHERE run_id = r.id AND cost_status = 'priced') AS known,
+               (SELECT COUNT(*) FROM llm_calls
+                WHERE run_id = r.id AND cost_status = 'unknown')
+             + (SELECT COUNT(*) FROM llm_cost_reservations
+                WHERE run_id = r.id AND status = 'abandoned') AS unknown_calls,
+               COALESCE((SELECT SUM(cost_upper_bound_usd) FROM llm_calls
+                         WHERE run_id = r.id AND cost_status = 'unknown'), 0)
+             + COALESCE((SELECT SUM(amount_usd) FROM llm_cost_reservations
+                         WHERE run_id = r.id AND status IN ('abandoned', 'open')), 0)
+                   AS unknown_bound
+    ) c ON TRUE"""
+
+
+def _cost_fields(known, unknown_calls, unknown_bound=0.0):
     """One cost shape for every endpoint. total_cost is only a number when it is
-    COMPLETE; otherwise the known part and the count of unpriced calls are explicit
-    (SUM() ignores NULL, so a bare sum of a partly-unpriced run looks complete)."""
+    COMPLETE; otherwise the known part, the number of calls with unknown cost and
+    a conservative upper bound are explicit (a bare SUM() of a partly-unknown run
+    would look complete)."""
     known = float(known or 0)
     unknown_calls = int(unknown_calls or 0)
+    bound = float(unknown_bound or 0)
     complete = unknown_calls == 0
     return {"total_cost": known if complete else None, "known_cost_usd": known,
             "unknown_cost_calls": unknown_calls, "cost_complete": complete,
+            "cost_upper_bound_usd": known + bound,
             "cost_basis": "estimated_paid_tier"}
 
 
@@ -339,23 +391,19 @@ def _cost_fields(known, unknown_calls):
 def list_runs(limit: int = Query(20, ge=1, le=100), user: dict = Depends(require_auth)):
     with get_connection() as conn:
         cur = conn.cursor()
-        cur.execute("""
+        cur.execute(f"""
             SELECT r.id, r.status, r.started_at, r.total_tokens,
                    r.target_role, r.location, r.work_mode, r.error_code,
-                   COALESCE(c.known, 0), COALESCE(c.unknown_calls, 0)
+                   COALESCE(c.known, 0), c.unknown_calls, c.unknown_bound
             FROM runs r
-            LEFT JOIN LATERAL (
-                SELECT SUM(cost_usd) AS known,
-                       COUNT(*) FILTER (WHERE cost_usd IS NULL AND status = 'success')
-                           AS unknown_calls
-                FROM llm_calls WHERE run_id = r.id) c ON TRUE
+            {_COST_LATERAL_SQL}
             WHERE r.user_id = %s ORDER BY r.id DESC LIMIT %s
         """, (user["id"], limit))
         rows = cur.fetchall()
         return [{"id": r[0], "status": r[1],
                  "started_at": r[2].isoformat() if r[2] else None,
                  "total_tokens": r[3], "target_role": r[4], "location": r[5],
-                 "work_mode": r[6], "error_code": r[7], **_cost_fields(r[8], r[9])}
+                 "work_mode": r[6], "error_code": r[7], **_cost_fields(r[8], r[9], r[10])}
                 for r in rows]
 
 
@@ -368,7 +416,7 @@ class AgentGoalRequest(BaseModel):
     alternative_titles: list[str] = Field(default_factory=list, max_length=8)
     seniority: Literal["", "intern", "entry", "junior", "mid", "senior"] = ""
     include_maybe: bool = False
-    providers: list[Literal["adzuna", "remotive", "pool"]] = Field(
+    providers: list[Literal["adzuna", "remotive"]] = Field(
         default_factory=lambda: ["adzuna", "remotive"])
     max_iterations: int = Field(20, ge=1, le=60)
     max_searches: int = Field(6, ge=1, le=20)
@@ -394,10 +442,12 @@ class StartRunRequest(BaseModel):
     work_mode: WorkMode = ""
     employment_type: EmploymentType = ""
     evaluate: bool = False
-    live_only: bool = False
-    mode: Literal["pipeline", "agent"] = "pipeline"
+    # The controller agent is the ONLY execution engine (the fixed "pipeline"
+    # engine was retired). "agent" is still accepted so existing clients keep
+    # working; anything else is rejected with 422.
+    mode: Literal["agent"] = "agent"
     goal: Optional[AgentGoalRequest] = None
-    # Applies to BOTH modes. "rules_only" = zero model calls for the whole run.
+    # "rules_only" = zero model calls for the whole run.
     model_policy: Literal["auto", "rules_only"] = "auto"
 
 
@@ -477,16 +527,14 @@ def start_run(request: Request, body: StartRunRequest,
               _csrf: None = Depends(require_csrf)):
     resume_id, target_role, location = body.resume_id, body.target_role, body.location
     work_mode, employment_type = body.work_mode, body.employment_type
-    evaluate, live_only = body.evaluate, body.live_only
+    evaluate = body.evaluate
     if resume_id is None:
         raise HTTPException(status_code=400, detail="resume_id is required; upload or pick a resume first")
     if not target_role.strip():
         raise HTTPException(status_code=400, detail="target_role is required for a search")
     _check_len("target_role", target_role, MAX_ROLE_CHARS)
     _check_len("location", location, MAX_LOCATION_CHARS)
-    agent_goal = _build_agent_goal(body) if body.mode == "agent" else None
-    if body.mode != "agent" and body.goal is not None:
-        raise HTTPException(status_code=422, detail="goal is only valid with mode='agent'")
+    agent_goal = _build_agent_goal(body)
 
     conn = get_connection()
     try:
@@ -521,30 +569,27 @@ def start_run(request: Request, body: StartRunRequest,
                                target_role=target_role, location=location,
                                work_mode=work_mode, employment_type=employment_type,
                                user_id=user["id"])
-        if agent_goal is not None:
-            import json as _json
-            cur.execute("UPDATE runs SET mode = 'agent', goal_json = %s, llm_call_budget = %s "
-                        "WHERE id = %s",
-                        (_json.dumps(agent_goal.model_dump()), agent_goal.limits.max_llm_calls,
-                         run_id))
-        job_id = enqueue_tx(cur, "start_run", {
-            "resume_id": resume_id, "target_role": target_role, "location": location,
-            "work_mode": work_mode, "employment_type": employment_type,
-            "evaluate": evaluate, "run_id": run_id, "live_only": live_only,
-            "mode": body.mode, "model_policy": body.model_policy,
-        }, run_id=run_id)
+        import json as _json
+        cur.execute("UPDATE runs SET mode = 'agent', goal_json = %s, llm_call_budget = %s, "
+                    "max_cost_usd = %s WHERE id = %s",
+                    (_json.dumps(agent_goal.model_dump()), agent_goal.limits.max_llm_calls,
+                     agent_goal.limits.max_cost_usd, run_id))
+        # The goal (with every setting) lives on the run row; the job only names it.
+        job_id = enqueue_tx(cur, "start_run", {"run_id": run_id, "resume_id": resume_id},
+                            run_id=run_id)
         conn.commit()
     except HTTPException:
         conn.rollback()
         raise
     except Exception as e:
         conn.rollback()
-        log.exception("start_run failed: %s", e)   # full detail to the server log only
+        # Type + code only: DB error details can echo row values (goal text, roles).
+        log.error("start_run failed (%s, code=%s)", type(e).__name__, classify_exception(e))
         raise HTTPException(status_code=500, detail="Unable to start the run.")
     finally:
         conn.close()
     return {"run_id": run_id, "resume_id": resume_id, "target_role": target_role,
-            "live_only": live_only, "job_id": job_id, "mode": body.mode,
+            "job_id": job_id, "mode": "agent",
             "message": f"Run {run_id} enqueued (job {job_id})."}
 
 
@@ -633,9 +678,8 @@ def get_run(run_id: int, user: dict = Depends(require_auth)):
         run = cur.fetchone()
         if not run:
             raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
-        cur.execute("""SELECT COALESCE(SUM(cost_usd), 0),
-                              COUNT(*) FILTER (WHERE cost_usd IS NULL AND status = 'success')
-                       FROM llm_calls WHERE run_id = %s""", (run_id,))
+        cur.execute(f"""SELECT COALESCE(c.known, 0), c.unknown_calls, c.unknown_bound
+                        FROM runs r {_COST_LATERAL_SQL} WHERE r.id = %s""", (run_id,))
         cost_row = cur.fetchone()
 
         # Bulk-load the whole trace in a CONSTANT number of queries (steps, tool
@@ -668,7 +712,7 @@ def get_run(run_id: int, user: dict = Depends(require_auth)):
             SELECT step_id, prompt_tokens, completion_tokens, latency_ms, cost_usd, status,
                    prompt, response, error_message, operation_name, attempt_number,
                    retry_count, provider_request_id, logical_call_id, pricing_version,
-                   model, run_attempt
+                   model, run_attempt, cost_status, cost_upper_bound_usd, usage_missing
             FROM llm_calls WHERE run_id = %s ORDER BY id
         """, (run_id,))
         llm_by_step = {}
@@ -683,7 +727,10 @@ def get_run(run_id: int, user: dict = Depends(require_auth)):
                 # retry explainability: logical call -> HTTP attempt -> run attempt
                 "attempt_number": l[10], "retry_count": l[11], "provider_request_id": l[12],
                 "logical_call_id": l[13], "pricing_version": l[14], "model": l[15],
-                "run_attempt": l[16]})
+                "run_attempt": l[16],
+                # priced | unknown (usage missing / failed after dispatch; bounded) |
+                # not_billed (rejected by the provider before any work)
+                "cost_status": l[17], "cost_upper_bound_usd": l[18], "usage_missing": l[19]})
 
         cur.execute("""
             SELECT DISTINCT ON (step_id) step_id, relevance_score, faithfulness_score,
@@ -772,15 +819,19 @@ def resume_run(run_id: int, body: ResumeRunRequest,
         if pending.get("type") == "input_request":
             if body.answer not in (pending.get("options") or []):
                 raise HTTPException(status_code=422, detail="answer must be one of the offered options")
-        if row[2] == "agent":
-            cur.execute("""
-                UPDATE review_requests SET status = 'submitted', decision = %s, answer = %s,
-                       comment = %s, reviewer_user_id = %s, reviewer = %s, submitted_at = NOW()
-                WHERE review_id = %s AND run_id = %s AND status = 'pending'
-            """, (decision if pending.get("type") != "input_request" else None, body.answer,
-                  comment, user["id"], user["username"], expected, run_id))
-            if cur.rowcount != 1:
-                raise HTTPException(status_code=409, detail="This review was already answered")
+        if row[2] != "agent":
+            # Paused by the retired pipeline engine: nothing can resume it. Cancel it.
+            raise HTTPException(status_code=409,
+                                detail="This run belongs to the retired pipeline engine and "
+                                       "cannot be resumed; cancel it and start a new run")
+        cur.execute("""
+            UPDATE review_requests SET status = 'submitted', decision = %s, answer = %s,
+                   comment = %s, reviewer_user_id = %s, reviewer = %s, submitted_at = NOW()
+            WHERE review_id = %s AND run_id = %s AND status = 'pending'
+        """, (decision if pending.get("type") != "input_request" else None, body.answer,
+              comment, user["id"], user["username"], expected, run_id))
+        if cur.rowcount != 1:
+            raise HTTPException(status_code=409, detail="This review was already answered")
 
         # ATOMIC: move waiting_for_human -> queued AND enqueue the resume job
         # together. The run goes back to 'queued' (not straight to 'running') because
@@ -800,7 +851,7 @@ def resume_run(run_id: int, body: ResumeRunRequest,
         raise
     except Exception as e:
         conn.rollback()
-        log.exception("resume_run failed: %s", e)
+        log.error("resume_run failed (%s, code=%s)", type(e).__name__, classify_exception(e))
         raise HTTPException(status_code=500, detail="Unable to resume the run.")
     finally:
         conn.close()
@@ -831,21 +882,22 @@ def get_run_rankings(run_id: int, user: dict = Depends(require_auth)):
             elif title:
                 legacy_by_title.setdefault(title, []).append(advice)
 
+        # resume_suggestions is part of the required schema (migration 0010). Any
+        # error here — outage, permissions, a missing table on an un-migrated DB —
+        # is a real failure and surfaces as one; it is never shown as "no
+        # suggestions".
         suggestions_by_job = {}
-        try:
-            cur.execute("""
-                SELECT job_id, kind, original_text, suggested_text, reason, evidence, method,
-                       status, validation_notes
-                FROM resume_suggestions WHERE run_id = %s AND status <> 'rejected'
-                ORDER BY job_id, position
-            """, (run_id,))
-            for r in cur.fetchall():
-                suggestions_by_job.setdefault(r[0], []).append({
-                    "kind": r[1], "original_text": r[2], "suggested_text": r[3],
-                    "reason": r[4], "evidence": r[5], "method": r[6], "status": r[7],
-                    "validation_notes": r[8]})
-        except Exception:
-            conn.rollback()          # pre-0010 database: no structured suggestions
+        cur.execute("""
+            SELECT job_id, kind, original_text, suggested_text, reason, evidence, method,
+                   status, validation_notes
+            FROM resume_suggestions WHERE run_id = %s AND status <> 'rejected'
+            ORDER BY job_id, position
+        """, (run_id,))
+        for r in cur.fetchall():
+            suggestions_by_job.setdefault(r[0], []).append({
+                "kind": r[1], "original_text": r[2], "suggested_text": r[3],
+                "reason": r[4], "evidence": r[5], "method": r[6], "status": r[7],
+                "validation_notes": r[8]})
 
         cur.execute("""
             SELECT rank_position, job_id, title, company, score, final_decision, apply_url
@@ -929,7 +981,7 @@ def get_agent_timeline(run_id: int, user: dict = Depends(require_auth)):
     if not row:
         raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
     if row[0] != "agent":
-        return {"run_id": run_id, "mode": row[0] or "pipeline", "actions": []}
+        return {"run_id": run_id, "mode": "pipeline_retired", "actions": []}
     actions = [_safe_action(a) for a in agent_store.list_actions(run_id)]
     usage = agent_store.run_usage(run_id)
     return {"run_id": run_id, "mode": "agent", "goal": row[1], "controller_mode": row[2],
@@ -939,6 +991,10 @@ def get_agent_timeline(run_id: int, user: dict = Depends(require_auth)):
                         "wall_clock_seconds": usage["elapsed_seconds"]},
             "cost": {"known_estimated_usd": usage["known_cost_usd"],
                      "calls_with_unknown_cost": usage["unknown_cost_calls"],
+                     "unknown_cost_upper_bound_usd": usage["unknown_cost_bound_usd"],
+                     "in_flight_reserved_usd": usage["reserved_open_usd"],
+                     "committed_usd": usage["committed_usd"],
+                     "limit_usd": ((row[1] or {}).get("limits") or {}).get("max_cost_usd"),
                      "complete": usage["unknown_cost_calls"] == 0,
                      "basis": "estimated_paid_tier"},
             "actions": actions}

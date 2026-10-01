@@ -1,9 +1,8 @@
 """
 Regression tests for the review-routing / AI-quality fixes:
 
-  * an EXISTING non-score review flag pauses the LangGraph graph even when the score
-    and the judge agree (Apply / Apply) — end to end through the graph, not just the
-    router's return value;
+  * an EXISTING non-score review flag marks the job for review even when the score
+    and the judge agree (Apply / Apply) — and the agent queues that review;
   * injection text in a job posting is caught even when requirements come from the
     cache (the LLM extractor, which used to be the only detector, doesn't run then);
   * the pause payload tells the reviewer WHY (review_reason);
@@ -26,7 +25,6 @@ from database import get_connection
 from auth import create_user
 from agent_state import AgentState
 import router
-import autonomous_graph as ag
 from llm import flag_for_review
 
 
@@ -86,31 +84,20 @@ def _stub_scoring(mp, score_decision="Apply", judge_raw='{"decision": "Apply", "
 # ------------------------------------------------ graph-level pause regression --
 
 def test_existing_review_flag_pauses_the_graph_even_when_score_and_judge_agree(monkeypatch):
-    """existing review flag = TRUE, score = Apply, LLM = Apply  ->  graph still pauses."""
-    from langgraph.checkpoint.memory import MemorySaver
+    """existing review flag = TRUE, score = Apply, LLM = Apply  ->  the job still needs
+    review, and the agent's evaluate tool queues a review (which pauses the graph)."""
     run_id = _run(_user())
     job = _job()
     _stub_scoring(monkeypatch, score_decision="Apply",
                   judge_raw='{"decision": "Apply", "reason": "fit"}',
                   pre_flag="possible_prompt_injection(job)")
-    # Upstream nodes: stub only what feeds process_job.
-    monkeypatch.setattr(ag, "load_resume",
-                        lambda s, rid: setattr(s, "resume_text", "Python SQL engineer resume"))
-    monkeypatch.setattr(ag, "do_parse_resume", lambda s, rid: setattr(s, "parsed_resume", {
-        "skills": ["python"], "years_experience": 5, "education": [], "projects": [],
-        "experience": []}))
-    monkeypatch.setattr(ag, "do_search_jobs", lambda s, rid: setattr(s, "jobs", [job]))
-
-    seed = AgentState(goal="x", resume_id=1, target_role="engineer")
-    graph = ag.build_graph(checkpointer=MemorySaver())
-    result = graph.invoke(ag._dump(seed, run_id),
-                          config={"configurable": {"thread_id": f"t-{run_id}"}})
-
-    assert result.get("__interrupt__"), "graph did not pause for a flagged job"
-    payload = ag._extract_interrupt_payload(result)
-    assert payload["score_decision"] == "Apply" and payload["llm_decision"] == "Apply"
+    s = _state([job])
+    router.do_process_job(s, run_id)
+    assert s.job_results[-1]["needs_review"] is True
+    info = s.last_review_info
+    assert info["score_decision"] == "Apply" and info["llm_decision"] == "Apply"
     # The reviewer is told WHY it paused.
-    assert "possible_prompt_injection(job)" in (payload.get("review_reason") or "")
+    assert "possible_prompt_injection(job)" in (info.get("review_reason") or "")
 
 
 def test_job_injection_is_detected_on_requirements_cache_hit(monkeypatch):
@@ -229,19 +216,12 @@ def test_human_decision_records_reviewer_identity(monkeypatch):
 
 # ------------------------------------------------- shared outcome classification --
 
-def test_resumed_graph_failure_keeps_specific_error_code():
-    status, code = ag._final_status({"error": "search failed: 503 UNAVAILABLE",
-                                     "jobs": [{"x": 1}]})
-    assert status == "failed" and code == "llm_unavailable"      # retryable, not internal
-    assert ag._final_status({"cancelled": True})[0] == "cancelled"
-    assert ag._final_status({"jobs": [1], "failed_jobs": 1}) == ("completed_with_errors", None)
-
-
 def test_stage_failure_caused_by_llm_keeps_the_llm_code():
     # A parse that failed because of a rate limit must stay retryable, not become
     # a terminal parse_failed.
-    assert ag._stage_error_code("parse failed: 429 RESOURCE_EXHAUSTED") == "llm_rate_limited"
-    assert ag._stage_error_code("parse failed: 503 UNAVAILABLE") == "llm_unavailable"
-    assert ag._stage_error_code(
+    from error_codes import stage_error_code
+    assert stage_error_code("parse failed: 429 RESOURCE_EXHAUSTED") == "llm_rate_limited"
+    assert stage_error_code("parse failed: 503 UNAVAILABLE") == "llm_unavailable"
+    assert stage_error_code(
         "parse failed: 429 RESOURCE_EXHAUSTED GenerateRequestsPerDay") == "llm_quota_exhausted"
-    assert ag._stage_error_code("parse failed: bad JSON") == "parse_failed"
+    assert stage_error_code("parse failed: bad JSON") == "parse_failed"

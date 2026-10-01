@@ -1,12 +1,11 @@
 """
-Router: executes the action the planner chose, updates state, returns.
-Reuses the EXISTING, already-tested tools (parse_resume, search_jobs,
-calculate_match_score, etc.) — the autonomous rewrite changes the control
-flow, not the tools themselves.
+Shared tool library for the agent engine (agent_tools / agent_loop):
+resume loading + parsing, per-job evaluation (requirements, scoring, judge,
+review flags), human-decision application and the requirements/parse caches.
 
-All tool executions pass through logged_tool_call() so the autonomous path
-keeps full AgentOps observability. Caching, cooperative cancellation, and
-conditional Gemini use also live here.
+The legacy fixed-sequence pipeline (autonomous_graph.py) and its search / rank /
+advice / dispatch functions were retired: the controller agent is the single
+execution engine. Everything here is traced through create_step / logged_*.
 """
 from timeutil import utcnow
 import hashlib
@@ -17,10 +16,8 @@ from settings import settings
 from error_codes import ErrorCode
 
 from parser import parse_resume
-from job_source import search_jobs
 from job_parser import extract_requirements
 from scorer import calculate_match_score
-from ranker import rank_jobs
 from schemas import JobDecision
 from cache_version import parse_cache_version, reqs_cache_version
 from prompt_safety import wrap_untrusted, HARDENING_PREAMBLE
@@ -31,6 +28,18 @@ from llm import (
     is_cancel_requested, record_judge_signals
 )
 log = get_logger(__name__)
+
+
+def is_infrastructure_error(exc):
+    """Errors that must NEVER be absorbed by a per-item fallback: lost execution
+    ownership and database failures. They propagate so the run fails (or is
+    retried) with the right code instead of continuing on silently degraded data."""
+    import agent_store
+    import run_lock
+    if isinstance(exc, (agent_store.ExecutionLost, run_lock.ExecutionLost)):
+        return True
+    return (type(exc).__module__ or "").startswith(("psycopg2", "psycopg"))
+
 
 def _hash(text):
     """Stable hash for cache keys (#12) — detects when resume/job text changed."""
@@ -145,71 +154,15 @@ def do_parse_resume(state, run_id):
             # the model-parse key, so a later model-enabled run still gets a model parse.
             from rule_resume_parser import parse_resume_rules
             parsed = parse_resume_rules(state.resume_text)
-            log.info("resume parsed by rules (%d skills, years %s) — 0 LLM calls",
-                     len(parsed["skills"]),
-                     "unknown" if parsed["years_experience"] is None else parsed["years_experience"],
-                     extra={"step_id": step_id})
+            log.info("resume parsed by rules (%d skills) — 0 LLM calls",
+                     len(parsed["skills"]), extra={"step_id": step_id})
         state.parsed_resume = parsed
         finish_step(step_id, "success")
     except Exception as e:
         fail_step(step_id, e)
+        if is_infrastructure_error(e):
+            raise
         state.error = f"parse failed: {e}"
-
-
-def do_search_jobs(state, run_id):
-    """
-    Fetch LIVE jobs for this search, upsert them (dedup on external_id), then
-    search the COMBINED pool (seeded + live). Live fetch is best-effort — if it
-    fails (network/API), we simply search the existing pool. 0 LLM calls.
-    """
-    step_id = create_step(run_id, "search_jobs", len(state.completed_actions))
-    try:
-        # Refresh the pool with REAL live jobs matching this role + location
-        # (Adzuna does real search + location filtering). Best-effort — falls back
-        # to the existing pool if the API is unavailable or keys are missing.
-        # Refresh the live pool from BOTH live providers, each RUN-SCOPED (so a
-        # live_only run actually sees their postings), and track each provider's
-        # classified fetch status.
-        provider_status = {}
-        try:
-            from adzuna_jobs import fetch_and_upsert_adzuna
-            _, _, provider_status["adzuna"] = fetch_and_upsert_adzuna(
-                state.target_role, state.location, run_id=run_id, step_id=step_id)
-        except Exception as e:
-            log.warning("adzuna fetch skipped (%s) — using existing pool", e)
-            provider_status["adzuna"] = "failed"
-        try:
-            from live_jobs import fetch_and_upsert_remotive
-            _, _, provider_status["remotive"] = fetch_and_upsert_remotive(
-                state.target_role, state.location, run_id=run_id, step_id=step_id)
-        except Exception as e:
-            log.warning("remotive fetch skipped (%s) — using existing pool", e)
-            provider_status["remotive"] = "failed"
-
-        state.jobs = logged_tool_call(
-            "search_jobs",
-            lambda p: search_jobs(p["target_role"], p["location"],
-                                  p["work_mode"], p["employment_type"],
-                                  live_only=p["live_only"], run_id=p["run_id"]),
-            {"target_role": state.target_role, "location": state.location,
-             "work_mode": state.work_mode, "employment_type": state.employment_type,
-             "live_only": state.live_only, "run_id": run_id},
-            run_id, step_id, operation="search_jobs")
-
-        # In LIVE-ONLY mode, 0 jobs is only a real "no matches" if at least one live
-        # provider FETCHED cleanly (success/empty). If EVERY live provider failed
-        # (network/auth/rate-limit/...) and nothing came back, the sources were
-        # unavailable — report search_failed, not a misleading no_matches.
-        SUCCEEDED = {"success", "empty"}
-        if (state.live_only and not state.jobs
-                and not any(s in SUCCEEDED for s in provider_status.values())):
-            code = provider_failure_code(provider_status)
-            raise RuntimeError(f"{code.value}: live job sources unavailable ({provider_status})")
-
-        finish_step(step_id, "success")
-    except Exception as e:
-        fail_step(step_id, e)
-        state.error = f"search failed: {e}"
 
 
 # Provider fetch status -> run error code. Transient failures come first: if ANY
@@ -218,7 +171,7 @@ _TRANSIENT_PROVIDER = {
     "rate_limited": ErrorCode.JOB_SOURCE_RATE_LIMITED,
     "server_error": ErrorCode.JOB_SOURCE_UNAVAILABLE,
     "network_error": ErrorCode.JOB_SOURCE_UNAVAILABLE,
-    "failed": ErrorCode.JOB_SOURCE_UNAVAILABLE,   # unexpected error (e.g. DB blip)
+    "failed": ErrorCode.JOB_SOURCE_UNAVAILABLE,   # unclassified provider-side failure
 }
 _TERMINAL_PROVIDER = {
     "auth_error": ErrorCode.JOB_SOURCE_AUTH_FAILED,
@@ -334,28 +287,38 @@ def _get_requirements(state, job, run_id, step_id):
     cached, provenance = _reqs_cache_get(dhash)
     method = (provenance or {}).get("extraction_method")
     if cached is not None and method == "llm":
-        log.info("requirements for '%s' served from cache [llm] — 0 LLM calls", job["title"])
+        log.info("requirements served from cache [llm] — 0 LLM calls", extra={"step_id": step_id})
         return cached, True, "llm"
 
     if _llm_allowed(state):
+        from llm import is_degraded_model_error
         try:
             reqs = extract_requirements(job, run_id, step_id, budget=state)
+        except Exception as extract_err:
+            # ONLY a degraded model (not configured, quota/budget/cost stop, provider
+            # outage, unusable output) takes the rules fallback. A database error,
+            # a programming error or lost ownership propagates and fails visibly.
+            if not is_degraded_model_error(extract_err):
+                raise
+            from error_codes import summarize_error
+            log.warning("requirements LLM extraction degraded (%s) — rules fallback",
+                        summarize_error(extract_err), extra={"step_id": step_id})
+        else:
+            # Outside the fallback: a cache-write failure is infrastructure, never a
+            # reason to throw away a good model extraction.
             _reqs_cache_put(dhash, reqs, "llm")
             if cached is not None:
-                log.info("requirements for '%s' upgraded rule_based -> llm", job["title"])
+                log.info("requirements upgraded rule_based -> llm", extra={"step_id": step_id})
             return reqs, False, "llm"
-        except Exception as extract_err:
-            from error_codes import summarize_error
-            log.warning("requirements LLM extraction failed (%s)", summarize_error(extract_err))
 
     if cached is not None:
         # Degraded but still valid fallback that hasn't expired — reuse it, don't rewrite.
-        log.info("requirements for '%s' served from cache [%s]", job["title"], method)
+        log.info("requirements served from cache [%s]", method, extra={"step_id": step_id})
         return cached, True, method or "rule_based"
 
     reqs = extract_requirements_rule_based(job)
     _reqs_cache_put(dhash, reqs, "rule_based")
-    log.info("requirements via rules — 0 LLM calls")
+    log.info("requirements via rules — 0 LLM calls", extra={"step_id": step_id})
     return reqs, False, "rule_based"
 
 
@@ -447,9 +410,13 @@ def do_process_job(state, run_id):
         # 0. Untrusted job text is scanned EVERY time — not only when the LLM
         #    extractor runs — so an injection attempt is still caught (and pauses the
         #    run for review) when requirements come from the cache.
-        from prompt_safety import detect_injection
-        if detect_injection(f"{job.get('title', '')}\n{job.get('description', '')}"):
-            flag_for_review(step_id, reason="possible_prompt_injection(job)")
+        #    Policy (prompt_safety.py): HIGH-confidence patterns request human review;
+        #    LOW-confidence phrases ("system prompt", "assistant:" — normal in AI and
+        #    security job ads) are recorded as a security signal only.
+        from prompt_safety import detect_injection, apply_injection_policy
+        apply_injection_policy(
+            detect_injection(f"{job.get('title', '')}\n{job.get('description', '')}"),
+            step_id, source="job", run_id=run_id)
 
         # 1. requirements — structured, optional-aware, cache- and quality-aware.
         requirements, cache_hit, _method = _get_requirements(state, job, run_id, step_id)
@@ -533,15 +500,20 @@ def do_process_job(state, run_id):
                     judge_status = "ran"
                 except Exception as parse_err:
                     # The call succeeded but the structured output was invalid — an
-                    # AI-quality failure, not a judgment. Ask a human.
+                    # AI-quality failure, not a judgment. Ask a human. (Logged by
+                    # exception TYPE only: the message can quote model output.)
                     judge_status = "invalid_output"
                     judge_skip_reason = "parse_error"
                     llm_decision = "Unknown"
                     result = None          # nothing valid for the evaluator to grade
                     flag_for_review(step_id, reason="judge_invalid_output")
-                    log.warning("judge returned invalid structured output: %s", parse_err,
+                    log.warning("judge returned invalid structured output (%s)",
+                                type(parse_err).__name__,
                                 extra={"run_id": run_id, "step_id": step_id})
             except Exception as judge_err:
+                from llm import is_degraded_model_error
+                if not is_degraded_model_error(judge_err):
+                    raise
                 # The job KEEPS its deterministic score (it is not discarded), but the
                 # decision quality is DEGRADED: an uncertain-band job without its
                 # second opinion goes to a human. Other jobs keep processing.
@@ -595,6 +567,9 @@ def do_process_job(state, run_id):
                          rel, faith, comp, eval_result['hallucination_detected'],
                          extra={"run_id": run_id, "step_id": step_id})
             except Exception as eval_err:
+                from llm import is_degraded_model_error
+                if not is_degraded_model_error(eval_err):
+                    raise
                 flag_for_review(step_id, reason="evaluation_failed")
                 from error_codes import summarize_error
                 log.warning("evaluation requested but failed: %s", summarize_error(eval_err),
@@ -649,228 +624,18 @@ def do_process_job(state, run_id):
 
         finish_step(step_id, "success")
     except Exception as e:
-        state.failed_jobs += 1   # count it so the run can report completed_with_errors
         fail_step(step_id, e)
-        log.exception("job '%s' failed", job['title'], extra={"step_id": step_id})
+        if is_infrastructure_error(e):
+            raise                # the RUN fails / retries; never "one job failed"
+        state.failed_jobs += 1   # count it so the run can report completed_with_errors
+        # Job id and exception TYPE only: titles, descriptions and exception text
+        # can carry job- or resume-derived content (logging policy, logging_config).
+        log.error("job %s evaluation failed (%s)", job.get("id"), type(e).__name__,
+                  extra={"run_id": run_id, "step_id": step_id})
     finally:
         # ALWAYS advance to the next job, success or failure. finally runs no
         # matter what — a failing job is skipped, never retried forever.
         state.current_job_index += 1
-
-
-def do_rank_jobs(state, run_id):
-    """Rank scored jobs (traced), then PERSIST the ranked list to run_rankings.
-    Sets ranking_done so the loop terminates."""
-    step_id = create_step(run_id, "rank_jobs", len(state.completed_actions))
-    try:
-        state.ranked = logged_tool_call(
-            "rank_jobs", lambda r: rank_jobs(r), state.job_results,
-            run_id, step_id, operation="rank_jobs")
-        _persist_rankings(run_id, state.ranked)
-        finish_step(step_id, "success")
-    except Exception as e:
-        # The ranking IS the run's deliverable: if it was not committed, the run
-        # must not report success (R03).
-        fail_step(step_id, e)
-        state.ranked = state.job_results
-        state.error = f"rank failed: {e}"
-    finally:
-        state.ranking_done = True   # ranking ran (even if empty) — don't loop on it
-
-
-def _persist_rankings(run_id, ranked):
-    """
-    Persist the final ranked list as self-contained snapshot rows in run_rankings
-    (1-based rank_position). Snapshot fields are stored so the ranking is readable
-    later without joining job_postings. Replace-all in ONE transaction, so a retry
-    is idempotent. A persistence failure RAISES (R03): the caller decides the run
-    outcome; it is never silently reported as a successful ranking.
-    """
-    with get_connection() as conn:
-        cur = conn.cursor()
-        cur.execute("DELETE FROM run_rankings WHERE run_id = %s", (run_id,))
-        for pos, r in enumerate(ranked or [], start=1):
-            cur.execute("""
-                INSERT INTO run_rankings
-                    (run_id, job_id, rank_position, title, company, score,
-                     final_decision, apply_url)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-            """, (run_id, r.get("job_id"), pos, r.get("title"), r.get("company"),
-                  r.get("score"), r.get("final_decision") or r.get("decision"),
-                  r.get("apply_url")))
-
-
-def _advice_profile(parsed_resume, score_result):
-    """
-    The candidate facts the advice prompt is allowed to use — built from the
-    STRUCTURED, grounded parse instead of an arbitrary slice of the raw resume (the
-    old resume_text[:3000] silently dropped everything after the first 3000 chars).
-    Only GROUNDED skills are included; each list is capped to keep the prompt small.
-    """
-    pr = parsed_resume or {}
-    grounded = pr.get("grounded_skills")
-    skills = grounded if isinstance(grounded, list) else (pr.get("skills") or [])
-    evidence = [f"{e.get('skill')}: {e.get('evidence')}" for e in (pr.get("skill_evidence") or [])
-                if isinstance(e, dict) and e.get("skill") and e.get("evidence")]
-    return {
-        "skills": list(skills)[:40],
-        "years_experience_used": score_result.get("candidate_years_used"),
-        "experience": [f"{e.get('title')} at {e.get('company')} ({e.get('years')} yrs)"
-                       for e in (pr.get("experience") or []) if isinstance(e, dict)][:10],
-        "projects": [f"{p.get('name')}: {', '.join(p.get('tech') or [])}"
-                     for p in (pr.get("projects") or []) if isinstance(p, dict)][:10],
-        "education": [f"{e.get('degree')}, {e.get('institution')} {e.get('year') or ''}".strip()
-                      for e in (pr.get("education") or []) if isinstance(e, dict)][:5],
-        "evidence": evidence[:20],
-        "matched_requirements": score_result.get("matched_skills") or [],
-        "missing_requirements": score_result.get("missing_skills") or [],
-        "missing_preferred": score_result.get("missing_preferred") or [],
-    }
-
-
-def _combined_advice(parsed_resume, job, requirements, score_result, run_id, step_id,
-                     budget=None):
-    """
-    ONE Gemini call returning BOTH application strategy and resume-edit advice.
-    Used only for top viable jobs. The candidate side of the prompt is the
-    structured profile (_advice_profile), not the raw resume text.
-    """
-    profile = _advice_profile(parsed_resume, score_result)
-    prompt = f"""
-{HARDENING_PREAMBLE}
-
-You are a career advisor. For the job below, give the candidate BOTH:
-1. APPLICATION STRATEGY - how to position themselves for this specific role.
-2. RESUME EDITS - concrete, numbered edits to better match this job.
-Only rely on the candidate facts given; do not invent experience they don't have.
-
-CANDIDATE SKILLS (grounded in the resume): {wrap_untrusted(profile["skills"], "SKILLS")}
-YEARS OF EXPERIENCE USED FOR MATCHING: {profile["years_experience_used"]}
-EXPERIENCE: {wrap_untrusted(profile["experience"], "EXPERIENCE")}
-PROJECTS: {wrap_untrusted(profile["projects"], "PROJECTS")}
-EDUCATION: {wrap_untrusted(profile["education"], "EDUCATION")}
-RESUME EVIDENCE SNIPPETS: {wrap_untrusted(profile["evidence"], "EVIDENCE")}
-
-JOB: {wrap_untrusted(job['title'], "JOB_TITLE")} at {wrap_untrusted(job.get('company',''), "COMPANY")}
-REQUIRED SKILLS: {wrap_untrusted(requirements.get('required_skills', []), "REQUIRED_SKILLS")}
-PREFERRED SKILLS: {wrap_untrusted(requirements.get('preferred_skills', []), "PREFERRED_SKILLS")}
-REQUIREMENTS THE CANDIDATE MEETS: {wrap_untrusted(profile["matched_requirements"], "MATCHED")}
-REQUIREMENTS THE RESUME IS MISSING: {wrap_untrusted(profile["missing_requirements"], "MISSING_SKILLS")}
-PREFERRED SKILLS THE RESUME IS MISSING: {wrap_untrusted(profile["missing_preferred"], "MISSING_PREFERRED")}
-
-Respond in exactly this format:
-STRATEGY:
-<one paragraph>
-
-RESUME EDITS:
-1. <edit>
-2. <edit>
-3. <edit>
-"""
-    return logged_llm_call(prompt, run_id, step_id, operation="combined_advice", budget=budget)
-
-
-def _persist_advice(run_id, job_id, title, advice):
-    """Persist one advice text to run_advice, keyed to (run_id, job_id). Re-persisting
-    the same (run, job) replaces the prior row. A failure RAISES (R03); the caller
-    records it as a partial failure instead of reporting silent success."""
-    if not advice:
-        return
-    with get_connection() as conn:
-        cur = conn.cursor()
-        cur.execute(
-            "DELETE FROM run_advice WHERE run_id = %s AND job_id IS NOT DISTINCT FROM %s",
-            (run_id, job_id))
-        cur.execute("""
-            INSERT INTO run_advice (run_id, job_id, title, advice)
-            VALUES (%s, %s, %s, %s)
-        """, (run_id, job_id, title, advice.strip()))
-
-
-def _persist_suggestions(run_id, job_id, resume_id, resume_hash, suggestions):
-    """Structured suggestions for the pipeline path (same table as agent mode).
-    Replace-per-(run, job); raises on failure (R03)."""
-    if job_id is None or resume_id is None:
-        return
-    with get_connection() as conn:
-        cur = conn.cursor()
-        cur.execute("DELETE FROM resume_suggestions WHERE run_id = %s AND job_id = %s",
-                    (run_id, job_id))
-        for pos, sg in enumerate(suggestions, start=1):
-            cur.execute("""
-                INSERT INTO resume_suggestions (run_id, job_id, resume_id, resume_hash, position,
-                    kind, original_text, suggested_text, reason, evidence, method, status,
-                    validation_notes)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            """, (run_id, job_id, resume_id, resume_hash, pos, sg["kind"], sg.get("original_text"),
-                  sg["suggested_text"], sg["reason"], json.dumps(sg.get("evidence") or []),
-                  sg["method"], sg["status"], sg.get("validation_notes")))
-
-
-def do_generate_advice(state, run_id, top_n=2):
-    """
-    #10: after ranking, generate combined advice for the TOP N viable
-    (Apply/Maybe) jobs only - not every job. One combined call each,
-    budget-permitting. This is where advice comes back cheaply.
-    """
-    step_id = create_step(run_id, "generate_advice", len(state.completed_actions))
-    try:
-        viable = [r for r in (state.ranked or [])
-                  if r.get("final_decision", r.get("decision")) in ("Apply", "Maybe")][:top_n]
-        for r in viable:
-            # Look up the posting by STABLE job_id, falling back to title only when
-            # job_id is missing (legacy rows).
-            job = None
-            if r.get("job_id") is not None:
-                job = next((j for j in state.jobs if j.get("id") == r["job_id"]), None)
-            if job is None and r.get("job_id") is None:
-                same_title = [j for j in state.jobs if j["title"] == r["title"]]
-                job = same_title[0] if len(same_title) == 1 else None
-            if not job:
-                continue
-            dhash = _reqs_cache_key(job["title"], job["description"])
-            cached_reqs, _prov = _reqs_cache_get(dhash)
-            requirements = cached_reqs or {
-                "required_skills": [], "required_any_of": [], "preferred_skills": [],
-                "min_years_experience": 0, "responsibilities": []
-            }
-            from skills import normalize_requirements
-            requirements = normalize_requirements(requirements)
-            sc = calculate_match_score(state.parsed_resume, requirements,
-                                       state.resume_text, job, None)
-            # Evidence-checked suggestions from rules ALWAYS (no model needed); the
-            # model-written strategy text is added only when a model call is allowed.
-            from resume_advisor import rule_suggestions, advice_summary
-            suggestions = rule_suggestions(state.parsed_resume, state.resume_text, job,
-                                           requirements, sc)
-            advice = advice_summary(job, suggestions, "rules")
-            if _llm_allowed(state):
-                try:
-                    advice = _combined_advice(state.parsed_resume, job, requirements, sc,
-                                              run_id, step_id, budget=state) \
-                        + "\n\n" + advice
-                except Exception as adv_err:
-                    from error_codes import summarize_error
-                    log.warning("model advice unavailable (%s) — rules suggestions only",
-                                summarize_error(adv_err), extra={"step_id": step_id})
-            _persist_advice(run_id, job.get("id"), job["title"], advice)
-            _persist_suggestions(run_id, job.get("id"), state.resume_id,
-                                 resume_content_hash(state.resume_text or ""), suggestions)
-            # METADATA ONLY. The advice text is derived from the resume and the job
-            # posting; it lives in run_advice (covered by erasure and retention) and
-            # must never leak into application logs, which those controls don't reach.
-            log.info("application advice generated",
-                     extra={"run_id": run_id, "step_id": step_id})
-            log.debug("advice metadata: job_id=%s chars=%d", job.get("id"),
-                      len(advice or ""), extra={"run_id": run_id, "step_id": step_id})
-        finish_step(step_id, "success")
-        state.advice_done = True
-    except Exception as e:
-        # Advice is optional enrichment: its failure makes the run PARTIAL
-        # (completed_with_errors), never a silent success (R03).
-        fail_step(step_id, e)
-        state.failed_jobs += 1
-        state.advice_done = True   # don't loop on advice failure
 
 
 def apply_human_decision(state, run_id, step_id, decision, comment="",
@@ -903,22 +668,3 @@ def apply_human_decision(state, run_id, step_id, decision, comment="",
         if r.get("step_id") == step_id:
             r["final_decision"] = decision
             break
-
-
-def dispatch(action, state, run_id):
-    """Map a planner action to its tool. Mutates state."""
-    if action == "load_resume":
-        load_resume(state, run_id)
-    elif action == "parse_resume":
-        do_parse_resume(state, run_id)
-    elif action == "search_jobs":
-        do_search_jobs(state, run_id)
-    elif action == "process_job":
-        do_process_job(state, run_id)
-    elif action == "rank_jobs":
-        do_rank_jobs(state, run_id)
-    elif action == "generate_advice":
-        do_generate_advice(state, run_id)
-    else:
-        raise NotImplementedError(f"unknown action '{action}'")
-    state.record_action(action)

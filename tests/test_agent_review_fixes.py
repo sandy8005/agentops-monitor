@@ -156,10 +156,22 @@ class FakeStore:
         mp.setattr(agent_store, "is_cancel_requested", lambda rid: s.cancel)
         mp.setattr(agent_store, "run_usage", lambda rid: {
             "elapsed_seconds": 1, "active_runtime_seconds": 1, "llm_calls_reserved": 0,
-            "llm_call_budget": 0, "known_cost_usd": 0.0, "unknown_cost_calls": 0})
+            "llm_call_budget": 0, "known_cost_usd": 0.0, "unknown_cost_calls": 0,
+            "unknown_cost_bound_usd": 0.0, "unbounded_unknown": 0, "reserved_open_usd": 0.0,
+            "committed_usd": 0.0})
         mp.setattr(agent_store, "begin_action_attempt", lambda rid, g, i, replayed=False: 1)
-        mp.setattr(agent_store, "suspend_execution", lambda rid, g: None)
-        mp.setattr(agent_store, "reserve_llm_call", lambda rid, b: False)
+        mp.setattr(agent_store, "reserve_llm_call", lambda *a, **k: None)
+        # Providers answer "no postings" unless a test says otherwise (no network).
+        import adzuna_jobs
+        import live_jobs
+        mp.setattr(adzuna_jobs, "fetch_and_upsert_adzuna", lambda *a, **k: (0, 0, "empty"))
+        mp.setattr(live_jobs, "fetch_and_upsert_remotive", lambda *a, **k: (0, 0, "empty"))
+        mp.setattr(agent_store, "search_history", lambda *a: [])
+        mp.setattr(agent_store, "record_search", lambda *a, **k: None)
+        import llm
+        mp.setattr(llm, "create_step", lambda *a: 1)
+        mp.setattr(llm, "finish_step", lambda *a, **k: None)
+        mp.setattr(llm, "fail_step", lambda *a, **k: None)
         mp.setattr(agent_store, "set_controller_mode", lambda *a: None)
         mp.setattr(agent_store, "get_action", lambda rid, i: s.actions.get(i))
         mp.setattr(agent_store, "record_proposed_action",
@@ -200,7 +212,7 @@ class FakeStore:
 @pytest.fixture
 def env(monkeypatch):
     goal = AgentGoal(target_role="AI Engineer", target_count=1, model_policy="rules_only",
-                     providers=["pool"], limits={"max_iterations": 6, "max_searches": 1})
+                     providers=["adzuna"], limits={"max_iterations": 6, "max_searches": 1})
     fs = FakeStore(goal)
     fs.install(monkeypatch)
     saver = MemorySaver()
@@ -278,7 +290,7 @@ def test_N07_all_evaluations_failed_is_not_no_matches(env, monkeypatch):
     fs, factory, mp = env
     state = {"run_id": 1, "goal": fs.goal, "stop": {"by": "controller", "reason": "done"},
              "evaluated": {"5": {"job_id": 5, "status": "failed"}}, "searches": [
-                 {"provider": "pool", "provider_status": "success"}]}
+                 {"provider": "adzuna", "provider_status": "success"}]}
     out = agent_loop.node_finalize(state, {"configurable": {"generation": 1}})
     assert out["final"]["status"] == "failed"
 
