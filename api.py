@@ -305,6 +305,11 @@ async def upload_resume(request: Request, file: UploadFile = File(...), name: st
             VALUES (%s, %s, %s, %s, %s, %s) RETURNING id
         """, (name, resume_text, utcnow(), user["id"], original_chars, truncated))
         resume_id = cur.fetchone()[0]
+        # A NEW upload of a previously erased text is fresh consent to store it: lift
+        # the parse-cache tombstone for this content (erasure_guards.py).
+        from router import resume_content_hash
+        cur.execute("DELETE FROM erased_resume_hashes WHERE content_hash = %s",
+                    (resume_content_hash(resume_text),))
 
     message = f"Resume stored as #{resume_id}"
     if truncated:
@@ -568,12 +573,7 @@ def start_run(request: Request, body: StartRunRequest,
         run_id = create_run_tx(cur, "job search run (dashboard)", resume_id=resume_id,
                                target_role=target_role, location=location,
                                work_mode=work_mode, employment_type=employment_type,
-                               user_id=user["id"])
-        import json as _json
-        cur.execute("UPDATE runs SET mode = 'agent', goal_json = %s, llm_call_budget = %s, "
-                    "max_cost_usd = %s WHERE id = %s",
-                    (_json.dumps(agent_goal.model_dump()), agent_goal.limits.max_llm_calls,
-                     agent_goal.limits.max_cost_usd, run_id))
+                               user_id=user["id"], goal=agent_goal)
         # The goal (with every setting) lives on the run row; the job only names it.
         job_id = enqueue_tx(cur, "start_run", {"run_id": run_id, "resume_id": resume_id},
                             run_id=run_id)
@@ -820,7 +820,7 @@ def resume_run(run_id: int, body: ResumeRunRequest,
             if body.answer not in (pending.get("options") or []):
                 raise HTTPException(status_code=422, detail="answer must be one of the offered options")
         if row[2] != "agent":
-            # Paused by the retired pipeline engine: nothing can resume it. Cancel it.
+            # A retired legacy run (migration 0013 closes these): nothing resumes it.
             raise HTTPException(status_code=409,
                                 detail="This run belongs to the retired pipeline engine and "
                                        "cannot be resumed; cancel it and start a new run")

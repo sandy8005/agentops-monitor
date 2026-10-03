@@ -13,6 +13,9 @@ JSON-serializable dict, so it needs no custom types at all.
 Schema setup: PostgresSaver.setup() creates/migrates LangGraph's own tables. It is
 DDL and belongs to deployment, not to every job execution — it now runs once from
 `python migrate.py` (and once at worker startup as a safety net), never per run.
+It also installs the erasure guard triggers on the checkpoint tables
+(erasure_guards.install_checkpoint_guards), which do not exist yet when migration
+0015 runs on an empty database.
 """
 from contextlib import contextmanager
 
@@ -57,7 +60,14 @@ def setup_schema():
     migrations (migrate.schema_lock): two replicas deploying at once would
     otherwise both see a checkpoint migration as pending and race its DDL."""
     from migrate import schema_lock
+    from erasure_guards import install_checkpoint_guards
     with schema_lock():
         with open_checkpointer() as cp:
             cp.setup()
+            # Migration 0015 runs BEFORE these tables exist on a fresh database, so
+            # the erasure guards on them are installed here, after every setup()
+            # (idempotent: DROP/CREATE TRIGGER). One transaction: all or nothing.
+            with cp.conn.transaction():
+                with cp.conn.cursor() as cur:
+                    install_checkpoint_guards(cur)
     log.info("langgraph checkpoint schema is up to date")

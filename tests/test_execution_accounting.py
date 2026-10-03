@@ -123,6 +123,12 @@ def _search_env(monkeypatch, history):
     monkeypatch.setattr(agent_store, "search_history", lambda rid, p, q: history)
     recorded = []
     monkeypatch.setattr(agent_store, "record_search", lambda *a, **k: recorded.append(k))
+    # Durable attempt records (external_search_attempts), kept in memory here.
+    attempts = []
+    monkeypatch.setattr(agent_store, "search_attempts", lambda rid, p, q: list(attempts))
+    monkeypatch.setattr(agent_store, "begin_search_attempt",
+                        lambda rid, g, i, p, q: attempts.append("started") or len(attempts))
+    monkeypatch.setattr(agent_store, "finish_search_attempt", lambda *a, **k: None)
     monkeypatch.setattr(llm, "create_step", lambda *a: 1)
     monkeypatch.setattr(llm, "finish_step", lambda *a, **k: None)
     monkeypatch.setattr(llm, "fail_step", lambda *a, **k: None)

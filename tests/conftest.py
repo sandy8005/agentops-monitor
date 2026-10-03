@@ -51,4 +51,8 @@ def _deterministic_model_settings(monkeypatch):
     monkeypatch.setattr(settings, "gemini_model", "gemini-3.6-flash", raising=False)
     monkeypatch.setattr(settings, "llm_input_price_per_million", None, raising=False)
     monkeypatch.setattr(settings, "llm_output_price_per_million", None, raising=False)
+    # No network in tests: the reservation uses the proven byte bound unless a
+    # test opts into (and fakes) provider token counting.
+    monkeypatch.setattr(settings, "llm_input_token_bound", "bytes", raising=False)
+    monkeypatch.setattr(settings, "llm_reserve_bytes_per_token", 1.0, raising=False)
     yield

@@ -213,7 +213,12 @@ def _collect_candidates(ctx, provider, query):
 # really call the provider again) vs. ones that cannot (credentials/config, a body
 # the provider will keep sending malformed). Unknown/legacy details count as
 # transient: retrying costs one request, wrongly never retrying loses the search.
-NON_TRANSIENT_PROVIDER_FAILURES = frozenset({"missing_keys", "auth_error", "invalid_response"})
+NON_TRANSIENT_PROVIDER_FAILURES = frozenset({"missing_keys", "auth_error", "invalid_response",
+                                             "retry_limit"})
+# Hard cap on REAL provider requests for one (provider, query) in a run, across
+# every worker generation — counted from durable external_search_attempts, so a
+# crash loop between dispatch and recording cannot call a provider without bound.
+MAX_PROVIDER_REQUESTS_PER_SEARCH = 3
 
 
 def plan_search(history, iteration, generation):
@@ -309,6 +314,44 @@ def finish_permitted(goal, state, qualified):
                   else "every title/provider combination was searched")
 
 
+def _fetch_with_attempt(ctx, args, qnorm, step_id, plan):
+    """Call the provider with a DURABLE attempt record around the request:
+    'started' is committed (fenced) before dispatch and closed with the outcome
+    after it. Refuses (provider_status 'retry_limit', no request) once this
+    (provider, query) already has MAX_PROVIDER_REQUESTS_PER_SEARCH recorded
+    requests in the run, including ones whose outcome was lost in a crash."""
+    goal = ctx.goal
+    prior = store.search_attempts(ctx.run_id, args.provider, qnorm)
+    if len(prior) >= MAX_PROVIDER_REQUESTS_PER_SEARCH:
+        log.warning("search %s: %d provider requests already recorded — not calling again",
+                    args.provider, len(prior), extra={"run_id": ctx.run_id})
+        return "retry_limit"
+    attempt_id = store.begin_search_attempt(ctx.run_id, ctx.generation, ctx.iteration,
+                                            args.provider, qnorm)
+    status = None
+    try:
+        if args.provider == "adzuna":
+            from adzuna_jobs import fetch_and_upsert_adzuna
+            _, _, status = fetch_and_upsert_adzuna(
+                args.query, goal.constraints.location or None,
+                limit=goal.limits.max_jobs_per_search, run_id=ctx.run_id, step_id=step_id)
+        else:
+            from live_jobs import fetch_and_upsert_remotive
+            _, _, status = fetch_and_upsert_remotive(
+                args.query, goal.constraints.location or None,
+                limit=goal.limits.max_jobs_per_search, run_id=ctx.run_id, step_id=step_id)
+        return status
+    finally:
+        ok = status in ("success", "empty")
+        try:
+            store.finish_search_attempt(ctx.run_id, ctx.generation, attempt_id,
+                                        "succeeded" if ok else "failed",
+                                        status or "exception")
+        except Exception as e:      # the attempt stays 'started' -> abandoned later
+            log.warning("could not close search attempt (%s)", type(e).__name__,
+                        extra={"run_id": ctx.run_id})
+
+
 def tool_search_jobs(ctx, args: SearchArgs):
     goal, state = ctx.goal, ctx.state
     if args.provider not in goal.providers:
@@ -336,20 +379,15 @@ def tool_search_jobs(ctx, args: SearchArgs):
             # non-transient failure (bad credentials won't fix themselves).
             provider_status = prior.get("provider_detail") or (
                 "success" if prior["provider_status"] == "success" else "failed")
-        elif args.provider == "adzuna":
-            from adzuna_jobs import fetch_and_upsert_adzuna
-            _, _, provider_status = fetch_and_upsert_adzuna(
-                args.query, goal.constraints.location or None,
-                limit=goal.limits.max_jobs_per_search, run_id=ctx.run_id, step_id=step_id)
-        elif args.provider == "remotive":
-            from live_jobs import fetch_and_upsert_remotive
-            _, _, provider_status = fetch_and_upsert_remotive(
-                args.query, goal.constraints.location or None,
-                limit=goal.limits.max_jobs_per_search, run_id=ctx.run_id, step_id=step_id)
-        else:                                   # unreachable: SearchArgs is a closed set
+        elif args.provider not in ("adzuna", "remotive"):   # unreachable: closed set
             raise ToolRejected(f"unknown provider {args.provider!r}")
+        else:
+            provider_status = _fetch_with_attempt(ctx, args, qnorm, step_id, plan)
+            if provider_status == "retry_limit":
+                plan = {**plan, "mode": "reuse_limit"}
         fetched = plan["mode"] == "fetch"
-        reused_from = None if fetched else prior.get("execution_generation")
+        reused_from = (None if fetched or prior is None
+                       else prior.get("execution_generation"))
 
         succeeded = provider_status in ("success", "empty")
         candidates = _collect_candidates(ctx, args.provider, args.query) if succeeded else []

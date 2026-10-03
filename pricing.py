@@ -1,4 +1,4 @@
-﻿"""
+"""
 LLM pricing — the Monitor's cost numbers are ESTIMATES of paid-tier list price.
 
 Prices change on known dates, so the table is EFFECTIVE-DATED: each model has a
@@ -21,7 +21,8 @@ Source for gemini-3.6-flash (checked 2026-09-29, ai.google.dev/gemini-api/docs/p
   through 2026-12-31; $1.50 / $7.50 from 2027-01-01.
 """
 from dataclasses import dataclass
-from datetime import datetime, timezone
+import math
+from datetime import datetime, timedelta, timezone
 
 from settings import settings
 
@@ -74,10 +75,15 @@ def rates_for(model, at=None):
     instant `at` (default: now). An explicit env override wins. A model with no
     window covering `at` returns (None, None, None) so the cost is recorded as
     UNKNOWN rather than as a confident-but-wrong number."""
-    if settings.llm_input_price_per_million is not None and \
-            settings.llm_output_price_per_million is not None:
-        return (settings.llm_input_price_per_million,
-                settings.llm_output_price_per_million, "env-override")
+    inp_o = settings.llm_input_price_per_million
+    out_o = settings.llm_output_price_per_million
+    if inp_o is not None and out_o is not None:
+        return (float(inp_o), float(out_o), "env-override")
+    if (inp_o is None) != (out_o is None):
+        # Half an override (settings.py rejects this at startup; this is the
+        # backstop for code that changes settings at runtime): the operator's
+        # intent is unknowable, so the price is UNKNOWN — fail closed.
+        return (None, None, None)
     at = at or _now()
     if at.tzinfo is None:
         at = at.replace(tzinfo=timezone.utc)
@@ -100,19 +106,39 @@ def estimate_cost(model, prompt_tokens, completion_tokens, at=None):
     return (round(cost, 8), version)
 
 
-def max_request_cost(model, prompt_bytes, max_output_tokens, at=None):
-    """Conservative UPPER BOUND on one request's cost, used to reserve dollars
-    before dispatch. Input tokens are bounded by the prompt's UTF-8 byte length
-    divided by settings.llm_reserve_bytes_per_token (default 1.0: a tokenizer never
-    produces more tokens than bytes); output is bounded by the max_output_tokens the
-    request itself enforces (thinking tokens count against it). None if the price
-    is unknown."""
-    inp, out, _v = rates_for(model, at)
-    if inp is None or out is None:
-        return None
+# A request priced at dispatch can complete after a price change. The reservation
+# uses the HIGHEST rate in effect at any moment of this window after dispatch.
+PRICE_CHANGE_HORIZON = timedelta(minutes=15)
+
+
+def byte_token_bound(prompt_bytes):
+    """Proven upper bound on input tokens: one token never covers less than one
+    UTF-8 byte, so bytes / bytes_per_token (<= 1.0, enforced by settings) + 1."""
     bpt = float(getattr(settings, "llm_reserve_bytes_per_token", 1.0) or 1.0)
-    in_tokens = int(prompt_bytes / bpt) + 1
-    return round((in_tokens * inp + int(max_output_tokens) * out) / 1_000_000, 8)
+    bpt = min(bpt, 1.0)            # backstop: never trust a value that under-reserves
+    return int(prompt_bytes / bpt) + 1
+
+
+def max_request_cost(model, prompt_bytes, max_output_tokens, at=None, input_tokens=None):
+    """Conservative UPPER BOUND on one request's cost, used to reserve dollars
+    before dispatch. Input tokens: `input_tokens` when the caller has a tighter
+    bound (llm.input_token_bound — a provider count with a margin, itself capped
+    by the byte bound), else the byte bound. Output: the max_output_tokens the
+    request itself enforces (thinking tokens count against it). Priced at the
+    highest rate in [at, at + PRICE_CHANGE_HORIZON]. None if the price is unknown."""
+    at = at or _now()
+    if at.tzinfo is None:
+        at = at.replace(tzinfo=timezone.utc)
+    rates = [rates_for(model, at), rates_for(model, at + PRICE_CHANGE_HORIZON)]
+    if any(r[0] is None or r[1] is None for r in rates):
+        return None
+    inp = max(r[0] for r in rates)
+    out = max(r[1] for r in rates)
+    bound = byte_token_bound(prompt_bytes)
+    in_tokens = bound if input_tokens is None else min(int(input_tokens), bound)
+    raw = (in_tokens * inp + int(max_output_tokens) * out) / 1_000_000
+    # Round UP so rounding can never shave the bound below the true maximum.
+    return math.ceil(raw * 1e8) / 1e8
 
 
 def price_known(model=None, at=None):

@@ -14,7 +14,10 @@ from typing import List, Literal, Optional
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 Seniority = Literal["", "intern", "entry", "junior", "mid", "senior"]
-Provider = Literal["adzuna", "remotive", "pool"]
+# Live providers only. The "pool" practice source was retired (migration 0013
+# retires every stored goal that still names it).
+Provider = Literal["adzuna", "remotive"]
+LIVE_PROVIDERS = ("adzuna", "remotive")
 
 # Seniority words that may appear in a job TITLE, used to (a) reject a search
 # query that silently changes seniority and (b) mark discovered jobs whose title
@@ -165,3 +168,52 @@ def validate_search_query(query, goal: AgentGoal):
         if bad in title_words(q) or bad in normalize_query(q).split():
             return False, None, f"'{bad}' is a fixed constraint applied by the backend, not a title word"
     return True, normalize_query(q), None
+
+# ------------------------------------------------------- title variants -----
+# Only the TITLE changes; seniority words from the user's own title are carried
+# over, never added or removed.
+TITLE_VARIANTS = [
+    (r"\bai engineer\b", ["machine learning engineer", "ml engineer", "applied ai engineer"]),
+    (r"\bmachine learning engineer\b", ["ai engineer", "ml engineer", "applied scientist"]),
+    (r"\bml engineer\b", ["machine learning engineer", "ai engineer"]),
+    (r"\bdata scientist\b", ["machine learning scientist", "applied scientist"]),
+    (r"\bdata engineer\b", ["analytics engineer", "etl developer"]),
+    (r"\bsoftware engineer\b", ["software developer", "backend engineer"]),
+    (r"\bbackend engineer\b", ["backend developer", "software engineer"]),
+    (r"\bfrontend engineer\b", ["frontend developer", "ui engineer"]),
+    (r"\bdevops engineer\b", ["site reliability engineer", "platform engineer"]),
+    (r"\bdata analyst\b", ["business intelligence analyst", "analytics analyst"]),
+]
+_ALL_SENIORITY = frozenset(w for ws in SENIORITY_WORDS.values() for w in ws if " " not in w)
+
+
+def title_variants(target_role):
+    """Known alternative titles for `target_role`, keeping its leading seniority
+    words (e.g. "Junior AI Engineer" -> "junior machine learning engineer")."""
+    words = normalize_query(target_role).split()
+    prefix_words = []
+    for w in words:
+        if w not in _ALL_SENIORITY:
+            break
+        prefix_words.append(w)
+    core = " ".join(words[len(prefix_words):])
+    prefix = (" ".join(prefix_words) + " ") if prefix_words else ""
+    out = []
+    for pattern, variants in TITLE_VARIANTS:
+        if re.search(pattern, core):
+            out.extend(prefix + v for v in variants)
+    return out
+
+
+def candidate_queries(goal: AgentGoal):
+    """Every valid, distinct title this run may search: the target role, the
+    user's alternative titles and known title variants, in that order. Together
+    with the goal's providers this DEFINES the run's search space (and therefore
+    when `finish` is permitted)."""
+    seen, out = set(), []
+    for q in [goal.target_role] + list(goal.alternative_titles) + title_variants(goal.target_role):
+        ok, qn, _ = validate_search_query(q, goal)
+        if ok and qn not in seen:
+            seen.add(qn)
+            out.append(qn)
+    return out

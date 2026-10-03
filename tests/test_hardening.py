@@ -134,13 +134,22 @@ def test_resume_review_payload_carries_reviewer_identity():
 
 
 def test_legacy_pipeline_run_cannot_be_resumed():
+    import psycopg2
     c, uid = _client()
     rid = _resume(uid)
+    # A NEW non-agent run cannot exist at all (runs_mode_chk, migration 0013)...
+    with pytest.raises(psycopg2.errors.CheckViolation):
+        with get_connection() as conn:
+            conn.cursor().execute(
+                "INSERT INTO runs (status, input_summary, user_id, resume_id, mode) "
+                "VALUES ('queued', 't', %s, %s, 'pipeline')", (uid, rid))
+    # ...and a historical (explicitly retired) one is never resumable.
     with get_connection() as conn:
         cur = conn.cursor()
-        cur.execute("INSERT INTO runs (status, input_summary, user_id, resume_id, mode) "
-                    "VALUES ('waiting_for_human', 't', %s, %s, 'pipeline') RETURNING id",
-                    (uid, rid))
+        cur.execute("INSERT INTO runs (status, input_summary, user_id, resume_id, mode, "
+                    "goal_retired_at, goal_retired_reason) "
+                    "VALUES ('waiting_for_human', 't', %s, %s, 'pipeline', NOW(), "
+                    "'pipeline_engine') RETURNING id", (uid, rid))
         run_id = cur.fetchone()[0]
     r = c.post(f"/runs/{run_id}/resume", json={"decision": "Apply", "comment": "ok"})
     assert r.status_code == 409 and "retired" in r.json()["detail"]

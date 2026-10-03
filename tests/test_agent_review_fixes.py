@@ -168,6 +168,17 @@ class FakeStore:
         mp.setattr(live_jobs, "fetch_and_upsert_remotive", lambda *a, **k: (0, 0, "empty"))
         mp.setattr(agent_store, "search_history", lambda *a: [])
         mp.setattr(agent_store, "record_search", lambda *a, **k: None)
+        s.attempts = []
+        mp.setattr(agent_store, "search_attempts", lambda rid, p, q: [
+            a for a in s.attempts if (a["provider"], a["query_norm"]) == (p, q)])
+
+        def _begin_attempt(rid, g, i, p, q):
+            s.attempts.append({"id": len(s.attempts) + 1, "provider": p, "query_norm": q,
+                               "execution_generation": g, "status": "started"})
+            return len(s.attempts)
+        mp.setattr(agent_store, "begin_search_attempt", _begin_attempt)
+        mp.setattr(agent_store, "finish_search_attempt",
+                   lambda rid, g, aid, st, detail=None: s.attempts[aid - 1].update(status=st))
         import llm
         mp.setattr(llm, "create_step", lambda *a: 1)
         mp.setattr(llm, "finish_step", lambda *a, **k: None)

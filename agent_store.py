@@ -22,9 +22,21 @@ class ExecutionLost(RuntimeError):
     """This worker's execution generation is no longer the run's current one."""
 
 
+class RunErased(ExecutionLost):
+    """The run's data was erased (erasure tombstone): nothing may execute or write
+    for it again. A subclass of ExecutionLost so every existing "stop, don't
+    finalize" path handles it."""
+
+
+_TOMBSTONE_SQL = "EXISTS (SELECT 1 FROM erasure_tombstones t WHERE t.run_id = runs.id)"
+
+
 def _check_generation(cur, run_id, generation, lock="FOR SHARE"):
-    cur.execute(f"SELECT execution_generation FROM runs WHERE id = %s {lock}", (run_id,))
+    cur.execute(f"SELECT execution_generation, {_TOMBSTONE_SQL} FROM runs "
+                f"WHERE id = %s {lock}", (run_id,))
     row = cur.fetchone()
+    if row and row[1]:
+        raise RunErased(f"run {run_id}: data was erased — write refused")
     if not row or int(row[0]) != int(generation):
         raise ExecutionLost(f"run {run_id}: generation {generation} superseded "
                             f"(current {row[0] if row else 'missing'})")
@@ -70,6 +82,9 @@ def begin_execution(run_id, new_attempt):
     grace = float(settings.execution_heartbeat_grace_seconds)
     with get_connection() as conn:
         cur = conn.cursor()
+        cur.execute("SELECT 1 FROM erasure_tombstones WHERE run_id = %s", (run_id,))
+        if cur.fetchone():
+            raise RunErased(f"run {run_id}: data was erased — it cannot execute again")
         cur.execute(f"""
             UPDATE runs SET status = 'running',
                 started_at = COALESCE(started_at, NOW()),
@@ -88,7 +103,61 @@ def begin_execution(run_id, new_attempt):
             raise ExecutionLost(f"run {run_id} does not exist")
         gen = int(row[0])
         _abandon_open_reservations(cur, run_id, before_generation=gen)
+        _abandon_search_attempts(cur, run_id, before_generation=gen)
         return gen
+
+
+def _abandon_search_attempts(cur, run_id, before_generation):
+    """'started' external requests of a dead generation: outcome unknown."""
+    cur.execute("""UPDATE external_search_attempts
+                   SET status = 'abandoned', finished_at = NOW(),
+                       provider_detail = COALESCE(provider_detail, 'outcome_unknown')
+                   WHERE run_id = %s AND status = 'started' AND execution_generation < %s""",
+                (run_id, before_generation))
+
+
+# ------------------------------------------------------- external searches ----
+
+def begin_search_attempt(run_id, generation, iteration, provider, query_norm):
+    """Durably record an external provider request BEFORE it is dispatched
+    (fenced). Returns the attempt id. A crash after this leaves a 'started' row
+    that the next generation marks 'abandoned' — never an invisible request."""
+    with get_connection() as conn:
+        cur = conn.cursor()
+        _check_generation(cur, run_id, generation)
+        cur.execute("""INSERT INTO external_search_attempts
+                           (run_id, iteration, execution_generation, provider, query_norm)
+                       VALUES (%s, %s, %s, %s, %s) RETURNING id""",
+                    (run_id, iteration, generation, provider, query_norm))
+        return int(cur.fetchone()[0])
+
+
+def finish_search_attempt(run_id, generation, attempt_id, status, provider_detail=None):
+    """Close THIS generation's attempt. Not fenced on purpose: the request already
+    happened, and recording its outcome is accounting, not a new effect."""
+    if status not in ("succeeded", "failed"):
+        raise ValueError(f"invalid attempt status {status!r}")
+    with get_connection() as conn:
+        conn.cursor().execute(
+            """UPDATE external_search_attempts SET status = %s, provider_detail = %s,
+                      finished_at = NOW()
+               WHERE id = %s AND run_id = %s AND execution_generation = %s
+                 AND status = 'started'""",
+            (status, (provider_detail or None) and str(provider_detail)[:80],
+             attempt_id, run_id, generation))
+
+
+def search_attempts(run_id, provider, query_norm):
+    """Every external request recorded for (provider, query) in this run."""
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("""SELECT id, iteration, execution_generation, status, provider_detail
+                       FROM external_search_attempts
+                       WHERE run_id = %s AND provider = %s AND query_norm = %s
+                       ORDER BY id""", (run_id, provider, query_norm))
+        rows = cur.fetchall()
+    return [{"id": r[0], "iteration": r[1], "execution_generation": r[2], "status": r[3],
+             "provider_detail": r[4]} for r in rows]
 
 
 def _abandon_open_reservations(cur, run_id, before_generation=None):
@@ -215,10 +284,12 @@ def reserve_llm_call(run_id, generation, default_budget, projected_usd=None,
     cap = float(max_cost_usd or 0)
     with get_connection() as conn:
         cur = conn.cursor()
-        cur.execute("""SELECT execution_generation, llm_calls_reserved,
-                              COALESCE(llm_call_budget, %s)
+        cur.execute(f"""SELECT execution_generation, llm_calls_reserved,
+                              COALESCE(llm_call_budget, %s), {_TOMBSTONE_SQL}
                        FROM runs WHERE id = %s FOR UPDATE""", (int(default_budget), run_id))
         row = cur.fetchone()
+        if row and row[3]:
+            raise RunErased(f"run {run_id}: data was erased — no model call")
         if not row or int(row[0]) != int(generation):
             raise ExecutionLost(f"run {run_id}: generation {generation} superseded "
                                 f"(current {row[0] if row else 'missing'}) — no model call")

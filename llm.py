@@ -188,6 +188,45 @@ def _generation_config():
     return types.GenerateContentConfig(max_output_tokens=settings.llm_max_output_tokens)
 
 
+def provider_token_count(prompt):
+    """The provider's own input-token count for `prompt` (free endpoint, no
+    generation). Raises on any failure — callers fall back to the byte bound."""
+    resp = get_client().models.count_tokens(model=settings.gemini_model, contents=prompt)
+    total = getattr(resp, "total_tokens", None)
+    if total is None:
+        raise InvalidProviderResponse("count_tokens returned no total_tokens")
+    return int(total)
+
+
+def input_token_bound(prompt):
+    """(input_token_bound, method) for the pre-dispatch cost reservation.
+
+    Fail-closed strategy: the byte bound (pricing.byte_token_bound) is a PROVEN
+    upper bound and is always the ceiling. With LLM_INPUT_TOKEN_BOUND=provider the
+    provider's count tightens it — count * (1 + LLM_TOKEN_COUNT_MARGIN) + 16 —
+    but only when the count is plausible (positive, not above the byte bound).
+    Any error, timeout, missing field or implausible value -> the byte bound.
+    The result is never below what the provider can bill for the prompt as long
+    as its count is honest, and never above the proven bound."""
+    from pricing import byte_token_bound
+    bound = byte_token_bound(len((prompt or "").encode("utf-8")))
+    if getattr(settings, "llm_input_token_bound", "bytes") != "provider":
+        return bound, "bytes"
+    try:
+        counted = provider_token_count(prompt)
+    except Exception as e:
+        log.warning("count_tokens failed (%s) — reserving with the byte bound",
+                    type(e).__name__)
+        return bound, "bytes_fallback"
+    if counted <= 0 or counted > bound:
+        log.warning("count_tokens returned an implausible value — reserving with the "
+                    "byte bound")
+        return bound, "bytes_fallback"
+    margin = float(getattr(settings, "llm_token_count_margin", 0.10) or 0.0)
+    tightened = int(counted * (1.0 + margin)) + 16
+    return min(bound, tightened), "provider"
+
+
 def real_llm_once(prompt):
     """Single LLM attempt — no retry. Raises on failure. Retry lives in logged_llm_call.
 
@@ -228,36 +267,51 @@ def real_llm_once(prompt):
 
 
 def create_run_tx(cur, input_summary, resume_id=None, target_role=None,
-                  location=None, work_mode=None, employment_type=None, user_id=None):
+                  location=None, work_mode=None, employment_type=None, user_id=None,
+                  goal=None, mode="agent"):
     """
     Transactional create_run: INSERT the run on the CALLER'S cursor and return its
     id WITHOUT committing. Lets the API create the run and enqueue its worker job in
     ONE transaction (both commit or both roll back), so a run is never left
     'running' with no queue job. The caller owns commit / rollback / close.
+
+    Every run is an AGENT run (the only engine; runs_mode_chk rejects anything
+    else for a new row). `goal` (an AgentGoal) is stored with its budget and cost
+    cap in the same INSERT, so no row ever exists in a half-configured state.
     """
+    if mode != "agent":
+        raise ValueError(f"mode {mode!r} is retired; the controller agent is the only engine")
+    goal_json = budget = max_cost = None
+    if goal is not None:
+        goal_json = json.dumps(goal.model_dump())
+        budget = goal.limits.max_llm_calls
+        max_cost = goal.limits.max_cost_usd
     # A new run is 'queued', NOT 'running': at creation it is only waiting in
     # job_queue for a worker to claim it. started_at is left NULL and is stamped
     # only when the worker actually begins executing (see _mark_run_running in
     # agent_store.begin_execution), so queue-wait time is never counted as execution time.
     cur.execute("""
         INSERT INTO runs (started_at, status, input_summary, resume_id,
-                          target_role, location, work_mode, employment_type, user_id)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id
+                          target_role, location, work_mode, employment_type, user_id,
+                          mode, goal_json, llm_call_budget, max_cost_usd)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id
     """, (None, "queued", input_summary, resume_id,
-          target_role, location, work_mode, employment_type, user_id))
+          target_role, location, work_mode, employment_type, user_id,
+          mode, goal_json, budget, max_cost))
     return cur.fetchone()[0]
 
 
 def create_run(input_summary, resume_id=None, target_role=None,
-               location=None, work_mode=None, employment_type=None, user_id=None):
-    """Create a run in its OWN transaction (thin wrapper over create_run_tx)."""
+               location=None, work_mode=None, employment_type=None, user_id=None,
+               goal=None):
+    """Create an agent run in its OWN transaction (thin wrapper over create_run_tx)."""
     conn = get_connection()
     try:
         cur = conn.cursor()
         run_id = create_run_tx(cur, input_summary, resume_id=resume_id,
                                target_role=target_role, location=location,
                                work_mode=work_mode, employment_type=employment_type,
-                               user_id=user_id)
+                               user_id=user_id, goal=goal)
         conn.commit()
         return run_id
     finally:
@@ -610,10 +664,13 @@ def logged_llm_call(prompt, run_id, step_id, operation="llm_call",
     prompt_bytes = len((prompt or "").encode("utf-8"))
     reserve = getattr(budget, "reserve_attempt", None)
     generation = getattr(budget, "generation", None)
+    # Counted once per LOGICAL call (the prompt is identical across HTTP retries),
+    # and only when a reservation will actually be made.
+    in_bound = input_token_bound(prompt)[0] if reserve is not None else None
     for attempt in range(1, max_retries + 1):
         # Upper bound of THIS request's cost, priced at dispatch time.
         projected = max_request_cost(settings.gemini_model, prompt_bytes,
-                                     settings.llm_max_output_tokens)
+                                     settings.llm_max_output_tokens, input_tokens=in_bound)
         reservation = None
         if reserve is not None:
             reservation = reserve(projected, operation)   # raises BudgetExceeded family /

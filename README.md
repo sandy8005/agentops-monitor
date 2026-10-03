@@ -18,8 +18,12 @@ The agent is the worker; the Monitor is the observer.
 
 > The earlier fixed-sequence "pipeline" engine (`autonomous_graph.py`) was **retired**:
 > two engines meant two sets of lifecycle, budget, pause/resume and error semantics to
-> keep correct. A run still queued for it is closed as `failed / engine_retired`
-> without executing; a paused one cannot be resumed (409) and should be cancelled.
+> keep correct. Migration `0013` finishes the move: `runs.mode` defaults to
+> `agent` and the database rejects any new non-agent run; every legacy goal record —
+> a `pipeline` run, or a goal naming the removed `pool` practice source — is
+> **explicitly retired** (`goal_retired_at`, `goal_retired_reason`) and, if it had
+> not finished, closed as `failed / engine_retired` (or `cancelled` if the user
+> asked). A retired run is never executed or resumed.
 > The original design spec is kept, clearly marked historical, in `docs/design-history.md`.
 
 ### The controller loop
@@ -66,9 +70,10 @@ and a **hard USD cap**.
 included), one transaction under the run-row lock:
 
 1. proves this worker still owns the run (execution generation);
-2. computes the request's **maximum possible cost** — prompt UTF-8 bytes as an
-   upper bound on input tokens, plus the `max_output_tokens` cap that every request
-   carries (thinking tokens count against it), priced at today's rate;
+2. computes the request's **maximum possible cost**: an input-token bound (below),
+   plus the `max_output_tokens` cap that every request carries (thinking tokens
+   count against it), priced at the **highest rate in effect in the next 15
+   minutes** (a request dispatched just before a price change is still bounded);
 3. refuses the request unless
    `known spend + bounds of unknown-cost calls + open reservations + this request ≤ cap`;
 4. records the reservation.
@@ -78,6 +83,26 @@ spend is never counted twice or not at all. A worker that dies mid-request leave
 its reservation `abandoned`: still counted against the cap and reported as unknown
 cost (the request may have been billed). A refused request is a budget stop: the
 caller takes its rules fallback, so a capped run keeps working without the model.
+
+**Input-token bound — fail closed.** The byte bound (prompt UTF-8 bytes ÷
+`LLM_RESERVE_BYTES_PER_TOKEN`) is a *proven* upper bound because a token never
+covers less than one byte; values above `1.0` would under-reserve, so settings
+reject them (and `NaN`/`inf`). With `LLM_INPUT_TOKEN_BOUND=provider` (default) the
+provider's own `count_tokens` tightens it to `count × (1 + LLM_TOKEN_COUNT_MARGIN) + 16`,
+never above the byte bound; any counting error, timeout, missing field or
+implausible value falls back to the byte bound. `LLM_INPUT_TOKEN_BOUND=bytes` skips
+the extra (free) call.
+
+**Ledger constraints** are in the schema, not only in code: `priced` ⇒ cost set,
+`unknown` ⇒ cost `NULL`, `not_billed` ⇒ no charge; no negative cost, token, latency
+or bound; `reservation_id` references `llm_cost_reservations` and is unique (a
+reservation settles exactly one call); a reservation's `status` and `settled_at`
+agree; costs are stored as `NUMERIC(18,10)` so small calls are not rounded to $0.
+`SELECT * FROM cost_ledger_violations(<run_id>)` reconciles a run (empty = clean).
+
+**Price overrides are both-or-neither.** `LLM_INPUT_PRICE_PER_MILLION` and
+`LLM_OUTPUT_PRICE_PER_MILLION` must be set together; one alone is a startup error
+(and treated as an unknown price if it ever reaches the pricing code).
 
 **Unknown is never $0.** Every `llm_calls` row has an explicit `cost_status`:
 
@@ -204,24 +229,38 @@ Only live providers are in scope:
 - **Remotive** — remote-only feed (location is informational; postings that name a
   candidate region are geo-checked).
 
+Every real provider request is recorded **before dispatch** in
+`external_search_attempts` (fenced by execution generation) and closed as
+`succeeded`/`failed` afterwards; a request whose worker died is marked `abandoned`
+(outcome unknown) by the next generation. A title/provider combination gets at
+most 3 real provider requests per run, counted from those rows, so a crash loop
+between dispatch and recording cannot call a provider without bound.
+
 Each search is **run-scoped**: a run only ever sees postings its own searches
 returned. Rows from any other source (old seed/CSV/scraped data in a legacy database)
 are never returned. Duplicates are collapsed URL-first, then by a
 title + company + location fingerprint.
 
-**Geographic eligibility** of remote postings uses a region hierarchy:
+**Geographic eligibility** of remote postings is resolved **structurally**
+(`geo.py`): text becomes ISO countries + regions from a hierarchy, by longest-phrase
+matching ("latin america" never also yields "america"; "south africa" never
+"africa"; "Austin, TX" is the US).
 
 ```
-north_america ── us, canada
-emea ─┬─ europe ── uk
-      ├─ middle_east
-      └─ africa
+world ─┬─ americas ─┬─ north_america  (us, ca, mx)
+       │            └─ latam          (mx, br, ar, …)
+       ├─ emea ─────┬─ europe ── eu   (member states)
+       │            ├─ middle_east
+       │            └─ africa
+       └─ apac
 ```
 
-A posting open to a region accepts a candidate in any sub-region ("EMEA" accepts
-the UAE; "Europe" accepts the UK). Siblings never match (a Middle East posting does
-not accept a German candidate). A candidate who names only a broader region ("EMEA")
-against a narrower posting ("Europe") is `unknown`, not `ineligible`.
+A candidate country is eligible when the posting names it or a region containing
+it — so a "Germany only" posting rejects a French candidate (the old keyword lists
+treated both as "europe"). A candidate who names only a region is eligible if the
+posting covers that region or an ancestor, `unknown` if the posting covers part of
+it, otherwise ineligible. Ambiguous names ("Georgia"), unresolvable text (a bare
+city) and exclusions ("worldwide except US") are `unknown`, never guessed.
 
 ---
 
@@ -254,6 +293,14 @@ python scripts/eval/fallback_agreement.py --limit 500 --resume-id <id>
 
 - **Deleting a resume erases it** (text, name and every trace payload of runs that
   used it, including checkpoints). A resume used by an active run can't be erased (409).
+- **Erasure is monotonic.** Every erased run (resume erasure, run deletion,
+  retention) gets an append-only **tombstone** and a new execution generation.
+  Database triggers then blank or drop any *late* write for it — trace prompts and
+  responses, tool payloads, step context, review payloads, advice, resume
+  suggestions, LangGraph checkpoints — so a stale worker that was still finishing
+  cannot re-persist erased data; metrics (tokens, cost, status) are kept. An erased
+  resume cannot be restored or rewritten and its parse cannot be re-cached (until
+  the same text is uploaded again).
 - **Deleting a run** hard-deletes it and its traces.
 - **Retention** — the worker purges trace payloads of runs that ended more than
   `TRACE_RETENTION_DAYS` (default 30) days ago.
@@ -284,12 +331,17 @@ with status 2** if the checkpoint schema cannot be set up — let your superviso
 
 The suite needs PostgreSQL (`DB_*` settings, migrated with `python migrate.py`).
 Model calls are stubbed and tests set their own model settings, so results do not
-depend on your `.env`. `pytest -m "not db"` runs the pure-logic subset.
+depend on your `.env`. `pytest -m "not db"` runs the pure-logic subset;
+`pytest -m e2e` runs the end-to-end agent test (start → two human-review pauses →
+completion through the real worker, API, store and Postgres checkpointer).
 
-`.github/workflows/ci.yml` runs, on every push and pull request: byte-compilation,
-the pure-logic tests, migration of an **empty** database, a re-run of the migrations
+`.github/workflows/ci.yml` runs, on every push and pull request: a **release-hygiene
+check of the exact archive that would ship** (`git archive HEAD` checked by
+`scripts/check_release.py`: no `__pycache__`/`.pyc`, caches, `.env` or PDFs; the
+required files present), byte-compilation, the pure-logic tests, migration of an **empty** database, a re-run of the migrations
 (must be a no-op), and the full suite (PostgreSQL integration, API authorization,
-pause/resume, concurrency and cost-ledger tests) against PostgreSQL 16.
+pause/resume, concurrency and cost-ledger tests) and the end-to-end agent test
+against PostgreSQL 16.
 
 ### Packaging
 
@@ -297,6 +349,7 @@ Ship tracked source only — never a working directory:
 
 ```bash
 git archive --format=zip -o agentops-monitor.zip HEAD
+python scripts/check_release.py agentops-monitor.zip
 ```
 
 ### Repository layout
@@ -306,6 +359,6 @@ git archive --format=zip -o agentops-monitor.zip HEAD
 - `static/`: dashboard.
 - `tests/`: pytest suite.
 - `scripts/eval/`: offline measurement (`fallback_agreement.py`).
-- `scripts/manual/`: print-based manual checks (not collected by pytest; pass them a synthetic resume path).
+- `scripts/check_release.py`: release-hygiene check (used by CI).
 - `scripts/legacy_migrations/`: pre-runner migration scripts, superseded by `migrations/`.
 - `docs/design-history.md`: the original (superseded) human-in-the-loop design.

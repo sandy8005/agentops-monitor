@@ -12,7 +12,7 @@ Real PostgreSQL (marked db):
 
 Pure logic:
   #5  `finish` is refused until the goal is met or the search space is exhausted
-  #6  EMEA / Europe / Middle East / Africa eligibility
+  #6  EMEA / Europe / Middle East / Africa eligibility (structured, geo.py)
   #11 a stale resume never leaves the run 'running'
       provider error specificity survives finalization; DB errors are not provider errors
       advice propagates limit/cancel stops; pricing is effective-dated
@@ -267,7 +267,9 @@ def test_duplicate_username_is_an_application_error():
 def test_legacy_pipeline_job_is_closed_not_executed(monkeypatch):
     import worker
     rid = _db_run()
-    _sql("UPDATE runs SET mode = 'pipeline', status = 'queued' WHERE id = %s", (rid,))
+    # A historical legacy row: only an explicitly retired run may carry mode='pipeline'.
+    _sql("UPDATE runs SET mode = 'pipeline', goal_retired_at = NOW(), "
+         "goal_retired_reason = 'pipeline_engine', status = 'queued' WHERE id = %s", (rid,))
     monkeypatch.setattr(agent_loop, "run_agent_loop", lambda *a, **k: pytest.fail("executed"))
     worker._run_job({"kind": "start_run", "payload": {"run_id": rid}, "run_id": rid})
     status, code = _sql("SELECT status, error_code FROM runs WHERE id = %s", (rid,))[0]
@@ -697,7 +699,8 @@ def test_database_error_during_advice_is_not_a_per_job_failure(monkeypatch):
 def test_cancelled_legacy_run_ends_cancelled_not_engine_retired(monkeypatch):
     import worker
     rid = _db_run()
-    _sql("UPDATE runs SET mode = 'pipeline', status = 'queued', cancel_requested = TRUE "
+    _sql("UPDATE runs SET mode = 'pipeline', goal_retired_at = NOW(), "
+         "goal_retired_reason = 'pipeline_engine', status = 'queued', cancel_requested = TRUE "
          "WHERE id = %s", (rid,))
     monkeypatch.setattr(agent_loop, "resume_agent_loop", lambda *a, **k: pytest.fail("executed"))
     worker._run_job({"kind": "resume_run", "payload": {"run_id": rid}, "run_id": rid})

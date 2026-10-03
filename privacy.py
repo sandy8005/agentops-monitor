@@ -18,6 +18,13 @@ real controls:
                                       review, checkpoints). Metrics (tokens, cost,
                                       latency, status, scores) are kept.
 
+Erasure is MONOTONIC (erasure_guards.py): every erased run gets an append-only
+tombstone, its execution_generation is bumped (so any worker still holding the old
+generation fails its next fenced write), and database triggers keep any LATE write
+from a stale worker — trace rows, step context, tool payloads, suggestions, advice,
+LangGraph checkpoints — from re-persisting the erased content. An erased resume
+cannot be restored or rewritten, and its parse cannot be re-cached.
+
 What this does NOT cover (deployment responsibilities, see README "Data handling"):
 database-level encryption at rest, backup retention/rotation (erased data lives on
 in old backups until they expire), and log retention.
@@ -41,6 +48,29 @@ def _existing_checkpoint_tables(cur):
                 "AND tablename = ANY(%s)", (list(_CHECKPOINT_TABLES),))
     have = {r[0] for r in cur.fetchall()}
     return [t for t in _CHECKPOINT_TABLES if t in have]
+
+
+def _tombstone_runs(cur, run_ids, reason):
+    """Record the erasure FIRST (same transaction as the scrub) and supersede every
+    execution generation of these runs. From the commit on, the guard triggers
+    blank or drop any late write for them, and a worker still holding an old
+    generation gets ExecutionLost on its next fenced write. Idempotent: an
+    already-tombstoned run keeps its original tombstone (append-only)."""
+    if not run_ids:
+        return
+    cur.execute("INSERT INTO erasure_tombstones (run_id, reason) "
+                "SELECT unnest(%s::bigint[]), %s ON CONFLICT (run_id) DO NOTHING",
+                (list(run_ids), reason))
+    cur.execute("UPDATE runs SET execution_generation = execution_generation + 1 "
+                "WHERE id = ANY(%s)", (list(run_ids),))
+
+
+def is_erased(run_id):
+    """True if this run's payloads were erased (tombstoned)."""
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM erasure_tombstones WHERE run_id = %s", (run_id,))
+        return cur.fetchone() is not None
 
 
 def _scrub_run_payloads(cur, run_ids):
@@ -108,10 +138,15 @@ def erase_resume(resume_id, user_id):
             # this removes EVERY cached parse of this text — including parses made
             # by older parser/schema/model versions (derived personal data).
             from router import resume_content_hash
-            cur.execute("DELETE FROM parsed_resume_cache WHERE content_hash = %s",
-                        (resume_content_hash(text),))
-        cur.execute("SELECT id FROM runs WHERE resume_id = %s", (resume_id,))
-        _scrub_run_payloads(cur, [r[0] for r in cur.fetchall()])
+            h = resume_content_hash(text)
+            # Hash tombstone first: a stale worker can no longer re-cache the parse.
+            cur.execute("INSERT INTO erased_resume_hashes (content_hash) VALUES (%s) "
+                        "ON CONFLICT (content_hash) DO NOTHING", (h,))
+            cur.execute("DELETE FROM parsed_resume_cache WHERE content_hash = %s", (h,))
+        cur.execute("SELECT id FROM runs WHERE resume_id = %s ORDER BY id FOR UPDATE", (resume_id,))
+        run_ids = [r[0] for r in cur.fetchall()]
+        _tombstone_runs(cur, run_ids, "resume_erased")
+        _scrub_run_payloads(cur, run_ids)
         cur.execute("UPDATE resumes SET resume_text = %s, name = %s, is_deleted = TRUE "
                     "WHERE id = %s", (ERASED, ERASED, resume_id))
     log.info("resume erased", extra={"resume_id": resume_id})
@@ -132,6 +167,9 @@ def delete_run(run_id, user_id):
             return False
         if row[0] in ACTIVE_RUN_STATUSES:
             raise ErasureConflict("run is still in progress; cancel it first")
+        # The tombstone outlives the row: the checkpoint tables have no FK to runs,
+        # so without it a stale worker could recreate this run's checkpoints.
+        _tombstone_runs(cur, [run_id], "run_deleted")
         _scrub_run_payloads(cur, [run_id])       # checkpoints live outside the FK graph
         for table in ("evaluations", "llm_calls", "tool_calls", "run_rankings", "run_advice",
                       "agent_action_attempts", "agent_actions", "agent_searches", "review_requests",
@@ -180,6 +218,7 @@ def purge_expired_traces(retention_days, batch_size=500):
             run_ids = [r[0] for r in cur.fetchall()]
             if not run_ids:
                 break
+            _tombstone_runs(cur, run_ids, "retention")
             _scrub_run_payloads(cur, run_ids)
             cur.execute("UPDATE runs SET trace_purged_at = NOW() WHERE id = ANY(%s)",
                         (run_ids,))

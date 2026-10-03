@@ -21,7 +21,8 @@ STALE_AFTER_DAYS = 14   # jobs not seen in this many days drop out of search
 # "practice" data and the mixed "pool" mode were removed: every search reads live
 # postings that THIS run fetched, nothing else. Rows with any other source (left
 # over from an old database) are never returned.
-LIVE_SOURCES = frozenset({"adzuna", "remotive"})
+from agent_goal import LIVE_PROVIDERS  # noqa: E402  (single definition)
+LIVE_SOURCES = frozenset(LIVE_PROVIDERS)
 
 
 # --- Role aliases: expand a query term into equivalent phrases/abbreviations. ---
@@ -426,119 +427,17 @@ def _merge_relaxed_duplicates(rows):
 
 # --- Geographic eligibility of REMOTE postings ---------------------------------
 # A remote-only provider (Remotive) doesn't filter by location, but its postings
-# often restrict WHERE the candidate may live ("USA only", "Europe", "UK"). Work mode
-# (remote) and geographic eligibility are different things. The check below is
-# deliberately CONSERVATIVE: it only reports "ineligible" when both the posting's
-# region and the requested location map to KNOWN, non-overlapping regions. Anything
-# it can't resolve (a city, a state, free text) is "unknown" and kept.
-_WORLDWIDE = {"worldwide", "anywhere", "global", "globally", "international",
-              "any location", "everywhere"}
-_REGION_TERMS = {
-    "us": {"us", "usa", "u.s.", "u.s.a.", "united states", "america",
-           "united states of america"},
-    "canada": {"canada"},          # NOT "ca" — that is California in "San Jose, CA"
-    "north_america": {"north america", "americas"},
-    "latam": {"latam", "latin america", "south america", "brazil", "mexico",
-              "argentina", "colombia", "chile"},
-    "uk": {"uk", "u.k.", "united kingdom", "great britain", "britain", "england",
-           "scotland", "wales"},
-    # EUROPE is a continent. "EMEA" is NOT a synonym for it: EMEA is a larger
-    # region that also contains the Middle East and Africa (see _REGION_PARENTS).
-    "europe": {"europe", "eu", "european union", "eea", "germany", "france",
-               "spain", "italy", "netherlands", "poland", "portugal", "ireland",
-               "sweden", "switzerland", "austria", "belgium", "denmark", "norway",
-               "finland"},
-    "emea": {"emea"},
-    "apac": {"apac", "asia", "asia pacific", "india", "japan", "singapore",
-             "australia", "new zealand", "philippines", "indonesia", "vietnam",
-             "china", "korea"},
-    "africa": {"africa", "nigeria", "kenya", "south africa", "egypt"},
-    "middle_east": {"middle east", "uae", "saudi arabia", "israel", "qatar"},
-}
-# Containment hierarchy, child -> ALL ancestors (transitively closed):
-#
-#   north_america ── us, canada
-#   emea ─┬─ europe ── uk
-#         ├─ middle_east
-#         └─ africa
-#
-# A posting open to a PARENT accepts a candidate in any CHILD ("EMEA" accepts a
-# UAE candidate; "Europe" accepts a UK candidate). SIBLINGS never accept each
-# other: a Middle East posting does NOT accept a German candidate, and an Africa
-# posting does NOT accept a French one.
-_REGION_PARENTS = {
-    "us": {"north_america"},
-    "canada": {"north_america"},
-    "uk": {"europe", "emea"},
-    "europe": {"emea"},
-    "middle_east": {"emea"},
-    "africa": {"emea"},
-}
-
-
-# Terms that name a REGION itself (not one country inside it). Only a candidate who
-# names a region can be "broader" than a posting; one who names a country is not.
-_REGION_LEVEL_TERMS = {
-    "north_america": {"north america", "americas"},
-    "latam": {"latam", "latin america", "south america"},
-    "europe": {"europe", "eu", "european union", "eea"},
-    "emea": {"emea"},
-    "apac": {"apac", "asia", "asia pacific"},
-    "africa": {"africa"},
-    "middle_east": {"middle east"},
-}
-
-
-def _region_level_named(text):
-    low = f" {' '.join(re.split(r'[^a-z0-9.]+', (text or '').lower()))} "
-    return {r for r, terms in _REGION_LEVEL_TERMS.items() if any(f" {t} " in low for t in terms)}
-
-
-def _regions_in(text):
-    low = f" {' '.join(re.split(r'[^a-z0-9.]+', (text or '').lower()))} "
-    found = set()
-    for region, terms in _REGION_TERMS.items():
-        for t in terms:
-            if f" {t} " in low:
-                found.add(region)
-                break
-    return found
-
+# often restrict WHERE the candidate may live ("USA only", "Europe", "UK, Germany").
+# Work mode (remote) and geographic eligibility are different things. Resolution is
+# STRUCTURED (geo.py: ISO countries + a region hierarchy) and CONSERVATIVE: only a
+# clear conflict between resolved scopes is "ineligible"; anything unresolved,
+# ambiguous or phrased as an exclusion is "unknown" and kept.
 
 def geo_eligibility(job, requested_location):
-    """
-    'eligible' / 'ineligible' / 'unknown' for a remote posting vs. the location the
-    user searched from. Only a clear conflict between KNOWN regions is 'ineligible'.
-    """
-    req = (requested_location or "").strip()
-    if not req:
-        return "unknown"
-    region_text = (job.get("location") or "").strip().lower()
-    if not region_text:
-        return "unknown"
-    job_regions = _regions_in(region_text)
-    if not job_regions:
-        return "eligible" if any(w in region_text for w in _WORLDWIDE) else "unknown"
-    req_regions = _regions_in(req)
-    if not req_regions:
-        return "unknown"
-    # The candidate is eligible when the posting's region is the candidate's own
-    # region OR one of its ANCESTORS (a "Europe" posting accepts a UK candidate).
-    # The reverse is not true: a "UK only" posting does not accept a candidate who
-    # only said "Europe" — unless the candidate's text ALSO names a region the
-    # posting covers. Siblings (Europe vs Middle East) never match.
-    candidate_scope = set(req_regions)
-    for r in req_regions:
-        candidate_scope |= _REGION_PARENTS.get(r, set())
-    if job_regions & candidate_scope:
-        return "eligible"
-    # The candidate named a BROADER region than the posting ("EMEA" vs a
-    # "Europe only" posting): they may or may not be inside it — ambiguous, kept.
-    named = _region_level_named(req)
-    for jr in job_regions:
-        if _REGION_PARENTS.get(jr, set()) & named:
-            return "unknown"
-    return "ineligible"
+    """'eligible' / 'ineligible' / 'unknown' for a remote posting vs. the location
+    the user searched from (see geo.eligibility)."""
+    from geo import eligibility
+    return eligibility((job.get("location") or "").strip(), (requested_location or "").strip())
 
 
 def search_jobs(target_role=None, location=None, work_mode=None,

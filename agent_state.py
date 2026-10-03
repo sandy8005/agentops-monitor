@@ -20,7 +20,7 @@ class AgentState:
         self.employment_type = employment_type
         self.evaluate = evaluate
         # Live Mode: search ONLY live-sourced jobs this run fetched, never the
-        # seed/CSV/scraped practice pool.
+        # retired seed/CSV/scraped sources.
         self.live_only = live_only
         # "auto": use Gemini when configured/available, fall back to rules.
         # "rules_only": never call a model (parse, requirements, judge, evaluation,

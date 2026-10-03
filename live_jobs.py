@@ -228,4 +228,4 @@ if __name__ == "__main__":
         print(f"  - {j['title']} @ {j['company']} [{j['employment_type']}] ({j['external_id']})")
     if len(sys.argv) > 2 and sys.argv[2] == "--upsert":
         ins, skip, _ids = upsert_live_jobs(jobs)
-        print(f"\nUpsert: {ins} inserted, {skip} skipped (already in pool)")
+        print(f"\nUpsert: {ins} inserted, {skip} skipped (already stored)")

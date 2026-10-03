@@ -9,6 +9,7 @@ Usage:
     python migrate.py           # apply all pending migrations
     python migrate.py --status  # show applied vs pending, don't change anything
     python migrate.py --skip-checkpointer   # app migrations only
+    python migrate.py --to 0014 --skip-checkpointer   # stop at a version (upgrade tests)
 
 After the app migrations, LangGraph's own checkpoint tables are created/migrated
 (PostgresSaver.setup(), via checkpointing.setup_schema). That DDL used to run on
@@ -17,7 +18,7 @@ also runs it once at startup as a safety net).
 
 Fresh install:  `python migrate.py` on an EMPTY database applies 0001_baseline and
                 every later migration — this is the only supported way to build the
-                schema (db_pg.py is just an alias for it).
+                schema (db_pg.py is an alias: both run main()).
 Existing DB:    `python migrate.py` applies only what's pending. 0001_baseline is
                 idempotent (IF NOT EXISTS) so a pre-migration DB is adopted safely.
 """
@@ -123,13 +124,14 @@ def status():
         print(f"{version}     {name:<27}  {'applied' if version in applied else 'PENDING'}")
 
 
-def migrate():
-    """Apply every pending migration, holding the global schema lock throughout."""
+def migrate(target=None):
+    """Apply every pending migration (or, with `target`, those up to and including
+    that version), holding the global schema lock throughout."""
     with schema_lock():
-        _migrate_locked()
+        _migrate_locked(target)
 
 
-def _migrate_locked():
+def _migrate_locked(target=None):
     conn = _connect()
     cur = conn.cursor()
     _ensure_tracking_table(cur)
@@ -138,7 +140,13 @@ def _migrate_locked():
     # held it first has already applied (and recorded) what it found pending.
     applied = _applied_versions(cur)
 
-    pending = [(v, n, p) for (v, n, p) in _discover() if v not in applied]
+    discovered = _discover()
+    if target is not None and target not in {v for v, _n, _p in discovered}:
+        conn.close()
+        print(f"unknown migration version: {target}")
+        sys.exit(2)
+    pending = [(v, n, p) for (v, n, p) in discovered
+               if v not in applied and (target is None or v <= target)]
     if not pending:
         print("No pending migrations — database is up to date.")
         conn.close()
@@ -177,10 +185,45 @@ def setup_checkpointer():
         sys.exit(1)
 
 
-if __name__ == "__main__":
-    if "--status" in sys.argv:
+def main(argv=None):
+    """The ONE command-line entrypoint for schema work. `python migrate.py` and
+    `python db_pg.py` both call this, so the two are guaranteed to do the same thing:
+
+        (no flags)            app migrations, then LangGraph checkpoint schema + guards
+        --skip-checkpointer   app migrations only
+        --to NNNN             apply pending migrations only up to version NNNN
+                              (upgrade-path testing; combine with --skip-checkpointer
+                              to reproduce an older deployment exactly)
+        --status              show applied vs pending, change nothing
+    """
+    args = sys.argv[1:] if argv is None else list(argv)
+    target, rest, i = None, [], 0
+    while i < len(args):
+        if args[i] == "--to" and i + 1 < len(args):
+            target = args[i + 1]
+            i += 2
+            continue
+        if args[i].startswith("--to="):
+            target = args[i].split("=", 1)[1]
+        else:
+            rest.append(args[i])
+        i += 1
+    unknown = [a for a in rest if a not in ("--status", "--skip-checkpointer")]
+    if unknown or (target is not None and not re.fullmatch(r"\d{4}", target)):
+        if unknown:
+            print(f"unknown argument(s): {' '.join(unknown)}")
+        else:
+            print(f"--to expects a 4-digit migration version, got {target!r}")
+        print("usage: python migrate.py [--status | --skip-checkpointer] [--to NNNN]")
+        return 2
+    if "--status" in rest:
         status()
-    else:
-        migrate()
-        if "--skip-checkpointer" not in sys.argv:
-            setup_checkpointer()
+        return 0
+    migrate(target)
+    if "--skip-checkpointer" not in rest:
+        setup_checkpointer()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,119 @@
+# AgentOps Monitor — CI. One job, run top to bottom; any failing step fails the run.
+# GitHub runs every `run:` with `bash -eo pipefail`, so a failure inside a pipeline
+# (e.g. `migrate.py | tee`) is fatal too. scripts/check_release.py validates this
+# file's content: it rejects an empty workflow, a missing stage, `continue-on-error`
+# and `|| true`.
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  release:
+    name: release hygiene, migrations, full suite (PostgreSQL 16)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: agentops
+          POSTGRES_PASSWORD: agentops-ci        # throwaway CI-only container password
+          POSTGRES_DB: agentops_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U agentops -d agentops_ci"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+
+    env:
+      ENV: dev
+      DB_NAME: agentops_ci
+      DB_USER: agentops
+      DB_PASSWORD: agentops-ci
+      DB_HOST: localhost
+      DB_PORT: "5432"
+      # Model calls are stubbed by the tests; no real key is ever available in CI.
+      GEMINI_API_KEY: ""
+      PYTHONUNBUFFERED: "1"
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements-dev.txt
+
+      - name: Release hygiene — check the exact archive that would ship
+        run: |
+          git archive --format=zip -o "$RUNNER_TEMP/agentops-monitor.zip" HEAD
+          python scripts/check_release.py "$RUNNER_TEMP/agentops-monitor.zip"
+
+      - name: Keep the checked archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: agentops-monitor-${{ github.sha }}
+          path: ${{ runner.temp }}/agentops-monitor.zip
+          if-no-files-found: error
+
+      - name: Byte-compile every module
+        run: python -m compileall -q .
+
+      - name: Pure tests (no database reachable)
+        env:
+          DB_NAME: ""
+          DB_HOST: ""
+        run: python -m pytest -m "not db" --junitxml=reports/pure.xml
+
+      - name: Migrate the EMPTY database to the latest schema
+        run: python migrate.py
+
+      - name: Re-run the migrations (must be a no-op) and check status via db_pg.py
+        run: |
+          python migrate.py | tee "$RUNNER_TEMP/rerun.log"
+          grep -q "No pending migrations" "$RUNNER_TEMP/rerun.log"
+          python db_pg.py --status | tee "$RUNNER_TEMP/status.log"
+          ! grep -q PENDING "$RUNNER_TEMP/status.log"
+
+      - name: Upgrade paths — every older schema version reaches the fresh-install schema
+        run: python scripts/check_migrations.py
+
+      - name: Database tests (integration, authorization, pause/resume, concurrency, cost ledger)
+        run: python -m pytest -m "db and not e2e" --junitxml=reports/db.xml
+
+      - name: End-to-end agent test (two human-review interrupts)
+        run: python -m pytest -m e2e --junitxml=reports/e2e.xml
+
+      - name: Prove the whole suite ran green (no failures, no skips, nothing missed)
+        run: python scripts/ci_summary.py reports/pure.xml reports/db.xml reports/e2e.xml
+
+      - name: Keep the test reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-reports-${{ github.sha }}
+          path: reports/
+          if-no-files-found: warn

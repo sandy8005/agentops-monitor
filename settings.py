@@ -23,6 +23,7 @@ tests can import freely without a live DB config. API keys are optional (feature
 degrade without them). SESSION_SECRET is required only when ENV=production
 (enforced in api.py, where a forgeable session key actually matters).
 """
+import math
 import os
 from dotenv import load_dotenv
 
@@ -93,6 +94,10 @@ class _Reader:
             val = float(raw.strip())
         except ValueError:
             self.errors.append(f"{name}={raw!r} is not a number")
+            return default
+        if not math.isfinite(val):
+            # NaN compares False against every bound, so it would slip past them.
+            self.errors.append(f"{name}={raw!r} must be a finite number")
             return default
         if min_value is not None and val < min_value:
             self.errors.append(f"{name}={val} must be >= {min_value}")
@@ -174,20 +179,40 @@ class Settings:
         # for this long (llm.py quota circuit breaker).
         self.llm_quota_cooldown_seconds = r.int("LLM_QUOTA_COOLDOWN_SECONDS", 3600,
                                                 min_value=60, max_value=86400)
-        # Optional explicit prices (USD per 1M tokens). Both must be set to apply.
+        # Optional explicit prices (USD per 1M tokens). BOTH or NEITHER: a single
+        # override used to be silently ignored, so an operator who set only the
+        # input price believed it applied while the built-in table was used.
         self.llm_input_price_per_million = r.float("LLM_INPUT_PRICE_PER_MILLION",
-                                                   None, min_value=0.0)
+                                                   None, min_value=0.0, max_value=10_000.0)
         self.llm_output_price_per_million = r.float("LLM_OUTPUT_PRICE_PER_MILLION",
-                                                    None, min_value=0.0)
+                                                    None, min_value=0.0, max_value=10_000.0)
+        if (self.llm_input_price_per_million is None) != (self.llm_output_price_per_million is None):
+            r.errors.append("LLM_INPUT_PRICE_PER_MILLION and LLM_OUTPUT_PRICE_PER_MILLION must "
+                            "be set together (both or neither)")
         # Hard output cap sent with EVERY model request (max_output_tokens; thinking
         # tokens count against it). It is also the output side of the dollar
         # reservation made before each request, so a USD cap can be proven.
         self.llm_max_output_tokens = r.int("LLM_MAX_OUTPUT_TOKENS", 8192,
                                            min_value=256, max_value=65536)
-        # Input-token upper bound used for the reservation: prompt UTF-8 bytes /
-        # this value. 1.0 is a true bound (a token never covers less than a byte).
+        # Input-token upper bound for the pre-dispatch reservation (pricing.py):
+        #   "provider" (default): the provider's own count_tokens for the exact
+        #       prompt, plus a safety margin, never above the byte bound; if the
+        #       count fails or looks implausible, the byte bound is used (fail closed).
+        #   "bytes": prompt UTF-8 bytes / LLM_RESERVE_BYTES_PER_TOKEN, no extra call.
+        self.llm_input_token_bound = (r.str("LLM_INPUT_TOKEN_BOUND", "provider")
+                                      or "provider").strip().lower()
+        if self.llm_input_token_bound not in ("provider", "bytes"):
+            r.errors.append(f"LLM_INPUT_TOKEN_BOUND={self.llm_input_token_bound!r} must be "
+                            "'provider' or 'bytes'")
+        # Bytes per token for the byte bound. A token never covers LESS than one
+        # UTF-8 byte, so bytes/1.0 is a proven upper bound; any value ABOVE 1.0
+        # would under-reserve and silently weaken the hard USD cap, so it is
+        # rejected. Lower values are allowed (more conservative).
         self.llm_reserve_bytes_per_token = r.float("LLM_RESERVE_BYTES_PER_TOKEN", 1.0,
-                                                   min_value=0.5, max_value=4.0)
+                                                   min_value=0.25, max_value=1.0)
+        # Margin applied to a provider token count (count * (1 + margin) + 16).
+        self.llm_token_count_margin = r.float("LLM_TOKEN_COUNT_MARGIN", 0.10,
+                                              min_value=0.0, max_value=1.0)
         # Runtime accounting after a worker crash: the dead worker's open execution
         # interval is charged up to its LAST HEARTBEAT plus this grace (not up to
         # the moment a replacement starts).

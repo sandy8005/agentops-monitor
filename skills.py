@@ -1,4 +1,4 @@
-﻿"""
+"""
 Canonical skill normalization — ONE vocabulary for the whole pipeline.
 
 Every stage that compares skills goes through this module: resume grounding

@@ -155,8 +155,9 @@ def _run_job(job):
     run_id = job.get("run_id") or p.get("run_id")
     if kind not in ("start_run", "resume_run"):
         raise ValueError(f"unknown job kind: {kind}")
-    if _run_mode(run_id) != "agent":
-        _retire_legacy_run(run_id)
+    mode, retired = _run_mode(run_id)
+    if mode != "agent" or retired:
+        _retire_legacy_run(run_id, retired or "pipeline_engine")
         return
     if kind == "start_run":
         agent_loop.run_agent_loop(p["run_id"], queue_attempt=job.get("attempts", 1))
@@ -164,22 +165,25 @@ def _run_job(job):
         agent_loop.resume_agent_loop(p["run_id"], p, queue_attempt=job.get("attempts", 1))
 
 
-def _retire_legacy_run(run_id):
-    """Close a run of the retired engine without executing it. A cancel the user
-    requested wins: such a run ends 'cancelled', otherwise failed/engine_retired."""
+def _retire_legacy_run(run_id, reason="pipeline_engine"):
+    """Close a retired run without executing it (normally migration 0013 already
+    did; this is the backstop for a job that was claimed concurrently). A cancel
+    the user requested wins: such a run ends 'cancelled', otherwise
+    failed/engine_retired. The goal record is marked retired explicitly."""
     with get_connection() as conn:
         conn.cursor().execute(
             "UPDATE runs SET status = CASE WHEN cancel_requested THEN 'cancelled' ELSE 'failed' END, "
             "ended_at = NOW(), pending_review = NULL, "
+            "goal_retired_at = COALESCE(goal_retired_at, NOW()), "
+            "goal_retired_reason = COALESCE(goal_retired_reason, %s), "
             "error_code = CASE WHEN cancel_requested THEN %s ELSE %s END, "
             "stop_reason = CASE WHEN cancel_requested THEN 'cancelled by user' ELSE "
-            "'engine_retired: this run was queued for the retired pipeline engine and was not "
+            "'engine_retired: this run''s goal uses a retired engine or job source and was not "
             "executed; start a new run' END "
             "WHERE id = %s AND status NOT IN ('success', 'partial_success', 'no_matches', "
             "'completed_with_errors', 'cancelled', 'failed')",
-            (ErrorCode.CANCELLED.value, ErrorCode.ENGINE_RETIRED.value, run_id))
-    log.warning("legacy pipeline run closed without executing (engine retired)",
-                extra={"run_id": run_id})
+            (reason, ErrorCode.CANCELLED.value, ErrorCode.ENGINE_RETIRED.value, run_id))
+    log.warning("retired run closed without executing (%s)", reason, extra={"run_id": run_id})
 
 
 class DatabaseUnavailable(RuntimeError):
@@ -188,23 +192,32 @@ class DatabaseUnavailable(RuntimeError):
 
 def _run_mode(run_id):
     """
-    The run's engine ('agent', or 'pipeline' for legacy rows). Any failure raises
-    DatabaseUnavailable (retryable): a transient error must never be read as a
-    routing decision (N08). migrate.py is required, so runs.mode always exists.
+    (mode, retired_reason) of the run. A goal is retired when it uses the retired
+    pipeline engine or a retired job source (migration 0013), or when its stored
+    goal no longer validates (e.g. it still names the removed 'pool' provider).
+    Any DB failure raises DatabaseUnavailable (retryable): a transient error must
+    never be read as a routing decision (N08).
     """
     if run_id is None:
         raise ValueError("job has no run_id")
     try:
         with get_connection() as conn:
             cur = conn.cursor()
-            cur.execute("SELECT mode FROM runs WHERE id = %s", (run_id,))
+            cur.execute("SELECT mode, goal_retired_reason, goal_json FROM runs WHERE id = %s",
+                        (run_id,))
             row = cur.fetchone()
     except Exception as e:
         raise DatabaseUnavailable(f"database_unavailable: run mode lookup failed "
                                   f"({type(e).__name__})") from e
     if not row:
         raise ValueError(f"run {run_id} does not exist")
-    return row[0] or "pipeline"
+    mode, retired, goal = row
+    if not retired and isinstance(goal, dict):
+        providers = goal.get("providers")
+        from agent_goal import LIVE_PROVIDERS
+        if isinstance(providers, list) and any(p not in LIVE_PROVIDERS for p in providers):
+            retired = "retired_provider"
+    return mode, retired
 
 
 def _job_is_stale(job):
@@ -221,11 +234,14 @@ def _job_is_stale(job):
         return False
     with get_connection() as conn:
         cur = conn.cursor()
-        cur.execute("SELECT status, error_code FROM runs WHERE id = %s", (run_id,))
+        cur.execute("SELECT status, error_code, EXISTS (SELECT 1 FROM erasure_tombstones t "
+                    "WHERE t.run_id = runs.id) FROM runs WHERE id = %s", (run_id,))
         row = cur.fetchone()
     if not row:
         return True
-    status, error_code = row
+    status, error_code, erased = row
+    if erased:
+        return True          # the run's data was erased: it never executes again
     if status in ("queued", "retrying", "running"):
         return False
     # R02: a run left 'failed' with a RETRYABLE code by an older (non-atomic) crash
