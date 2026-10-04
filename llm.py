@@ -198,26 +198,43 @@ def provider_token_count(prompt):
     return int(total)
 
 
-def input_token_bound(prompt):
+def input_token_bound(prompt, authorize=None, record=None):
     """(input_token_bound, method) for the pre-dispatch cost reservation.
 
-    Fail-closed strategy: the byte bound (pricing.byte_token_bound) is a PROVEN
-    upper bound and is always the ceiling. With LLM_INPUT_TOKEN_BOUND=provider the
-    provider's count tightens it — count * (1 + LLM_TOKEN_COUNT_MARGIN) + 16 —
-    but only when the count is plausible (positive, not above the byte bound).
-    Any error, timeout, missing field or implausible value -> the byte bound.
-    The result is never below what the provider can bill for the prompt as long
-    as its count is honest, and never above the proven bound."""
+    Default (LLM_INPUT_TOKEN_BOUND=bytes): the byte bound (pricing.byte_token_bound),
+    a PROVEN upper bound computed locally — nothing leaves the process before the
+    fenced reservation authorizes the request.
+
+    LLM_INPUT_TOKEN_BOUND=provider tightens it with the provider's count —
+    count * (1 + LLM_TOKEN_COUNT_MARGIN) + 16, never above the byte bound. A token
+    count SENDS THE PROMPT to the provider, so it is an external request like any
+    other and follows the same rule:
+      * it needs `authorize` — called first, it proves (durably, under the run row
+        lock) that this worker owns the run and that the run is neither erased nor
+        cancelled, and raises otherwise. Without an `authorize` callback there is
+        no proof, so the provider is NOT contacted and the byte bound is used;
+      * it is recorded: `record(status, counted, latency_ms, error)` writes it to
+        the trace as an external provider interaction.
+    Any count failure, timeout, missing field or implausible value -> the byte
+    bound (fail closed). Authorization errors propagate (no request is made)."""
     from pricing import byte_token_bound
     bound = byte_token_bound(len((prompt or "").encode("utf-8")))
     if getattr(settings, "llm_input_token_bound", "bytes") != "provider":
         return bound, "bytes"
+    if authorize is None:
+        return bound, "bytes"
+    authorize()                     # raises ExecutionLost / RunErased / RunCancelled
+    start = time.time()
     try:
         counted = provider_token_count(prompt)
     except Exception as e:
+        if record is not None:
+            record("failed", None, int((time.time() - start) * 1000), e)
         log.warning("count_tokens failed (%s) — reserving with the byte bound",
                     type(e).__name__)
         return bound, "bytes_fallback"
+    if record is not None:
+        record("success", counted, int((time.time() - start) * 1000), None)
     if counted <= 0 or counted > bound:
         log.warning("count_tokens returned an implausible value — reserving with the "
                     "byte bound")
@@ -225,6 +242,19 @@ def input_token_bound(prompt):
     margin = float(getattr(settings, "llm_token_count_margin", 0.10) or 0.0)
     tightened = int(counted * (1.0 + margin)) + 16
     return min(bound, tightened), "provider"
+
+
+def _token_count_recorder(run_id, step_id, operation, prompt_bytes):
+    """Trace writer for a provider token count: the request is recorded as a
+    tool call (size and outcome only — never the prompt)."""
+    def record(status, counted, latency_ms, error):
+        log_tool_call(run_id, step_id, "gemini_count_tokens",
+                      {"operation": operation, "prompt_bytes": prompt_bytes,
+                       "model": settings.gemini_model},
+                      None if counted is None else {"total_tokens": counted},
+                      latency_ms, status, None if error is None else type(error).__name__,
+                      operation)
+    return record
 
 
 def real_llm_once(prompt):
@@ -623,23 +653,35 @@ def _backoff_seconds(attempt, exc=None):
     return random.uniform(0, ceiling)
 
 
+_DISPATCH_CHECK_EVERY = 4   # retry sleeps re-check cancel/erasure every 4 slices (2s)
+
+
 def _interruptible_sleep(seconds, budget):
     """Sleep between HTTP attempts. With a durable budget the sleep is cut into
-    _SLEEP_SLICE pieces and run ownership is checked before each one, so a worker
-    that lost the run stops immediately instead of sleeping up to 30s and then
-    making another request (the next reservation is generation-fenced as well)."""
+    _SLEEP_SLICE pieces: run ownership (in-process) is checked before each one,
+    and the durable dispatch authorization (generation + not erased + not
+    cancelled, budget.authorize_dispatch) every _DISPATCH_CHECK_EVERY slices and
+    once more at the end. A worker that lost the run, or whose run was cancelled,
+    stops during the backoff instead of sleeping up to 30s first. (The next
+    reservation enforces the same rule atomically regardless.)"""
     seconds = max(0.0, float(seconds))
     check = getattr(budget, "check_owner", None)
+    authorize = getattr(budget, "authorize_dispatch", None)
     if check is None:
         time.sleep(seconds)
         return
-    remaining = seconds
+    remaining, n = seconds, 0
     while remaining > 0:
         check()                                  # raises ExecutionLost
+        if authorize is not None and n % _DISPATCH_CHECK_EVERY == 0:
+            authorize()                          # raises RunCancelled / RunErased
         step = min(_SLEEP_SLICE, remaining)
         time.sleep(step)
         remaining -= step
+        n += 1
     check()
+    if authorize is not None:
+        authorize()
 
 
 def logged_llm_call(prompt, run_id, step_id, operation="llm_call",
@@ -665,8 +707,14 @@ def logged_llm_call(prompt, run_id, step_id, operation="llm_call",
     reserve = getattr(budget, "reserve_attempt", None)
     generation = getattr(budget, "generation", None)
     # Counted once per LOGICAL call (the prompt is identical across HTTP retries),
-    # and only when a reservation will actually be made.
-    in_bound = input_token_bound(prompt)[0] if reserve is not None else None
+    # and only when a reservation will actually be made. A provider-side count is
+    # itself an external request: it is authorized by the same durable rule as the
+    # reservation BEFORE the prompt leaves the process, and traced.
+    in_bound = None
+    if reserve is not None:
+        in_bound = input_token_bound(
+            prompt, authorize=getattr(budget, "authorize_dispatch", None),
+            record=_token_count_recorder(run_id, step_id, operation, prompt_bytes))[0]
     for attempt in range(1, max_retries + 1):
         # Upper bound of THIS request's cost, priced at dispatch time.
         projected = max_request_cost(settings.gemini_model, prompt_bytes,
@@ -674,7 +722,8 @@ def logged_llm_call(prompt, run_id, step_id, operation="llm_call",
         reservation = None
         if reserve is not None:
             reservation = reserve(projected, operation)   # raises BudgetExceeded family /
-                                                          # ExecutionLost; never returns None
+                                                          # ExecutionLost / RunCancelled;
+                                                          # never returns None
         elif budget is not None:
             if not budget.can_spend():
                 raise BudgetExceeded(

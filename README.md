@@ -69,7 +69,8 @@ and a **hard USD cap**.
 **USD cap — reserve, then spend.** Before every provider request (retries
 included), one transaction under the run-row lock:
 
-1. proves this worker still owns the run (execution generation);
+1. proves this worker still owns the run (execution generation), that the run was
+   not erased and that the user has **not cancelled** it;
 2. computes the request's **maximum possible cost**: an input-token bound (below),
    plus the `max_output_tokens` cap that every request carries (thinking tokens
    count against it), priced at the **highest rate in effect in the next 15
@@ -87,11 +88,33 @@ caller takes its rules fallback, so a capped run keeps working without the model
 **Input-token bound — fail closed.** The byte bound (prompt UTF-8 bytes ÷
 `LLM_RESERVE_BYTES_PER_TOKEN`) is a *proven* upper bound because a token never
 covers less than one byte; values above `1.0` would under-reserve, so settings
-reject them (and `NaN`/`inf`). With `LLM_INPUT_TOKEN_BOUND=provider` (default) the
-provider's own `count_tokens` tightens it to `count × (1 + LLM_TOKEN_COUNT_MARGIN) + 16`,
-never above the byte bound; any counting error, timeout, missing field or
-implausible value falls back to the byte bound. `LLM_INPUT_TOKEN_BOUND=bytes` skips
-the extra (free) call.
+reject them (and `NaN`/`inf`). `LLM_INPUT_TOKEN_BOUND=bytes` is the **default**: the
+bound is computed locally, so nothing leaves the process before the reservation
+authorizes the request. `LLM_INPUT_TOKEN_BOUND=provider` additionally asks the
+provider's `count_tokens` to tighten it to `count × (1 + LLM_TOKEN_COUNT_MARGIN) + 16`,
+never above the byte bound. A token count **sends the prompt**, so it is treated as
+an external request: it is authorized first by the same rule as a reservation
+(owner, not erased, not cancelled — refused otherwise, nothing sent) and recorded
+as a `gemini_count_tokens` tool call (prompt size only, never content). Any
+counting error, timeout, missing field or implausible value falls back to the byte
+bound.
+
+### Cancellation
+
+`POST /runs/{id}/cancel` finalizes a run immediately when its job is still queued.
+Otherwise it sets `cancel_requested` under the run-row lock, and cancellation is a
+**precondition of every external dispatch**, not a flag polled near it:
+`reserve_llm_call` (every model request and retry), `authorize_dispatch` (provider
+token counts, retry backoff) and `begin_search_attempt` (Adzuna / Remotive) each
+refuse a cancelled run inside their own transaction. Once the cancel commits, no new
+external request is sent; work completed before it is kept and ranked, and the run
+ends `cancelled`, never `failed`.
+
+The API locks the *run* row while `job_queue.claim_next` locks the *queue* row, so a
+worker can claim a job while the API still sees the run `queued`. The API then
+falls back to the flag, and the worker re-reads `cancel_requested` **after**
+`begin_execution` (whose run-row update waits for the API's lock), so the run stops
+before setup.
 
 **Ledger constraints** are in the schema, not only in code: `priced` ⇒ cost set,
 `unknown` ⇒ cost `NULL`, `not_billed` ⇒ no charge; no negative cost, token, latency
@@ -125,10 +148,14 @@ with a model that has no price for today is refused (`422`) or stopped
 (`cost_unknown`).
 
 **Active runtime.** Only execution time is charged: waiting for a human or in the
-retry queue is not. If a worker dies mid-execution, its open interval is charged up
-to its **last heartbeat plus `EXECUTION_HEARTBEAT_GRACE_SECONDS`** (default 45s; the
-heartbeat runs every 30s) — a conservative bound, since the exact moment it stopped
-is unknowable.
+retry queue is not. The limit is **cooperative**: it is checked (reached at `>=`)
+before setup's resume parse, before every controller decision and tool, and between
+the work units of a batch tool, so nothing new starts once it is reached. A provider
+request already in flight is not interrupted and can finish past the limit, bounded
+by that request's own timeout and retry policy. If a worker dies mid-execution, its
+open interval is charged up to its **last heartbeat plus
+`EXECUTION_HEARTBEAT_GRACE_SECONDS`** (default 45s; the heartbeat runs every 30s) — a
+conservative bound, since the exact moment it stopped is unknowable.
 
 ### Audit model
 
@@ -229,6 +256,9 @@ re-raises them so the run fails (or retries) with a classified error code:
 
 * infrastructure failures: database errors and lost execution ownership
   (`database_unavailable` is retryable);
+* a dispatch refused because the user cancelled (`agent_store.RunCancelled`): it is
+  never turned into "take the rules fallback and keep working" — the run ends
+  `cancelled`;
 * programming errors in our own code: `TypeError`, `AttributeError`, `NameError`,
   `ImportError`, `AssertionError`, `NotImplementedError`, `RecursionError`.
 
@@ -400,9 +430,13 @@ python scripts/make_release.py       # git archive HEAD -> dist/agentops-monitor
 
 `make_release.py` refuses a dirty working tree and deletes the archive if the check
 fails. The check rejects `.env` / `.env.*` (except `.env.example`), bytecode and
-caches, virtualenvs, PDFs/DOCX, missing **or empty** required files, an incomplete CI
-workflow, and any value for a secret-looking variable in `.env.example`. To check an
-archive built some other way: `python scripts/check_release.py some.zip`.
+caches, virtualenvs, PDFs/DOCX, nested `.zip` archives, generated output
+(`reports/`, `dist/`, `build/`, `htmlcov/`, `*.egg-info/`, `.coverage*`), editor and
+OS files (`.idea/`, `.vscode/`, `.DS_Store`, `Thumbs.db`, `desktop.ini`), `uploads/`,
+missing **or empty** required files, an incomplete CI workflow, and any value for a
+secret-looking variable in `.env.example`. To check an archive built some other
+way: `python scripts/check_release.py some.zip`. **If the check fails, do not share
+the archive.**
 
 ### Repository layout
 

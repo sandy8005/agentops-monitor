@@ -626,16 +626,26 @@ def cancel_run(run_id: int, user: dict = Depends(require_auth),
         status = row[0]
 
         if status == "running":
-            # Actively executing — cooperative cancel: the loop checks is_cancel_requested
-            # between jobs. Set the flag in THIS locked transaction.
+            # Actively executing. Set the flag in THIS locked transaction. The loop
+            # checks it at every decision/tool boundary, and every external dispatch
+            # (model reservation, provider token count, job search) REQUIRES
+            # cancel_requested = FALSE under this same row lock — so once this
+            # commits, the worker cannot send another request.
             cur.execute("UPDATE runs SET cancel_requested = TRUE WHERE id = %s", (run_id,))
             return {"run_id": run_id, "cancel_requested": True}
 
         if status in ("queued", "retrying"):
-            # NOT executing. Cancel the queued job BEFORE a worker claims it, so the user
-            # doesn't wait through retry backoff. The row lock serializes against
-            # claim_next: if we cancel the queued job first, finalize the run IMMEDIATELY;
-            # if a worker just claimed it (now 'running'), fall back to cooperative cancel.
+            # Not executing yet. Cancel the queued job BEFORE a worker claims it, so the
+            # user doesn't wait through retry backoff; if we cancel it, finalize the run
+            # IMMEDIATELY.
+            #
+            # This run-row lock does NOT serialize against job_queue.claim_next, which
+            # locks only the QUEUE row: a worker may already have claimed the job while
+            # the run still reads 'queued'. Then the UPDATE below matches nothing and we
+            # fall back to the flag. That is safe because the worker's begin_execution
+            # (an UPDATE of this run row) waits for this lock, and run_agent_loop
+            # re-reads cancel_requested AFTER begin_execution — plus every dispatch
+            # refuses a cancelled run (see the 'running' branch).
             cur.execute("UPDATE job_queue SET status = 'cancelled', finished_at = NOW() "
                         "WHERE run_id = %s AND status = 'queued'", (run_id,))
             if cur.rowcount > 0:
@@ -643,7 +653,8 @@ def cancel_run(run_id: int, user: dict = Depends(require_auth),
                             "cancel_requested = TRUE, error_code = 'cancelled', "
                             "stop_reason = 'cancelled by user' WHERE id = %s", (run_id,))
                 return {"run_id": run_id, "cancelled": True}
-            # A worker claimed it in the meantime — cooperative cancel instead.
+            # A worker claimed the queue row in the meantime — set the flag; the worker
+            # sees it right after begin_execution, before setup or any external request.
             cur.execute("UPDATE runs SET cancel_requested = TRUE WHERE id = %s", (run_id,))
             return {"run_id": run_id, "cancel_requested": True}
 
@@ -999,5 +1010,5 @@ def get_agent_timeline(run_id: int, user: dict = Depends(require_auth)):
                      "committed_usd": usage["committed_usd"],
                      "limit_usd": ((row[1] or {}).get("limits") or {}).get("max_cost_usd"),
                      "complete": usage["unknown_cost_calls"] == 0,
-                     "basis": "estimated_paid_tier"}, 
+                     "basis": "estimated_paid_tier"},
             "actions": actions}

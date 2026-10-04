@@ -32,11 +32,15 @@ log = get_logger(__name__)
 
 def is_infrastructure_error(exc):
     """Errors that must NEVER be absorbed by a per-item fallback: lost execution
-    ownership and database failures. They propagate so the run fails (or is
-    retried) with the right code instead of continuing on silently degraded data."""
+    ownership, a refused dispatch because the user cancelled the run, and database
+    failures. They propagate so the run stops (cancelled), fails or is retried with
+    the right code instead of continuing on silently degraded data — in
+    particular, a cancel refused at a reservation must not be turned into "use the
+    rules fallback and keep working"."""
     import agent_store
     import run_lock
-    if isinstance(exc, (agent_store.ExecutionLost, run_lock.ExecutionLost)):
+    if isinstance(exc, (agent_store.ExecutionLost, run_lock.ExecutionLost,
+                        agent_store.RunCancelled)):
         return True
     return (type(exc).__module__ or "").startswith(("psycopg2", "psycopg"))
 

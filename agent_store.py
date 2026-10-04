@@ -28,11 +28,23 @@ class RunErased(ExecutionLost):
     finalize" path handles it."""
 
 
+class RunCancelled(RuntimeError):
+    """The user cancelled the run: no NEW external request (model call, model
+    token count, job-provider search) may be authorized for it.
+
+    Deliberately NOT an ExecutionLost: the worker still owns the run and must
+    finalize it as 'cancelled' (ExecutionLost means "stop without writing")."""
+
+
 _TOMBSTONE_SQL = "EXISTS (SELECT 1 FROM erasure_tombstones t WHERE t.run_id = runs.id)"
 
 
-def _check_generation(cur, run_id, generation, lock="FOR SHARE"):
-    cur.execute(f"SELECT execution_generation, {_TOMBSTONE_SQL} FROM runs "
+def _check_generation(cur, run_id, generation, lock="FOR SHARE", require_not_cancelled=False):
+    """Fence a transaction on the run row. With require_not_cancelled=True this is
+    the EXTERNAL-DISPATCH authorization rule (authorize_dispatch,
+    begin_search_attempt): generation matches AND not erased AND not cancelled,
+    all read under the same row lock the cancel endpoint takes."""
+    cur.execute(f"SELECT execution_generation, {_TOMBSTONE_SQL}, cancel_requested FROM runs "
                 f"WHERE id = %s {lock}", (run_id,))
     row = cur.fetchone()
     if row and row[1]:
@@ -40,6 +52,20 @@ def _check_generation(cur, run_id, generation, lock="FOR SHARE"):
     if not row or int(row[0]) != int(generation):
         raise ExecutionLost(f"run {run_id}: generation {generation} superseded "
                             f"(current {row[0] if row else 'missing'})")
+    if require_not_cancelled and row[2]:
+        raise RunCancelled(f"run {run_id}: cancellation requested — external request refused")
+
+
+def authorize_dispatch(run_id, generation):
+    """Prove, in one fenced read, that this worker may send data to an external
+    provider RIGHT NOW: it owns the run (generation), the run was not erased and
+    the user has not cancelled it. Raises ExecutionLost / RunErased / RunCancelled.
+
+    Used before requests that are not reservations themselves (e.g. a provider
+    token count). reserve_llm_call and begin_search_attempt apply the same rule
+    inside their own transactions."""
+    with get_connection() as conn:
+        _check_generation(conn.cursor(), run_id, generation, require_not_cancelled=True)
 
 
 # ------------------------------------------------------------------ lifecycle --
@@ -119,12 +145,15 @@ def _abandon_search_attempts(cur, run_id, before_generation):
 # ------------------------------------------------------- external searches ----
 
 def begin_search_attempt(run_id, generation, iteration, provider, query_norm):
-    """Durably record an external provider request BEFORE it is dispatched
-    (fenced). Returns the attempt id. A crash after this leaves a 'started' row
-    that the next generation marks 'abandoned' — never an invisible request."""
+    """AUTHORIZE and durably record an external provider request BEFORE it is
+    dispatched. In one transaction under the run row lock: generation matches,
+    no erasure tombstone, cancel_requested = FALSE (else ExecutionLost / RunErased
+    / RunCancelled and nothing is recorded or sent). Returns the attempt id. A
+    crash after this leaves a 'started' row that the next generation marks
+    'abandoned' — never an invisible request."""
     with get_connection() as conn:
         cur = conn.cursor()
-        _check_generation(cur, run_id, generation)
+        _check_generation(cur, run_id, generation, require_not_cancelled=True)
         cur.execute("""INSERT INTO external_search_attempts
                            (run_id, iteration, execution_generation, provider, query_norm)
                        VALUES (%s, %s, %s, %s, %s) RETURNING id""",
@@ -272,6 +301,10 @@ def reserve_llm_call(run_id, generation, default_budget, projected_usd=None,
     In ONE transaction, under the run row lock:
       * the worker must still own the run (execution_generation) — a superseded
         worker gets ExecutionLost and makes no request;
+      * the run must not be erased (RunErased) or cancelled (RunCancelled): a
+        cancel committed before this transaction stops every later request,
+        retries included — cancellation is a precondition of dispatch, not a
+        flag merely polled "near" it;
       * the request-count budget must have room (else returns None);
       * with a USD cap: no unbounded unknown spend may exist (CostUnknown), the
         request must have a known maximum cost (CostUnknown), and
@@ -285,7 +318,8 @@ def reserve_llm_call(run_id, generation, default_budget, projected_usd=None,
     with get_connection() as conn:
         cur = conn.cursor()
         cur.execute(f"""SELECT execution_generation, llm_calls_reserved,
-                              COALESCE(llm_call_budget, %s), {_TOMBSTONE_SQL}
+                              COALESCE(llm_call_budget, %s), {_TOMBSTONE_SQL},
+                              cancel_requested
                        FROM runs WHERE id = %s FOR UPDATE""", (int(default_budget), run_id))
         row = cur.fetchone()
         if row and row[3]:
@@ -293,6 +327,8 @@ def reserve_llm_call(run_id, generation, default_budget, projected_usd=None,
         if not row or int(row[0]) != int(generation):
             raise ExecutionLost(f"run {run_id}: generation {generation} superseded "
                                 f"(current {row[0] if row else 'missing'}) — no model call")
+        if row[4]:
+            raise RunCancelled(f"run {run_id}: cancellation requested — no model call")
         if int(row[1]) >= int(row[2]):
             return None
         if cap > 0:

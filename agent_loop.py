@@ -108,6 +108,18 @@ class DurableBudget:
     def check_owner(self):
         run_lock.check_owner(self.run_id)
 
+    def authorize_dispatch(self):
+        """Durable proof that an external request may be sent NOW: this worker
+        owns the run (in-process lock + execution_generation), the run is not
+        erased and not cancelled. Raises ExecutionLost / RunErased / RunCancelled.
+        reserve_llm_call / begin_search_attempt enforce the same rule atomically;
+        this is for requests that are not reservations (a provider token count)
+        and for stopping a retry backoff early."""
+        self.check_owner()
+        if self.generation is None:
+            raise RuntimeError("DurableBudget needs the execution generation to authorize")
+        store.authorize_dispatch(self.run_id, self.generation)
+
     def reserve_attempt(self, projected_usd, operation=None):
         from llm import BudgetExceeded, CostUnknown
         self.check_owner()
@@ -154,6 +166,9 @@ def _ctx(state, config, iteration=None):
 
 # ------------------------------------------------------------------- guard ----
 
+_CANCEL_STOP = {"by": "user", "reason": "cancelled by user", "cancel": True}
+
+
 def cost_preflight(goal):
     """None, or a stop dict when a hard USD cap is set but the model the run would
     call has no known price. A cap whose accounting is unknown is not a cap, so a
@@ -161,6 +176,8 @@ def cost_preflight(goal):
     lim = goal.limits
     if lim.max_cost_usd <= 0 or goal.model_policy == "rules_only":
         return None
+    if lim.max_llm_calls <= 0:
+        return None                      # no model request can be reserved at all
     if not settings.gemini_api_key:
         return None                      # no model calls can happen at all
     if price_known():
@@ -173,20 +190,28 @@ def cost_preflight(goal):
 
 
 def check_limits(run_id, goal, state):
-    """None, or a stop dict. Called before EVERY controller decision and EVERY tool
-    execution (R13), so an accepted cancellation or an exhausted limit is honoured
-    at each side-effect boundary.
+    """None, or a stop dict. Called before setup's resume parse, before EVERY
+    controller decision and EVERY tool execution, and between the work units of a
+    batch tool (R13), so an accepted cancellation or an exhausted limit is
+    honoured at each of those boundaries.
+
+    Cancellation is ALSO enforced atomically at every external dispatch
+    (agent_store.reserve_llm_call / begin_search_attempt / authorize_dispatch): a
+    cancel that commits between this check and a request still stops the request.
 
     Runtime is ACTIVE execution time (runs.active_runtime_seconds + the open
     interval), not wall-clock since the first start: time paused for a human, or
-    waiting in the queue, is never charged."""
+    waiting in the queue, is never charged. It is a COOPERATIVE limit: no new
+    decision, tool or setup step starts once it is reached (>=), but a provider
+    request already in flight is not interrupted and may finish past it (bounded
+    by that request's own timeout and retry policy)."""
     if state.get("cancel_seen") or store.is_cancel_requested(run_id):
         return {"by": "user", "reason": "cancelled by user", "cancel": True}
     lim = goal.limits
     if int(state.get("iteration") or 1) > lim.max_iterations:
         return {"by": "limit", "reason": f"iteration limit reached ({lim.max_iterations})"}
     usage = store.run_usage(run_id)
-    if usage["active_runtime_seconds"] > lim.max_runtime_seconds:
+    if usage["active_runtime_seconds"] >= lim.max_runtime_seconds:
         return {"by": "limit", "reason": f"runtime limit reached ({lim.max_runtime_seconds}s "
                                          f"of active execution)"}
     if lim.max_cost_usd > 0:
@@ -256,6 +281,9 @@ def _adapter(run_id, goal, budget, state):
         def check_owner(self):
             budget.check_owner()
 
+        def authorize_dispatch(self):
+            budget.authorize_dispatch()
+
         def can_spend(self):
             return budget.can_spend()
 
@@ -275,14 +303,24 @@ def node_setup(state: LoopState, config):
     if state.get("setup_done"):
         return {}
     run_id, goal, gen, budget = _ctx(state, config)
-    pre = cost_preflight(goal)
-    if pre:                        # before the resume parse, which may call the model
-        return {"stop": {**pre, "setup_failed": True}}
+    # Same gate as every other boundary (cancel, runtime, cost preflight), BEFORE
+    # the resume parse, which may call the model. A fresh dict: control fields of
+    # an earlier attempt (iteration, streaks) must not stop a new attempt here.
+    pre = check_limits(run_id, goal, {})
+    if pre:
+        if pre.get("cost_unknown"):
+            pre = {**pre, "setup_failed": True}
+        return {"stop": pre, "cancel_seen": bool(pre.get("cancel"))}
     from router import load_resume, do_parse_resume
     s = _adapter(run_id, goal, budget, state)
-    load_resume(s, run_id)
-    if not s.error:
-        do_parse_resume(s, run_id)
+    try:
+        load_resume(s, run_id)
+        if not s.error:
+            do_parse_resume(s, run_id)
+    except store.RunCancelled:
+        # The parse's model request was refused at its reservation: the user
+        # cancelled after the check above. Nothing was sent.
+        return {"stop": dict(_CANCEL_STOP), "cancel_seen": True}
     if s.error:
         return {"stop": {"by": "error", "reason": s.error, "setup_failed": True}}
     from llm import llm_available
@@ -345,6 +383,10 @@ def node_decide(state: LoopState, config):
                                       run_id, step_id, budget)
                 decided_by = "llm"
                 finish_step(step_id, "success")
+            except store.RunCancelled as e:
+                # Refused at the reservation: no controller request was sent.
+                fail_step(step_id, e)
+                return {"stop": dict(_CANCEL_STOP), "cancel_seen": True}
             except ControllerOutputInvalid as e:
                 fail_step(step_id, e)
                 streak = int(state.get("rejection_streak") or 0) + 1
@@ -431,6 +473,16 @@ def node_act(state: LoopState, config):
             # The rules policy should never be rejected; if it is, count it as no
             # progress so the run cannot spin.
             work["no_progress"] = int(work.get("no_progress") or 0) + 1
+    except store.RunCancelled:
+        # A dispatch inside the tool (model call or job search) was refused
+        # because the user cancelled. Work completed before it (evaluations in
+        # `work`) is kept and ranked by finalize; nothing more is sent.
+        store.record_action_outcome(run_id, gen, i, "rejected",
+                                    {"stopped_during_execution": "cancelled by user"},
+                                    replayed=replayed)
+        obs_entry["stopped"] = "cancelled by user"
+        work["cancel_seen"] = True
+        work["ranked"] = False
     except (store.ExecutionLost, run_lock.ExecutionLost):
         raise
     except Exception as e:
@@ -737,6 +789,12 @@ def _fail(run_id, gen, e):
     if isinstance(e, (store.ExecutionLost, run_lock.ExecutionLost)) or run_lock.is_lost(run_id):
         log.warning("agent execution abandoned (%s)", type(e).__name__, extra={"run_id": run_id})
         return {"abandoned": True}
+    if isinstance(e, store.RunCancelled):
+        # Backstop: a dispatch refused for cancellation outside the nodes that
+        # turn it into a graph stop. The run is CANCELLED, not failed.
+        store.finalize(run_id, gen, "cancelled", "cancelled by user", ErrorCode.CANCELLED, {})
+        log.info("agent run cancelled (dispatch refused)", extra={"run_id": run_id})
+        return {"cancelled": True}
     from sanitize import safe_exception_summary
     try:
         store.finalize(run_id, gen, "failed", safe_exception_summary(e), classify_exception(e), {})
@@ -756,7 +814,14 @@ def run_agent_loop(run_id, queue_attempt=1, checkpointer_factory=None):
         raise ValueError(f"run {run_id} has no agent goal")
     goal = AgentGoal(**cfg["goal"])
     gen = store.begin_execution(run_id, new_attempt=True)
-    if cfg["cancel_requested"]:
+    # Re-read cancellation AFTER begin_execution. `cfg` was read before it, and a
+    # cancel can commit in between: the API locks the RUN row, claim_next locks
+    # the QUEUE row, so the two do not serialize — the API may still see the run
+    # 'queued', find no queued job to cancel (we already claimed it) and set the
+    # flag. begin_execution's UPDATE waits for that row lock, so this read sees
+    # every cancel committed before it; any later cancel finds the run 'running'
+    # and is refused at every dispatch (reserve_llm_call, begin_search_attempt).
+    if cfg["cancel_requested"] or store.is_cancel_requested(run_id):
         store.finalize(run_id, gen, "cancelled", "cancelled before start", ErrorCode.CANCELLED, {})
         return {"cancelled": True}
     # A NEW attempt resets every control field explicitly: LangGraph merges input
@@ -829,7 +894,8 @@ def resume_agent_loop(run_id, payload, queue_attempt=1, checkpointer_factory=Non
                       "recursion_limit": _recursion_limit(goal)}
             pending = pending_interrupt_value(graph, config)
 
-            if cfg["cancel_requested"]:
+            # Re-read after begin_execution (cfg is from before it; see run_agent_loop).
+            if cfg["cancel_requested"] or store.is_cancel_requested(run_id):
                 # Cancel wins: never apply a decision or run more tools after it.
                 values = graph.get_state(config).values or {}
                 ok = [v for v in (values.get("evaluated") or {}).values() if v.get("status") == "ok"]

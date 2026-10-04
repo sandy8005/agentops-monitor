@@ -108,17 +108,22 @@ def test_reservation_uses_highest_rate_across_a_price_change():
     assert straddle > before and straddle >= 1.5      # Jan-2027 rate, not the intro rate
 
 
+def _allow():
+    """An authorize callback that permits the dispatch."""
+    return None
+
+
 def test_provider_count_tightens_but_never_exceeds_the_byte_bound(monkeypatch):
     import llm
     from settings import settings
     monkeypatch.setattr(settings, "llm_input_token_bound", "provider")
     prompt = "x" * 10_000
     monkeypatch.setattr(llm, "provider_token_count", lambda p: 2_500)
-    bound, how = llm.input_token_bound(prompt)
+    bound, how = llm.input_token_bound(prompt, authorize=_allow)
     assert how == "provider" and 2_500 < bound < 10_001
     # An implausible count (more tokens than bytes) is not trusted.
     monkeypatch.setattr(llm, "provider_token_count", lambda p: 50_000)
-    assert llm.input_token_bound(prompt) == (10_001, "bytes_fallback")
+    assert llm.input_token_bound(prompt, authorize=_allow) == (10_001, "bytes_fallback")
 
 
 @pytest.mark.parametrize("exc", [TimeoutError("slow"), RuntimeError("500"), ValueError("x")])
@@ -130,7 +135,57 @@ def test_token_count_failure_fails_closed_to_the_byte_bound(monkeypatch, exc):
     def boom(prompt):
         raise exc
     monkeypatch.setattr(llm, "provider_token_count", boom)
-    assert llm.input_token_bound("é" * 100) == (201, "bytes_fallback")
+    recorded = []
+    assert llm.input_token_bound("é" * 100, authorize=_allow,
+                                 record=lambda *a: recorded.append(a)) == (201, "bytes_fallback")
+    assert recorded and recorded[0][0] == "failed"        # the attempt is still traced
+
+
+def test_token_bound_defaults_to_bytes_and_sends_nothing(monkeypatch):
+    """Default configuration: the prompt never leaves the process for counting."""
+    import llm
+    import settings as settings_mod
+    monkeypatch.delenv("LLM_INPUT_TOKEN_BOUND", raising=False)
+    assert settings_mod.Settings().llm_input_token_bound == "bytes"   # the shipped default
+    from settings import settings
+    monkeypatch.setattr(settings, "llm_input_token_bound", "bytes")
+
+    def never(prompt):
+        raise AssertionError("count_tokens must not be called")
+    monkeypatch.setattr(llm, "provider_token_count", never)
+    assert llm.input_token_bound("x" * 100, authorize=_allow) == (101, "bytes")
+
+
+def test_provider_count_without_authorization_sends_nothing(monkeypatch):
+    """No authorize callback = no proof the run may transmit -> byte bound only."""
+    import llm
+    from settings import settings
+    monkeypatch.setattr(settings, "llm_input_token_bound", "provider")
+
+    def never(prompt):
+        raise AssertionError("count_tokens must not be called without authorization")
+    monkeypatch.setattr(llm, "provider_token_count", never)
+    assert llm.input_token_bound("x" * 100) == (101, "bytes")
+
+
+@pytest.mark.parametrize("refusal", ["lost", "erased", "cancelled"])
+def test_refused_authorization_stops_the_count_before_any_transmission(monkeypatch, refusal):
+    """A stale, erased or cancelled run must not send the prompt to count_tokens:
+    authorization runs FIRST and its refusal propagates."""
+    import agent_store
+    import llm
+    from settings import settings
+    monkeypatch.setattr(settings, "llm_input_token_bound", "provider")
+    sent = []
+    monkeypatch.setattr(llm, "provider_token_count", lambda p: sent.append(p) or 10)
+    exc = {"lost": agent_store.ExecutionLost, "erased": agent_store.RunErased,
+           "cancelled": agent_store.RunCancelled}[refusal]
+
+    def refuse():
+        raise exc("refused")
+    with pytest.raises(exc):
+        llm.input_token_bound("resume text " * 50, authorize=refuse)
+    assert sent == []
 
 
 def test_logged_llm_call_reserves_with_the_tightened_bound(monkeypatch):
@@ -138,12 +193,18 @@ def test_logged_llm_call_reserves_with_the_tightened_bound(monkeypatch):
     from settings import settings
     monkeypatch.setattr(settings, "llm_input_token_bound", "provider")
     monkeypatch.setattr(llm, "provider_token_count", lambda p: 100)
-    seen = []
+    traced = []
+    monkeypatch.setattr(llm, "log_tool_call", lambda *a, **k: traced.append(a))
+    seen, order = [], []
 
     class Budget:
         generation = 1
 
+        def authorize_dispatch(self):
+            order.append("authorize")
+
         def reserve_attempt(self, projected, operation=None):
+            order.append("reserve")
             seen.append(projected)
             raise llm.CostLimitReached("stop here")
     with pytest.raises(llm.CostLimitReached):
@@ -153,6 +214,10 @@ def test_logged_llm_call_reserves_with_the_tightened_bound(monkeypatch):
                                        settings.llm_max_output_tokens, input_tokens=126)
     assert seen[0] < max_request_cost(settings.gemini_model, 50_000,
                                       settings.llm_max_output_tokens)
+    assert order == ["authorize", "reserve"]          # authorized BEFORE the count
+    # The count is traced as an external provider interaction — size, not content.
+    assert len(traced) == 1 and traced[0][2] == "gemini_count_tokens"
+    assert "y" * 100 not in repr(traced[0])
 
 
 # =================================================================== geo =====
