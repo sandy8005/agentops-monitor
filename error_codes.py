@@ -100,6 +100,8 @@ def classify_exception(exc):
     msg = str(exc)
     low = msg.lower()
     name = type(exc).__name__
+    if name == "RunCancelled":
+        return ErrorCode.CANCELLED
     if name == "ModelNotConfigured" or "gemini_api_key is not set" in low:
         return ErrorCode.LLM_NOT_CONFIGURED
     if name in ("OperationalError", "InterfaceError", "DatabaseUnavailable", "PoolError") \

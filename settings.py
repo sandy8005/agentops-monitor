@@ -195,12 +195,15 @@ class Settings:
         self.llm_max_output_tokens = r.int("LLM_MAX_OUTPUT_TOKENS", 8192,
                                            min_value=256, max_value=65536)
         # Input-token upper bound for the pre-dispatch reservation (pricing.py):
-        #   "provider" (default): the provider's own count_tokens for the exact
-        #       prompt, plus a safety margin, never above the byte bound; if the
-        #       count fails or looks implausible, the byte bound is used (fail closed).
-        #   "bytes": prompt UTF-8 bytes / LLM_RESERVE_BYTES_PER_TOKEN, no extra call.
-        self.llm_input_token_bound = (r.str("LLM_INPUT_TOKEN_BOUND", "provider")
-                                      or "provider").strip().lower()
+        #   "bytes" (default): prompt UTF-8 bytes / LLM_RESERVE_BYTES_PER_TOKEN —
+        #       a proven upper bound computed locally; nothing is sent to the
+        #       provider before the fenced reservation authorizes the request.
+        #   "provider": additionally ask the provider's count_tokens (this SENDS
+        #       the prompt) to tighten the bound. The count is authorized first
+        #       (generation + not erased + not cancelled) and traced; on any count
+        #       failure the byte bound is used (fail closed).
+        self.llm_input_token_bound = (r.str("LLM_INPUT_TOKEN_BOUND", "bytes")
+                                      or "bytes").strip().lower()
         if self.llm_input_token_bound not in ("provider", "bytes"):
             r.errors.append(f"LLM_INPUT_TOKEN_BOUND={self.llm_input_token_bound!r} must be "
                             "'provider' or 'bytes'")

@@ -30,9 +30,15 @@ import zipfile
 REQUIRED = (".env.example", ".gitignore", ".github/workflows/ci.yml", "requirements.txt",
             "requirements-dev.txt", "migrate.py", "README.md")
 CI_PATH = ".github/workflows/ci.yml"
-FORBIDDEN_DIRS = ("__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", "venv", ".venv")
-FORBIDDEN_SUFFIXES = (".pyc", ".pyo", ".pdf", ".docx")
-FORBIDDEN_NAMES = (".env",)
+# Anything generated, local or personal. JUnit reports (reports/) carry machine
+# metadata (host name, timestamps); dist/ and build/ hold build output (including
+# earlier release archives); editor folders hold local settings.
+FORBIDDEN_DIRS = ("__pycache__", ".pytest_cache", ".mypy_cache", ".ruff_cache", "venv", ".venv",
+                  "reports", "dist", "build", "htmlcov", ".idea", ".vscode", "uploads",
+                  ".tox", ".nox", "__MACOSX")
+FORBIDDEN_SUFFIXES = (".pyc", ".pyo", ".pdf", ".docx", ".zip")
+FORBIDDEN_NAMES = (".env", ".coverage", ".DS_Store", "Thumbs.db", "desktop.ini")
+SECRET_NAMES = (".env",)
 
 # Variables in .env.example whose name looks like a credential must be blank.
 # TOKEN only in credential names: LLM_MAX_OUTPUT_TOKENS, LLM_RESERVE_BYTES_PER_TOKEN
@@ -162,13 +168,15 @@ def problems(files):
     out = []
     for p in content:
         parts = p.split("/")
-        if any(d in FORBIDDEN_DIRS for d in parts[:-1]):
+        name = parts[-1]
+        if any(d in FORBIDDEN_DIRS or d.endswith(".egg-info") for d in parts[:-1]):
             out.append(f"forbidden directory in release: {p}")
+        elif name in SECRET_NAMES or (name.startswith(".env.") and name != ".env.example"):
+            out.append(f"secret file in release: {p}")
         elif p.endswith(FORBIDDEN_SUFFIXES):
             out.append(f"forbidden file type in release: {p}")
-        elif parts[-1] in FORBIDDEN_NAMES or (parts[-1].startswith(".env.")
-                                              and parts[-1] != ".env.example"):
-            out.append(f"secret file in release: {p}")
+        elif name in FORBIDDEN_NAMES or name.startswith(".coverage."):
+            out.append(f"forbidden local/OS file in release: {p}")
     for r in REQUIRED:
         if r not in content:
             out.append(f"missing required file: {r}")
