@@ -493,7 +493,10 @@ def _build_agent_goal(body):
             model_policy=body.model_policy,
             require_verified_matches=g.require_verified_matches,
         )
-    except Exception as e:
+    except ValueError as e:
+        # pydantic.ValidationError is a ValueError: a conflicting / out-of-range goal
+        # is the CLIENT's error (422). Anything else is a bug in our code and must
+        # surface as a 500, not be reported to the user as "invalid goal".
         raise HTTPException(status_code=422, detail=f"invalid agent goal: {e}")
     from agent_loop import cost_preflight
     blocked = cost_preflight(goal)
@@ -996,5 +999,5 @@ def get_agent_timeline(run_id: int, user: dict = Depends(require_auth)):
                      "committed_usd": usage["committed_usd"],
                      "limit_usd": ((row[1] or {}).get("limits") or {}).get("max_cost_usd"),
                      "complete": usage["unknown_cost_calls"] == 0,
-                     "basis": "estimated_paid_tier"},
+                     "basis": "estimated_paid_tier"}, 
             "actions": actions}

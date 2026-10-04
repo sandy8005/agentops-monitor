@@ -197,9 +197,16 @@ def parse_resume(resume_text, run_id, step_id, budget=None):
         from prompt_safety import apply_injection_policy
         apply_injection_policy(detect_injection(resume_text), step_id, source="resume",
                                run_id=run_id, review_allowed=False)
-    except Exception:
-        # Observability must not break parsing; log the failure TYPE only.
-        log.warning("could not record resume security signal", extra={"step_id": step_id})
+    except Exception as e:
+        # Recording the signal must not break parsing on a transient hiccup — but a
+        # database failure or a bug in the detector itself is not "no signal": it
+        # propagates (the parse step fails visibly) instead of silently dropping a
+        # security check. Logged by TYPE only.
+        from router import must_propagate
+        if must_propagate(e):
+            raise
+        log.warning("could not record resume security signal (%s)", type(e).__name__,
+                    extra={"step_id": step_id})
     prompt = f"""
 {HARDENING_PREAMBLE}
 

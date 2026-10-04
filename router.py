@@ -41,6 +41,29 @@ def is_infrastructure_error(exc):
     return (type(exc).__module__ or "").startswith(("psycopg2", "psycopg"))
 
 
+# Exceptions that mean OUR code is wrong, not that a job, a provider or the model
+# misbehaved. A per-item handler that absorbed one would turn a bug into "some jobs
+# failed" (completed_with_errors) or a "failed action" the controller works around —
+# i.e. the system would carry on as though normal degradation had occurred.
+PROGRAMMING_ERRORS = (TypeError, AttributeError, NameError, ImportError, AssertionError,
+                      NotImplementedError, RecursionError, SyntaxError)
+
+
+def is_programming_error(exc):
+    """True for a defect in our own code (see PROGRAMMING_ERRORS). Exceptions raised
+    inside the provider SDK / HTTP stack are classified by llm.is_degraded_model_error
+    before they get here, so they are not counted as ours."""
+    return isinstance(exc, PROGRAMMING_ERRORS)
+
+
+def must_propagate(exc):
+    """The rule for every per-item `except Exception`: infrastructure failures and
+    programming errors are NEVER absorbed as a per-item outcome — they fail (or
+    retry) the run with a classified error. Everything else (bad data in one
+    posting, an unusable model answer, ...) may be recorded and skipped."""
+    return is_infrastructure_error(exc) or is_programming_error(exc)
+
+
 def _hash(text):
     """Stable hash for cache keys (#12) — detects when resume/job text changed."""
     return hashlib.sha256((text or "").encode("utf-8")).hexdigest()[:16]
@@ -162,6 +185,8 @@ def do_parse_resume(state, run_id):
         fail_step(step_id, e)
         if is_infrastructure_error(e):
             raise
+        # Not absorbed: a parse failure (bug included) sets state.error, and setup
+        # turns that into a FAILED run — nothing downstream runs without a resume.
         state.error = f"parse failed: {e}"
 
 
@@ -625,7 +650,7 @@ def do_process_job(state, run_id):
         finish_step(step_id, "success")
     except Exception as e:
         fail_step(step_id, e)
-        if is_infrastructure_error(e):
+        if must_propagate(e):
             raise                # the RUN fails / retries; never "one job failed"
         state.failed_jobs += 1   # count it so the run can report completed_with_errors
         # Job id and exception TYPE only: titles, descriptions and exception text

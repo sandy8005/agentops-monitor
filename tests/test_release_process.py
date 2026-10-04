@@ -39,6 +39,13 @@ def _read(rel):
         return fh.read()
 
 
+def _ci_text():
+    """ci.yml as text with LF line endings. On Windows the file may be saved with
+    CRLF; the tests below edit it with "\n"-based replacements, which would
+    silently match nothing on CRLF text and make the negative tests vacuous."""
+    return _read(CI).decode("utf-8").replace("\r\n", "\n")
+
+
 @pytest.fixture
 def good(cr):
     files = {r: _read(r) for r in cr.REQUIRED}
@@ -53,7 +60,7 @@ def test_repository_release_files_pass(cr, good):
 
 
 def test_shipped_ci_workflow_is_real(cr):
-    text = _read(CI).decode("utf-8")
+    text = _ci_text()
     assert len(text.strip()) > 500
     assert cr.ci_problems(text) == []
 
@@ -106,14 +113,14 @@ def test_ci_workflow_garbage_is_rejected(cr):
     'pytest -m "not db"', 'pytest -m "db and not e2e"', "pytest -m e2e",
     "scripts/ci_summary.py"])
 def test_ci_workflow_missing_a_stage_is_rejected(cr, needle):
-    text = _read(CI).decode("utf-8")
+    text = _ci_text()
     assert needle in text
     broken = text.replace(needle, "echo skipped")
     assert cr.ci_problems(broken) != []
 
 
 def test_ci_workflow_must_migrate_twice_and_start_postgres(cr):
-    text = _read(CI).decode("utf-8")
+    text = _ci_text()
     once = text.replace("python migrate.py | tee", "echo | tee")
     assert any("migrations twice" in p for p in cr.ci_problems(once))
     no_pg = text.replace("image: postgres:16", "image: redis:7")
@@ -121,13 +128,13 @@ def test_ci_workflow_must_migrate_twice_and_start_postgres(cr):
 
 
 def test_ci_workflow_cannot_be_allowed_to_fail(cr):
-    text = _read(CI).decode("utf-8")
+    text = _ci_text()
+    step = "      - name: Byte-compile every module\n"
+    assert step in text                       # the edit below must actually apply
     soft = text.replace("python scripts/ci_summary.py reports/pure.xml",
                         "python scripts/ci_summary.py reports/pure.xml || true #")
     assert any("|| true" in p for p in cr.ci_problems(soft))
-    soft = text.replace("      - name: Byte-compile every module\n",
-                        "      - name: Byte-compile every module\n"
-                        "        continue-on-error: true\n")
+    soft = text.replace(step, step + "        continue-on-error: true\n")
     assert any("continue-on-error" in p for p in cr.ci_problems(soft))
 
 

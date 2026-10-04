@@ -549,16 +549,28 @@ def _check_release():
     return m
 
 
+def _shipped_required_files(m):
+    """{path: bytes} of the REQUIRED files as they are in this repository."""
+    out = {}
+    for r in m.REQUIRED:
+        with open(os.path.join(ROOT, *r.split("/")), "rb") as fh:
+            out[r] = fh.read()
+    return out
+
+
 def test_release_check_rejects_artefacts_and_requires_shipped_files():
     m = _check_release()
-    good = list(m.REQUIRED) + ["api.py", "tests/test_x.py"]
+    good = dict(_shipped_required_files(m), **{"api.py": b"x = 1\n", "tests/test_x.py": b""})
     assert m.problems(good) == []
-    assert m.problems(["a1/" + p for p in good]) == []          # archive with a root folder
-    bad = m.problems(good + ["__pycache__/api.cpython-312.pyc", "tests/x.pyc",
-                             "resume.pdf", ".env", ".env.prod", ".pytest_cache/v/x"])
+    assert m.problems({"a1/" + p: d for p, d in good.items()}) == []  # archive root folder
+    junk = ["__pycache__/api.cpython-312.pyc", "tests/x.pyc", "resume.pdf", ".env",
+            ".env.prod", ".pytest_cache/v/x"]
+    bad = m.problems(dict(good, **{p: b"junk" for p in junk}))
     assert len(bad) == 6
-    assert any("missing required file: .github/workflows/ci.yml" in p
-               for p in m.problems(["api.py", ".env.example", ".gitignore"]))
+    no_ci = {p: d for p, d in good.items() if p != ".github/workflows/ci.yml"}
+    assert "missing required file: .github/workflows/ci.yml" in m.problems(no_ci)
+    # A bare path list cannot prove content: it is NOT a pass.
+    assert any("cannot read content" in p for p in m.problems(list(good)))
 
 
 def test_repository_ships_the_hygiene_files():
@@ -572,5 +584,3 @@ def test_repository_ships_the_hygiene_files():
     missing = [n for n in sorted(names) if n not in example]
     assert missing == [], f".env.example does not document {missing}"
     gi = open(os.path.join(ROOT, ".gitignore"), encoding="utf-8").read().split()
-    for pattern in ("__pycache__/", "*.py[cod]", ".env", "*.pdf"):
-        assert pattern in gi

@@ -219,6 +219,25 @@ exception *types* and prompt-safety pattern IDs — never resume- or job-derived
 messages). Application logs are outside the trace-retention purge, so this is
 enforced at the call sites (`logging_config.py`).
 
+### Error-handling policy
+
+A per-item `except Exception` (one job, one tool action, one advice item, the
+ranking write, the resume security signal) may record a failure and move on only
+for an ordinary item failure: bad data in one posting, an unusable model answer, a
+transient provider hiccup. Two classes are never absorbed — `router.must_propagate`
+re-raises them so the run fails (or retries) with a classified error code:
+
+* infrastructure failures: database errors and lost execution ownership
+  (`database_unavailable` is retryable);
+* programming errors in our own code: `TypeError`, `AttributeError`, `NameError`,
+  `ImportError`, `AssertionError`, `NotImplementedError`, `RecursionError`.
+
+Model degradation (not configured, quota, outage, invalid output) is classified
+separately by `llm.is_degraded_model_error` and takes the rules fallback. API
+validation returns 422 only for `ValueError`/pydantic errors; anything else is a
+500. The remaining broad handlers are provider-SDK boundaries, best-effort logging
+and worker supervision. `tests/test_exception_policy.py` covers each case.
+
 ---
 
 ## Job sources
@@ -316,7 +335,8 @@ python scripts/eval/fallback_agreement.py --limit 500 --resume-id <id>
 python -m venv venv && . venv/bin/activate
 pip install -r requirements-dev.txt          # runtime + test dependencies
 cp .env.example .env                         # then fill in DB_*, SESSION_SECRET, GEMINI_API_KEY
-python migrate.py                            # empty DB -> latest schema (the ONLY schema path)
+python migrate.py                            # empty DB -> latest schema (the ONLY schema path;
+                                             # `python db_pg.py` is the same entrypoint)
 uvicorn api:app                              # process 1: API + dashboard
 python worker.py                             # process 2: executes runs
 ```
@@ -329,28 +349,60 @@ with status 2** if the checkpoint schema cannot be set up — let your superviso
 
 ### Tests and CI
 
-The suite needs PostgreSQL (`DB_*` settings, migrated with `python migrate.py`).
+The suite needs PostgreSQL 16 (`DB_*` settings, migrated with `python migrate.py`).
 Model calls are stubbed and tests set their own model settings, so results do not
-depend on your `.env`. `pytest -m "not db"` runs the pure-logic subset;
-`pytest -m e2e` runs the end-to-end agent test (start → two human-review pauses →
-completion through the real worker, API, store and Postgres checkpointer).
+depend on your `.env`. The markers split it into three disjoint slices:
 
-`.github/workflows/ci.yml` runs, on every push and pull request: a **release-hygiene
-check of the exact archive that would ship** (`git archive HEAD` checked by
-`scripts/check_release.py`: no `__pycache__`/`.pyc`, caches, `.env` or PDFs; the
-required files present), byte-compilation, the pure-logic tests, migration of an **empty** database, a re-run of the migrations
-(must be a no-op), and the full suite (PostgreSQL integration, API authorization,
-pause/resume, concurrency and cost-ledger tests) and the end-to-end agent test
-against PostgreSQL 16.
+```bash
+pytest -m "not db"            # pure logic, no database
+pytest -m "db and not e2e"    # PostgreSQL integration, authorization, pause/resume,
+                              # concurrency, cost ledger, erasure guards
+pytest -m e2e                 # start -> two human-review pauses -> completion through
+                              # the real worker, API, store and Postgres checkpointer
+```
+
+Migration paths are checked with the real CLI against throwaway databases (the
+`DB_USER` needs `CREATEDB`):
+
+```bash
+python scripts/check_migrations.py   # empty DB -> latest; latest re-run is a no-op;
+                                     # EVERY older version -> latest, and each upgraded
+                                     # schema must be identical to a fresh install
+```
+
+`.github/workflows/ci.yml` runs on every push and pull request, top to bottom, and
+any failing step fails the run (no `continue-on-error`, no `|| true`):
+
+1. build the archive with `git archive HEAD` and run `scripts/check_release.py` on
+   that exact file (it is kept as a build artifact);
+2. `python -m compileall`;
+3. `pytest -m "not db"` with no database configured;
+4. `python migrate.py` on the empty PostgreSQL 16 service database, then again (must
+   print "No pending migrations"), then `python db_pg.py --status` (nothing pending);
+5. `scripts/check_migrations.py` (every upgrade path);
+6. `pytest -m "db and not e2e"` and `pytest -m e2e`, each writing a JUnit report;
+7. `scripts/ci_summary.py`, which fails unless the reports together cover **every**
+   collected test exactly once with **zero** failures and **zero** skips.
+
+`scripts/check_release.py` also validates the workflow itself: an empty or invalid
+`ci.yml`, or one missing any of these stages, fails the release check.
 
 ### Packaging
 
-Ship tracked source only — never a working directory:
+Ship tracked source only — never a working directory (no Explorer / VS Code /
+`Compress-Archive` zips: they pick up `.env`, `__pycache__/` and other local files):
 
 ```bash
-git archive --format=zip -o agentops-monitor.zip HEAD
-python scripts/check_release.py agentops-monitor.zip
+git status                           # commit first: git archive ships HEAD
+python scripts/make_release.py       # git archive HEAD -> dist/agentops-monitor-<sha>.zip,
+                                     # runs check_release.py on it, prints its SHA-256
 ```
+
+`make_release.py` refuses a dirty working tree and deletes the archive if the check
+fails. The check rejects `.env` / `.env.*` (except `.env.example`), bytecode and
+caches, virtualenvs, PDFs/DOCX, missing **or empty** required files, an incomplete CI
+workflow, and any value for a secret-looking variable in `.env.example`. To check an
+archive built some other way: `python scripts/check_release.py some.zip`.
 
 ### Repository layout
 
@@ -359,6 +411,9 @@ python scripts/check_release.py agentops-monitor.zip
 - `static/`: dashboard.
 - `tests/`: pytest suite.
 - `scripts/eval/`: offline measurement (`fallback_agreement.py`).
-- `scripts/check_release.py`: release-hygiene check (used by CI).
+- `scripts/make_release.py`: the only supported way to build a release archive.
+- `scripts/check_release.py`: release-hygiene check (used by CI and make_release.py).
+- `scripts/check_migrations.py`: every migration path ends at the fresh-install schema.
+- `scripts/ci_summary.py`: CI proof that every test ran once, green, unskipped.
 - `scripts/legacy_migrations/`: pre-runner migration scripts, superseded by `migrations/`.
 - `docs/design-history.md`: the original (superseded) human-in-the-loop design.

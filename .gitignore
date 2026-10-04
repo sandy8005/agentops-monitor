@@ -34,3 +34,6 @@ Thumbs.db
 
 # Release archives
 *.zip
+
+# Local CI reports (scripts/ci_summary.py input)
+reports/

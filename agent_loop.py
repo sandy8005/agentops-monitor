@@ -434,10 +434,12 @@ def node_act(state: LoopState, config):
     except (store.ExecutionLost, run_lock.ExecutionLost):
         raise
     except Exception as e:
+        from router import must_propagate
         code = classify_exception(e)
-        if code == ErrorCode.DATABASE_UNAVAILABLE:
-            # Infrastructure, not a tool outcome: fail the run with a retryable code
-            # instead of recording a "failed action" the controller would react to.
+        if code == ErrorCode.DATABASE_UNAVAILABLE or must_propagate(e):
+            # Infrastructure or a bug in our own code, not a tool outcome: fail the
+            # run with a classified code instead of recording a "failed action" the
+            # controller would react to (and route around) as if it were normal.
             raise
         from sanitize import safe_exception_summary
         msg = safe_exception_summary(e)
@@ -548,6 +550,9 @@ def node_finalize(state: LoopState, config):
         except (store.ExecutionLost, run_lock.ExecutionLost):
             raise
         except Exception as e:
+            from router import must_propagate
+            if must_propagate(e):
+                raise    # database_unavailable (retryable) / bug — not "ranking failed"
             from sanitize import safe_exception_summary
             rank_error = safe_exception_summary(e)
 
