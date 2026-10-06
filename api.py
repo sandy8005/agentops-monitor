@@ -9,7 +9,7 @@ from starlette.middleware.sessions import SessionMiddleware
 import os, tempfile
 from typing import Literal, Optional
 from pydantic import BaseModel, Field, ConfigDict
-from llm import create_run, create_run_tx, request_cancel
+from llm import create_run_tx
 from job_queue import enqueue, enqueue_tx
 from pdf_reader import read_resume_file_isolated, PdfExtractionError
 from auth import authenticate
@@ -274,8 +274,10 @@ async def upload_resume(request: Request, file: UploadFile = File(...), name: st
         tmp_path = tmp.name
 
     try:
-        # Parsed in a resource-limited child process, not in the API process.
-        resume_text = read_resume_file_isolated(tmp_path)
+        # Parsed in a resource-limited child process, not in the API process. The
+        # child stops extracting past MAX_RESUME_CHARS, so its output is bounded
+        # BEFORE it crosses the process boundary (no unbounded buffer here).
+        extracted = read_resume_file_isolated(tmp_path, max_chars=MAX_RESUME_CHARS)
     except PdfExtractionError as e:
         log.warning("pdf extraction failed (%s)", type(e).__name__)
         raise HTTPException(status_code=400, detail="Could not read that PDF")
@@ -283,19 +285,22 @@ async def upload_resume(request: Request, file: UploadFile = File(...), name: st
         os.remove(tmp_path)
 
     name = (name or filename or "resume.pdf")[:MAX_NAME_CHARS]
+    resume_text = extracted["text"]
 
     if not resume_text or not resume_text.strip():
         raise HTTPException(status_code=400, detail="Could not extract text from the PDF")
 
-    # Cap the extracted text before storing / feeding it to the LLM — a big PDF can
-    # expand into a very large amount of text. Truncation is never SILENT: the row
-    # records it and the response tells the caller, because skills or experience
-    # after the cut are simply not seen by the matcher.
-    original_chars = len(resume_text)
-    truncated = original_chars > MAX_RESUME_CHARS
+    # The text is capped at MAX_RESUME_CHARS by the extractor itself — a big PDF
+    # can expand into a very large amount of text. Truncation is never SILENT: the
+    # row records it and the response tells the caller, because skills or
+    # experience after the cut are simply not seen by the matcher. When truncated,
+    # original_chars is a LOWER BOUND (extraction stopped; the rest was never read).
+    truncated = bool(extracted["truncated"])
+    original_chars = max(int(extracted["chars_seen"]), len(resume_text))
+    resume_text = resume_text[:MAX_RESUME_CHARS]       # defensive; already bounded
     if truncated:
-        log.info("resume text truncated from %d to %d chars", original_chars, MAX_RESUME_CHARS)
-        resume_text = resume_text[:MAX_RESUME_CHARS]
+        log.info("resume text truncated: more than %d chars extracted, kept %d",
+                 MAX_RESUME_CHARS, len(resume_text))
 
     with get_connection() as conn:   # guaranteed release even if the INSERT throws
         cur = conn.cursor()
@@ -313,8 +318,9 @@ async def upload_resume(request: Request, file: UploadFile = File(...), name: st
 
     message = f"Resume stored as #{resume_id}"
     if truncated:
-        message += (f" — WARNING: the extracted text was {original_chars:,} characters; "
-                    f"only the first {MAX_RESUME_CHARS:,} were kept and will be matched.")
+        message += (f" — WARNING: the PDF contains more than {MAX_RESUME_CHARS:,} characters "
+                    f"of text; only the first {MAX_RESUME_CHARS:,} were kept and will be "
+                    f"matched.")
     return {"resume_id": resume_id, "name": name,
             "chars": len(resume_text), "truncated": truncated,
             "original_chars": original_chars, "stored_chars": len(resume_text),
@@ -445,6 +451,8 @@ class StartRunRequest(BaseModel):
     target_role: str = ""
     location: str = ""
     work_mode: WorkMode = ""
+    # remote/onsite search: also accept hybrid postings (explicit; default strict)
+    allow_hybrid: bool = False
     employment_type: EmploymentType = ""
     evaluate: bool = False
     # The controller agent is the ONLY execution engine (the fixed "pipeline"
@@ -481,6 +489,8 @@ def _build_agent_goal(body):
             qualifying_decisions=["Apply", "Maybe"] if g.include_maybe else ["Apply"],
             providers=g.providers,
             constraints={"location": body.location.strip(), "work_mode": body.work_mode,
+                         "allow_hybrid": bool(body.allow_hybrid and body.work_mode
+                                              in ("remote", "onsite")),
                          "employment_type": body.employment_type, "seniority": g.seniority},
             limits={"max_iterations": g.max_iterations, "max_searches": g.max_searches,
                     "max_llm_calls": g.max_llm_calls,
@@ -627,10 +637,15 @@ def cancel_run(run_id: int, user: dict = Depends(require_auth),
 
         if status == "running":
             # Actively executing. Set the flag in THIS locked transaction. The loop
-            # checks it at every decision/tool boundary, and every external dispatch
-            # (model reservation, provider token count, job search) REQUIRES
-            # cancel_requested = FALSE under this same row lock — so once this
-            # commits, the worker cannot send another request.
+            # checks it at every decision/tool boundary, and every external-dispatch
+            # AUTHORIZATION (model reservation, provider token count, job search)
+            # requires cancel_requested = FALSE under this same row lock — so once
+            # this commits, no NEW external request is authorized. A request whose
+            # authorization committed just before this one may still start or
+            # complete (cooperative cancellation; no lock is held across network
+            # I/O). The worker's terminal writes re-read the flag under the row
+            # lock: finalize() ends the run 'cancelled', and mark_waiting() refuses
+            # to park it waiting for a human.
             cur.execute("UPDATE runs SET cancel_requested = TRUE WHERE id = %s", (run_id,))
             return {"run_id": run_id, "cancel_requested": True}
 

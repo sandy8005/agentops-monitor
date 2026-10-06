@@ -202,7 +202,8 @@ def _collect_candidates(ctx, provider, query):
     from job_source import search_jobs as run_search
     c = ctx.goal.constraints
     jobs = run_search(query, c.location or None, c.work_mode or None,
-                      c.employment_type or None, run_id=ctx.run_id)
+                      c.employment_type or None, run_id=ctx.run_id,
+                      allow_hybrid=c.allow_hybrid)
     jobs = [j for j in jobs if (j.get("source") or "").lower() == provider]
     # Deterministic, bounded selection (R14): newest ids first, capped.
     jobs = sorted(jobs, key=lambda j: j["id"], reverse=True)[:ctx.goal.limits.max_jobs_per_search]

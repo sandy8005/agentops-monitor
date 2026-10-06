@@ -82,18 +82,35 @@ def calculate_match_score(parsed_resume, requirements, resume_text, job=None, us
     preferred = list(requirements["preferred_skills"])
     min_years = requirements.get("min_years_experience") or 0
 
-    insufficient = (len(required) == 0 and len(any_of_groups) == 0 and len(preferred) == 0)
+    # --- Which categories APPLY -------------------------------------------------
+    # A category participates only when the POSTING contains something for it to
+    # score. An absent category contributes nothing and its weight is redistributed
+    # proportionally over the categories that do apply. A posting that omits a
+    # section must never cost the candidate that section's points:
+    #
+    #   required   — applies iff the job lists required skills or any-of groups.
+    #   preferred  — applies iff the job lists preferred skills.
+    #   projects   — applies iff there are REQUIRED technology units to look for in
+    #                the candidate's projects (and see the experience-stands-in rule
+    #                below). Preferred-only postings have no required tech units, so
+    #                there is nothing for project evidence to corroborate.
+    #   experience — applies iff the job states an explicit minimum (min_years > 0).
+    #                With no stated minimum there is no requirement to satisfy, so
+    #                general experience earns no free points (it used to add a
+    #                constant 15% to every such job, which inflated weak matches).
+    #
+    # insufficient_requirements: the posting gave us NOTHING to score — no required
+    # skills, no any-of groups, no preferred skills and no explicit experience
+    # minimum. The router routes such a job to human review.
+    total_required_items = len(required) + len(any_of_groups)
+    has_skill_requirements = bool(total_required_items or preferred)
+    has_experience_requirement = min_years > 0
+    insufficient = not (has_skill_requirements or has_experience_requirement)
+    # Only a years figure, no skill requirement at all: one numeric fact cannot
+    # justify an automatic Apply (the decision is capped below), but it DOES decide
+    # between Skip (under-qualified) and Maybe.
+    experience_only = has_experience_requirement and not has_skill_requirements
 
-    # --- Scoring model ---------------------------------------------------------
-    # Each category contributes a FRACTION (0..1) of how well it's satisfied, and
-    # carries a base weight. The final score is the weighted average over only the
-    # categories that APPLY, times 100. "Preferred" is optional: when the job listed
-    # NO preferred skills there is nothing to score, so its weight is dropped and the
-    # remaining categories are renormalized proportionally (their relative weights
-    # are preserved). A perfect candidate therefore scores 100 whether or not the
-    # posting happened to list preferred skills. Required/projects/experience always
-    # apply (projects scores 0 if the required tech simply isn't in the resume's
-    # projects — that's a real signal, not an absent category).
     BASE_WEIGHTS = {"required": 50.0, "preferred": 20.0, "projects": 15.0, "experience": 15.0}
     fractions = {}       # category -> satisfied fraction in [0, 1]
     applicable = {}      # category -> weight, only for categories that apply
@@ -101,7 +118,6 @@ def calculate_match_score(parsed_resume, requirements, resume_text, job=None, us
     # Required — flat required skills + any-of groups (each group is one item).
     matched_required = []
     missing_required = []
-    total_required_items = len(required) + len(any_of_groups)
     if total_required_items > 0:
         met = 0
         for s in required:
@@ -117,11 +133,9 @@ def calculate_match_score(parsed_resume, requirements, resume_text, job=None, us
             else:
                 missing_required.append(" / ".join(group))
         fractions["required"] = met / total_required_items
-    else:
-        fractions["required"] = 0.0
-    applicable["required"] = BASE_WEIGHTS["required"]   # required always applies
+        applicable["required"] = BASE_WEIGHTS["required"]
 
-    # Preferred — OPTIONAL. Applies only if the job actually listed preferred skills.
+    # Preferred — applies only if the job actually listed preferred skills.
     matched_preferred = []
     missing_preferred = []
     if preferred:
@@ -132,8 +146,6 @@ def calculate_match_score(parsed_resume, requirements, resume_text, job=None, us
                 missing_preferred.append(s)
         fractions["preferred"] = len(matched_preferred) / len(preferred)
         applicable["preferred"] = BASE_WEIGHTS["preferred"]
-    # else: no preferred skills to score → category ABSENT; its weight is not added
-    # to `applicable`, so it's redistributed across the present categories below.
 
     # Project relevance — same group semantics as required (each flat skill / any-of
     # group is one unit, satisfied if it appears in the candidate's project tech).
@@ -142,11 +154,11 @@ def calculate_match_score(parsed_resume, requirements, resume_text, job=None, us
     # as strong evidence. A candidate with real work history but no separate
     # "Projects" section must not lose a fixed 15% for the missing section, so in
     # that case the projects category is treated as ABSENT and its weight is
-    # redistributed (same mechanism as an absent "preferred" category). A candidate
-    # with neither projects nor experience still scores 0 here — that is a real gap.
+    # redistributed. A candidate with neither projects nor experience still scores
+    # 0 here when there are required tech units — that is a real gap.
     has_professional_experience = bool(
         (candidate_years or 0) > 0 or (parsed_resume.get("experience") or []))
-    projects_category_applies = bool(projects) or not has_professional_experience
+
     def _in_projects(skill):
         c = canonical_skill(skill)
         if not c:
@@ -156,10 +168,9 @@ def calculate_match_score(parsed_resume, requirements, resume_text, job=None, us
         # multi-word canonical skill mentioned inside a longer tech label
         return " " in c and any(c in t for t in project_tech_set)
 
-    total_project_units = len(required) + len(any_of_groups)
-    if not projects_category_applies:
-        pass   # absent: experience stands in as the evidence; weight redistributed
-    elif total_project_units > 0:
+    projects_category_applies = (total_required_items > 0
+                                 and (bool(projects) or not has_professional_experience))
+    if projects_category_applies:
         units_met = 0
         for s in required:
             if _in_projects(s):
@@ -167,34 +178,23 @@ def calculate_match_score(parsed_resume, requirements, resume_text, job=None, us
         for group in any_of_groups:
             if any(_in_projects(s) for s in group):
                 units_met += 1
-        fractions["projects"] = units_met / total_project_units
-    else:
-        fractions["projects"] = 0.0
-    if projects_category_applies:
+        fractions["projects"] = units_met / total_required_items
         applicable["projects"] = BASE_WEIGHTS["projects"]
 
-    # Experience. UNKNOWN experience (rules-only parse with no explicit statement)
-    # is not scored as zero and not assumed sufficient: the category is absent and
-    # the decision is capped below (it cannot be an automatic Apply).
+    # Experience — only against an EXPLICIT minimum. UNKNOWN candidate experience
+    # (rules-only parse with no explicit statement) is not scored as zero and not
+    # assumed sufficient: the category is absent and the decision is capped below.
     experience_unknown = candidate_years is None
-    if experience_unknown:
-        pass
-    elif candidate_years >= min_years:
-        fractions["experience"] = 1.0
-    elif min_years > 0:
-        fractions["experience"] = candidate_years / min_years
-    else:
-        fractions["experience"] = 1.0
-    if not experience_unknown:
+    if has_experience_requirement and not experience_unknown:
+        fractions["experience"] = min(1.0, candidate_years / min_years)
         applicable["experience"] = BASE_WEIGHTS["experience"]
 
     # --- Normalize over applicable weight and build the reported breakdown --------
-    # Renormalize the applicable weights so they still sum to 100 (this is where an
-    # absent optional category's weight is proportionally redistributed). The
-    # breakdown reports each present category's EARNED points on the normalized
-    # scale, rounded for display; the TOTAL is summed from the UNROUNDED earned
-    # points so per-bucket rounding can never push it past 100.
-    applicable_total = sum(applicable.values()) or 1.0
+    # Renormalize the applicable weights so they still sum to 100. The breakdown
+    # reports each present category's EARNED points on the normalized scale, rounded
+    # for display; the TOTAL is summed from the UNROUNDED earned points so
+    # per-bucket rounding can never push it past 100.
+    applicable_total = sum(applicable.values())
     breakdown = {}
     breakdown_max = {}   # the REAL maximum for each category after renormalization
     exact_total = 0.0
@@ -206,7 +206,7 @@ def calculate_match_score(parsed_resume, requirements, resume_text, job=None, us
             breakdown[cat] = round(earned, 1)
             breakdown_max[cat] = round(norm_weight, 1)
         else:
-            breakdown[cat] = 0.0       # absent optional category — shown as 0 for clarity
+            breakdown[cat] = 0.0       # absent category — shown as 0 for clarity
             breakdown_max[cat] = 0.0   # ... and it was worth nothing (not counted)
 
     total = round(exact_total, 1)
@@ -214,7 +214,10 @@ def calculate_match_score(parsed_resume, requirements, resume_text, job=None, us
     # Decision thresholds (75 = Apply, 55 = Maybe) are HAND-SELECTED for this
     # proof of concept. They are not calibrated against a labeled evaluation set and
     # must not be described as validated until one exists.
-    if insufficient:
+    if insufficient or not applicable:
+        # Nothing to score (or the only requirement is a years figure we cannot
+        # check because the candidate's experience is unknown): never Skip/Apply
+        # on an empty basis.
         decision = "Maybe"
     elif total >= 75:
         decision = "Apply"
@@ -222,8 +225,9 @@ def calculate_match_score(parsed_resume, requirements, resume_text, job=None, us
         decision = "Maybe"
     else:
         decision = "Skip"
-    if experience_unknown and min_years > 0 and decision == "Apply":
-        decision = "Maybe"              # can't confirm the years requirement
+    if decision == "Apply" and (experience_only
+                                or (experience_unknown and has_experience_requirement)):
+        decision = "Maybe"              # one unverifiable / thin basis: no auto-Apply
 
     return {
         "score": total,
@@ -231,9 +235,13 @@ def calculate_match_score(parsed_resume, requirements, resume_text, job=None, us
         "breakdown": breakdown,
         "breakdown_max": breakdown_max,
         "projects_counted": projects_category_applies,
+        # The categories that actually contributed to the score.
+        "scored_categories": [c for c in ("required", "preferred", "projects", "experience")
+                              if c in applicable],
         "candidate_years_used": candidate_years,
         "experience_basis": experience_basis,
         "insufficient_requirements": insufficient,
+        "experience_only_requirements": experience_only,
         "experience_unknown": experience_unknown,
         # Accurate, requirements-based evidence (whole-word, optional-aware).
         # 'missing_skills' is REQUIRED-only — so an optional skill is never a gap.

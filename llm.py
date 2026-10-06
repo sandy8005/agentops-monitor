@@ -146,16 +146,9 @@ def reset_quota_breaker(model=None):
             _quota_blocked_until.pop(model, None)
 
 
-
 # get_connection is imported (pooled) from database at the top of this module, so
 # every `from llm import get_connection` (router.py, agent_store.py, ...) now
 # draws from the shared ThreadedConnectionPool instead of opening a fresh socket.
-
-
-def fake_llm(prompt):
-    time.sleep(0.5)
-    return {"text": "Apply", "prompt_tokens": len(prompt.split()),
-            "completion_tokens": random.randint(5, 20)}
 
 
 def _usage_tokens(response):
@@ -485,32 +478,12 @@ def record_judge_signals(step_id, judge_status, judge_skip_reason=None, cache_hi
         """, (judge_status, judge_skip_reason, cache_hit, step_id))
 
 
-def set_stop_reason(run_id, reason):
-    """Record WHY a run ended (queryable)."""
-    with get_connection() as conn:
-        cur = conn.cursor()
-        cur.execute("UPDATE runs SET stop_reason = %s WHERE id = %s", (reason, run_id))
-
-
-def set_evaluation_status(run_id, status):
-    """Record whether LLM-as-judge evaluation ran for this run."""
-    with get_connection() as conn:
-        cur = conn.cursor()
-        cur.execute("UPDATE runs SET evaluation_status = %s WHERE id = %s", (status, run_id))
-
-
 def is_cancel_requested(run_id):
     with get_connection() as conn:
         cur = conn.cursor()
         cur.execute("SELECT cancel_requested FROM runs WHERE id = %s", (run_id,))
         row = cur.fetchone()
         return bool(row and row[0])
-
-
-def request_cancel(run_id):
-    with get_connection() as conn:
-        cur = conn.cursor()
-        cur.execute("UPDATE runs SET cancel_requested = TRUE WHERE id = %s", (run_id,))
 
 
 def save_evaluation(run_id, step_id, evaluation):
@@ -527,34 +500,6 @@ def save_evaluation(run_id, step_id, evaluation):
             evaluation["completeness_score"], evaluation["hallucination_detected"],
             json.dumps(evaluation["hallucinated_claims"]), evaluation["notes"], utcnow()
         ))
-
-
-def finish_run(run_id, status="success", stop_reason=None, error_code=None):
-    """
-    Finalize a run. stop_reason and error_code are ALWAYS written to reflect THIS
-    outcome — including being cleared to NULL on a clean finish — so a run that failed
-    on an earlier attempt and then succeeded on retry doesn't keep a stale error_code /
-    stop_reason from the failed try.
-    """
-    with get_connection() as conn:
-        cur = conn.cursor()
-        # ErrorCode is a str-Enum; store its plain value. (psycopg2 would adapt it to the
-        # same string, but be explicit so the stored vocabulary is unambiguous.)
-        error_code_val = error_code.value if isinstance(error_code, ErrorCode) else error_code
-        cur.execute("""
-            UPDATE runs SET ended_at = %s, status = %s,
-                stop_reason = %s, error_code = %s,
-                total_tokens = (SELECT COALESCE(SUM(prompt_tokens + completion_tokens), 0)
-                                FROM llm_calls WHERE run_id = %s),
-                -- NULL when no call has a known price (unknown is not $0) ...
-                total_cost = (SELECT SUM(cost_usd) FROM llm_calls
-                              WHERE run_id = %s AND cost_status = 'priced'),
-                -- ... and a PARTIAL total is marked as partial.
-                unknown_cost_calls = (SELECT COUNT(*) FROM llm_calls WHERE run_id = %s
-                                      AND cost_status = 'unknown')
-            WHERE id = %s
-        """, (utcnow(), status, redact_secrets(stop_reason), error_code_val,
-              run_id, run_id, run_id, run_id))
 
 
 def _log_llm_attempt(run_id, step_id, operation, prompt, response_text,

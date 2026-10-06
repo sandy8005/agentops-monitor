@@ -30,7 +30,9 @@ class RunErased(ExecutionLost):
 
 class RunCancelled(RuntimeError):
     """The user cancelled the run: no NEW external request (model call, model
-    token count, job-provider search) may be authorized for it.
+    token count, job-provider search) may be AUTHORIZED for it, and it may not be
+    parked waiting for a human (mark_waiting). A request authorized before the
+    cancel committed may still start or complete — see README "Cancellation".
 
     Deliberately NOT an ExecutionLost: the worker still owns the run and must
     finalize it as 'cancelled' (ExecutionLost means "stop without writing")."""
@@ -42,8 +44,10 @@ _TOMBSTONE_SQL = "EXISTS (SELECT 1 FROM erasure_tombstones t WHERE t.run_id = ru
 def _check_generation(cur, run_id, generation, lock="FOR SHARE", require_not_cancelled=False):
     """Fence a transaction on the run row. With require_not_cancelled=True this is
     the EXTERNAL-DISPATCH authorization rule (authorize_dispatch,
-    begin_search_attempt): generation matches AND not erased AND not cancelled,
-    all read under the same row lock the cancel endpoint takes."""
+    begin_search_attempt, reserve_llm_call) and the pause rule (mark_waiting):
+    generation matches AND not erased AND not cancelled, all read under the same
+    row lock the cancel endpoint takes. Returns cancel_requested as read under
+    that lock (finalize uses it for cancellation precedence)."""
     cur.execute(f"SELECT execution_generation, {_TOMBSTONE_SQL}, cancel_requested FROM runs "
                 f"WHERE id = %s {lock}", (run_id,))
     row = cur.fetchone()
@@ -54,6 +58,7 @@ def _check_generation(cur, run_id, generation, lock="FOR SHARE", require_not_can
                             f"(current {row[0] if row else 'missing'})")
     if require_not_cancelled and row[2]:
         raise RunCancelled(f"run {run_id}: cancellation requested — external request refused")
+    return bool(row[2])      # cancel_requested, read under the same lock
 
 
 def authorize_dispatch(run_id, generation):
@@ -704,16 +709,32 @@ FINAL_COST_TOTALS_SQL = """
                           WHERE run_id = %(run)s AND status = 'abandoned')"""
 
 
+CANCELLED_REASON = "cancelled by user"
+
+
 def finalize(run_id, generation, status, stop_reason, error_code, progress):
     """Terminal transition, fenced. Closes the active runtime interval. Any
     reservation still open is abandoned (it stays counted). Cost totals keep
     unknown cost visible: total_cost is the sum of PRICED calls (NULL if none) and
     unknown_cost_calls says how many calls are missing from it — a partial total
-    is never presented as complete."""
+    is never presented as complete.
+
+    CANCELLATION PRECEDENCE. The cancel endpoint sets cancel_requested under this
+    same run-row lock. The caller's `status` was decided BEFORE this transaction
+    (in node_finalize, from an earlier read), so a cancel can commit between that
+    decision and this write. The precedence rule is therefore enforced HERE, on
+    the value read under FOR UPDATE: if a cancel committed before the terminal
+    transition, the run ends 'cancelled' whatever the caller computed. Results
+    already persisted (rankings, advice, traces) are kept.
+
+    Returns the status actually written."""
     code = error_code.value if hasattr(error_code, "value") else error_code
     with get_connection() as conn:
         cur = conn.cursor()
-        _check_generation(cur, run_id, generation, lock="FOR UPDATE")
+        cancel_requested = _check_generation(cur, run_id, generation, lock="FOR UPDATE")
+        if cancel_requested and status != "cancelled":
+            reason = f"{CANCELLED_REASON} (cancel committed before the run's '{status}' outcome)"
+            status, code, stop_reason = "cancelled", "cancelled", reason
         _abandon_open_reservations(cur, run_id)
         cur.execute(f"""
             UPDATE runs SET ended_at = NOW(), status = %(status)s, stop_reason = %(reason)s,
@@ -725,13 +746,24 @@ def finalize(run_id, generation, status, stop_reason, error_code, progress):
               "progress": json.dumps(progress, default=str), "run": run_id})
         cur.execute("""UPDATE review_requests SET status = 'superseded'
                        WHERE run_id = %s AND status IN ('pending', 'submitted')""", (run_id,))
+        return status
 
 
 def mark_waiting(run_id, generation, payload):
-    """Pause for a human. Closes the active interval: waiting time is not runtime."""
+    """Pause for a human. Closes the active interval: waiting time is not runtime.
+
+    Refuses a cancelled run (RunCancelled) under the same run-row lock the cancel
+    endpoint takes. Without this, a cancel that commits between node_review's
+    cancel check and this write sees the run 'running' (so the API enqueues no
+    resume-to-cancel job), and the run would then be parked in
+    'waiting_for_human' with cancel_requested = TRUE and no worker to finish it.
+    With it, either the cancel commits first (this raises; the worker finalizes
+    the run 'cancelled') or this commits first (the cancel then sees
+    'waiting_for_human' and enqueues the resume-to-cancel job)."""
     with get_connection() as conn:
         cur = conn.cursor()
-        _check_generation(cur, run_id, generation, lock="FOR UPDATE")
+        _check_generation(cur, run_id, generation, lock="FOR UPDATE",
+                          require_not_cancelled=True)
         cur.execute(f"""UPDATE runs SET status = 'waiting_for_human', pending_review = %s,
                             {CLOSE_EXECUTION_INTERVAL_SQL}
                         WHERE id = %s""",

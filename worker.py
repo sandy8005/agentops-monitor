@@ -38,7 +38,7 @@ RETENTION_SWEEP_INTERVAL = 3600.0  # seconds between trace-retention purges
 # --- Worker outcome contract -------------------------------------------------
 # The queue outcome is decided by the RUN'S recorded status/error_code, NOT by
 # "did _run_job raise". Both graph entrypoints catch their own exceptions and
-# finalize the run (finish_run / waiting_for_human) before returning normally, so a
+# finalize the run (agent_store.finalize / mark_waiting) before returning normally, so a
 # normal return can still mean the run failed — inspecting the run row is the only
 # reliable signal.
 SUCCESS = "success"
@@ -100,20 +100,6 @@ def _mark_run_retrying(run_id):
             "UPDATE runs SET status='retrying', "
             "  last_attempt_ended_at = COALESCE(ended_at, NOW()), ended_at = NULL "
             "WHERE id=%s AND status IN ('queued','running','failed')", (run_id,))
-
-
-def _finalize_run_failed_if_active(run_id, error_code):
-    """Finalize a run as 'failed' if it is still in an active (non-terminal) state.
-    Covers the case where _run_job raised BEFORE the graph could finalize the run
-    (malformed queue payload, dispatch-level error): the queue job is terminally
-    failed but the run would otherwise linger in queued/running/retrying. Conditional
-    on the current status, so it never overwrites a run the graph already finalized."""
-    with get_connection() as conn:
-        conn.cursor().execute(
-            "UPDATE runs SET status='failed', ended_at=NOW(), error_code=%s, "
-            "stop_reason=COALESCE(stop_reason, 'job failed before the run was finalized') "
-            "WHERE id=%s AND status IN ('queued','running','retrying')",
-            (str(error_code) if error_code else None, run_id))
 
 
 def _run_outcome(run_id):

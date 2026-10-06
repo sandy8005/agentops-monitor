@@ -15,6 +15,20 @@ GENERIC_ROLE_WORDS = {
 }
 
 
+# The ROLE FAMILY words among them — what kind of job it is. Seniority words and
+# stop-words are generic too, but they say nothing about the job family.
+ROLE_FAMILY_WORDS = {
+    "engineer", "developer", "analyst", "manager", "specialist", "consultant",
+    "administrator", "architect", "designer", "coordinator", "assistant",
+}
+# Family words that name the same job family in titles ("AI Engineer" ==
+# "AI Developer"). One-way lookup: query family word -> acceptable title words.
+_FAMILY_EQUIVALENTS = {
+    "engineer": {"engineer", "developer"},
+    "developer": {"developer", "engineer"},
+}
+
+
 STALE_AFTER_DAYS = 14   # jobs not seen in this many days drop out of search
 
 # The only job sources in scope are the two live providers. Seed / CSV / scraped
@@ -118,21 +132,34 @@ def _expand_terms(terms):
 
 def _role_matcher(target_role):
     """
-    Require at least one SPECIALIZING term from the query (e.g. 'ai', 'ml',
-    'backend'), matched as a WHOLE WORD — so short terms like 'ai'/'ml' don't
-    false-match inside 'airline'/'HTML'. Multi-word terms phrase-match. If the
-    query is only generic words, match on those.
+    Local validation that a posting is the requested KIND of job. Providers are
+    not trusted to obey the query, so this runs on everything they return.
 
-    Each query term is first EXPANDED through the role-alias table (one-way), so
-    e.g. "ML Engineer" also matches "machine learning" postings AND "machine
-    learning engineer" matches "ML" postings — while keeping the same whole-word/
-    phrase rigor (an alias like 'ai' still won't hit 'airline').
+    The query is split into SPECIALIZING terms ('ai', 'ml', 'backend', 'security')
+    and generic words, among them ROLE FAMILY words ('engineer', 'analyst').
+
+      * specialization: at least one specializing term (alias-expanded: "ML" also
+        matches "machine learning") in the title OR description, whole-word —
+        'ai' never hits 'airline', 'ml' never hits 'HTML';
+      * role family: when the query names one, the TITLE must name it too
+        (engineer and developer are treated as one family; plurals count).
+
+    Both dimensions are required. Without the family check, "AI Engineer"
+    matched a "Product Manager" whose description says "work with AI engineers",
+    a recruiter posting for "AI Engineering", or "Sales Executive, AI Solutions".
+    A query with only a specialization ("ML") or only generic words keeps the
+    single-dimension rule.
     """
     specializing, generic = _extract_query_terms(target_role)
 
     # Expand whichever set we'll actually match on, through the alias table.
     base_terms = specializing if specializing else generic
     terms = _expand_terms(base_terms)
+    families = [w for w in generic if w in ROLE_FAMILY_WORDS] if specializing else []
+    title_family_words = set()
+    for f in families:
+        for w in _FAMILY_EQUIVALENTS.get(f, {f}):
+            title_family_words.update({w, w + "s"})
 
     def _term_present(term, haystack_lower, haystack_tokens):
         t = term.strip().lower()
@@ -146,9 +173,15 @@ def _role_matcher(target_role):
         return t in haystack_tokens        # single word: WHOLE-WORD (token) match
 
     def matches(job):
-        haystack_lower = f"{job['title']} {job['description']}".lower()
+        title_lower = str(job.get("title") or "").lower()
+        haystack_lower = f"{title_lower} {job.get('description') or ''}".lower()
         haystack_tokens = set(re.findall(r"[a-z0-9\+\#\.]+", haystack_lower))
-        return any(_term_present(t, haystack_lower, haystack_tokens) for t in terms)
+        if not any(_term_present(t, haystack_lower, haystack_tokens) for t in terms):
+            return False
+        if title_family_words:
+            title_tokens = set(re.findall(r"[a-z0-9\+\#\.]+", title_lower))
+            return bool(title_tokens & title_family_words)
+        return True
 
     return matches
 
@@ -440,8 +473,34 @@ def geo_eligibility(job, requested_location):
     return eligibility((job.get("location") or "").strip(), (requested_location or "").strip())
 
 
+def work_mode_ok(job, work_mode, allow_hybrid=False):
+    """
+    Work mode is a FIXED constraint, so the match is STRICT: a remote search
+    returns remote postings, onsite returns onsite, hybrid returns hybrid.
+
+    allow_hybrid=True is the explicit, user-chosen relaxation "remote (or onsite)
+    preferred, hybrid acceptable": it additionally accepts hybrid postings for a
+    remote or onsite search. It never turns a hybrid search into "anything".
+
+    A posting with NO stated mode (and no "remote" in its location) is kept: the
+    providers often omit the field, and excluding it would drop most onsite jobs.
+    """
+    if not work_mode:
+        return True
+    wm = work_mode.lower().strip()
+    jm = (job.get("work_mode") or "").lower().strip()
+    jl = (job.get("location") or "").lower()
+    if not jm and "remote" in jl:
+        jm = "remote"
+    if not jm:
+        return True
+    if wm == jm:
+        return True
+    return bool(allow_hybrid) and jm == "hybrid" and wm in ("remote", "onsite")
+
+
 def search_jobs(target_role=None, location=None, work_mode=None,
-                employment_type=None, run_id=None):
+                employment_type=None, run_id=None, allow_hybrid=False):
     """
     Search the postings THIS run fetched from the live providers (Adzuna/Remotive).
 
@@ -526,24 +585,9 @@ def search_jobs(target_role=None, location=None, work_mode=None,
             j["geo_eligibility"] = ("matched_search" if j.get("assoc_locations")
                                     else geo_eligibility(j, location))
 
-    # --- work_mode filter (compatibility, not "remote is always OK") ---
+    # --- work_mode filter (strict; hybrid only by explicit allow_hybrid) ---
     if work_mode:
-        wm = work_mode.lower().strip()
-
-        def mode_ok(job):
-            jm = (job.get("work_mode") or "").lower().strip()
-            jl = (job.get("location") or "").lower()
-            if not jm and "remote" in jl:
-                jm = "remote"
-            if not jm:
-                return True          # unknown mode → don't exclude (soft filter)
-            if wm == jm:
-                return True
-            if "hybrid" in (wm, jm):
-                return True          # hybrid is a partial match either direction
-            return False
-
-        filtered = [j for j in filtered if mode_ok(j)]
+        filtered = [j for j in filtered if work_mode_ok(j, work_mode, allow_hybrid)]
 
     # --- employment_type filter (SOFT: keep unknown-type, exclude known mismatch) ---
     if employment_type:

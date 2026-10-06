@@ -77,6 +77,9 @@ class FixedConstraints(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
     location: str = Field("", max_length=200)
     work_mode: Literal["", "remote", "hybrid", "onsite"] = ""
+    # Explicit relaxation of work_mode: a remote/onsite search also accepts HYBRID
+    # postings. Off by default — work mode is otherwise matched exactly.
+    allow_hybrid: bool = False
     employment_type: Literal["", "full-time", "part-time", "contract", "internship"] = ""
     seniority: Seniority = ""
 

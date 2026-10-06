@@ -51,7 +51,9 @@ def _normalize_education(edu_list):
 
 
 def _normalize_projects(proj_list):
-    """Coerce each project to {name, tech}. Accepts tech as list or comma string."""
+    """Coerce each project to {name, tech, evidence}. Accepts tech as list or comma
+    string. `evidence` is the model's verbatim quote for the project (may be "");
+    it is consumed by ground_projects() and never stored past validation."""
     out = []
     for p in (proj_list or []):
         if not isinstance(p, dict):
@@ -63,7 +65,8 @@ def _normalize_projects(proj_list):
             tech = []
         out.append({
             "name": str(p.get("name") or p.get("title") or p.get("project") or ""),
-            "tech": [str(t) for t in tech]
+            "tech": [str(t) for t in tech if str(t).strip()],
+            "evidence": str(p.get("evidence") or ""),
         })
     return out
 
@@ -185,6 +188,101 @@ def ground_skills(skills, skill_evidence, resume_text):
             "grounded_skills": grounded, "ungrounded_skills": ungrounded}
 
 
+# How far after a project's name its description may run (characters). A project
+# block is the name line plus its bullets; a blank line ends it earlier.
+_PROJECT_WINDOW_CHARS = 600
+
+
+def _phrase_regex(phrase):
+    words = [re.escape(w) for w in str(phrase or "").split()]
+    if not words:
+        return None
+    return re.compile(r"(?<![a-z0-9])" + r"\s+".join(words) + r"(?![a-z0-9])", re.IGNORECASE)
+
+
+def _project_windows(name, resume_text):
+    """The resume text that follows each occurrence of the project's NAME, up to a
+    blank line or _PROJECT_WINDOW_CHARS — i.e. that project's own description."""
+    rx = _phrase_regex(name)
+    if rx is None:
+        return []
+    text = str(resume_text or "")
+    out = []
+    for m in rx.finditer(text):
+        chunk = text[m.start():m.start() + _PROJECT_WINDOW_CHARS]
+        blank = re.search(r"\n\s*\n", chunk)
+        out.append(chunk[:blank.start()] if blank else chunk)
+    return out
+
+
+def ground_projects(projects, resume_text):
+    """
+    Project technology feeds the scorer's project-relevance category, so it gets
+    the SAME deterministic grounding as skills: a model-claimed technology is kept
+    only if the resume itself affirmatively mentions it IN THAT PROJECT'S CONTEXT —
+
+      * in the model's verbatim evidence quote, when that quote really occurs in
+        the resume (whitespace/case-normalized); or
+      * in the text that follows the project's name in the resume (its own
+        description, up to a blank line).
+
+    A project is kept only if its name occurs in the resume or its evidence quote
+    is verified; otherwise the whole project is an ungrounded claim. Mentioning a
+    technology ELSEWHERE in the resume does not ground it for a project ("Python"
+    in the skills list is not evidence that "Analytics Project" used Python), and a
+    negated / aspirational mention ("no Kubernetes", "learning AWS") grounds
+    nothing.
+
+    Returns {"projects": [{name, tech}], "ungrounded_project_claims":
+             [{"project": name, "tech": [dropped...], "dropped_project": bool}]}.
+    """
+    from skills import affirmative_skill_in_text
+    resume_norm = _norm_ws(resume_text)
+    kept, ungrounded = [], []
+    for p in (projects or []):
+        name = str(p.get("name") or "").strip()
+        tech = [str(t).strip() for t in (p.get("tech") or []) if str(t).strip()]
+        ev = str(p.get("evidence") or "").strip()
+        ev_ok = bool(ev) and _norm_ws(ev) in resume_norm
+        contexts = ([ev] if ev_ok else []) + _project_windows(name, resume_text)
+        if not contexts:
+            ungrounded.append({"project": name, "tech": tech, "dropped_project": True})
+            continue
+        good = [t for t in tech
+                if any(affirmative_skill_in_text(t, ctx) for ctx in contexts)]
+        bad = [t for t in tech if t not in good]
+        kept.append({"name": name, "tech": good})
+        if bad:
+            ungrounded.append({"project": name, "tech": bad, "dropped_project": False})
+    return {"projects": kept, "ungrounded_project_claims": ungrounded}
+
+
+def ground_education(education, resume_text):
+    """
+    Keep an education entry only if its institution or degree text occurs in the
+    resume (whitespace/case-normalized); a year is kept only if it occurs too.
+    Entries the resume does not support are reported, not stored as facts.
+
+    Returns {"education": [...], "ungrounded_education": [...]}.
+    """
+    resume_norm = _norm_ws(resume_text)
+
+    def _in_resume(v):
+        v = _norm_ws(v)
+        return bool(v) and v in resume_norm
+
+    kept, ungrounded = [], []
+    for e in (education or []):
+        degree, inst, year = e.get("degree") or "", e.get("institution") or "", e.get("year") or ""
+        if not (_in_resume(inst) or _in_resume(degree)):
+            ungrounded.append({"degree": degree, "institution": inst, "year": year})
+            continue
+        kept.append({"degree": degree if _in_resume(degree) else "",
+                     "institution": inst if _in_resume(inst) else "",
+                     "year": year if _in_resume(year) else ""})
+    return {"education": kept, "ungrounded_education": ungrounded}
+
+
 def parse_resume(resume_text, run_id, step_id, budget=None):
     from prompt_safety import wrap_untrusted, HARDENING_PREAMBLE, detect_injection
     # The resume is the most attacker-controlled input (a candidate uploads it).
@@ -224,7 +322,7 @@ and using EXACTLY these key names:
     {{"degree": "...", "institution": "...", "year": "YYYY"}}
   ],
   "projects": [
-    {{"name": "...", "tech": ["..."]}}
+    {{"name": "...", "tech": ["..."], "evidence": "..."}}
   ],
   "experience": [
     {{"title": "...", "company": "...", "years": <number>}}
@@ -241,6 +339,10 @@ RULES:
 - "years_experience": total professional years as a number.
 - "skill_evidence": for each skill, a SHORT phrase COPIED VERBATIM from the resume
   that shows it. Never paraphrase. Omit a skill here if no such text exists.
+- projects "name": the project's name exactly as written in the resume.
+- projects "tech": ONLY technologies the resume states were used in THAT project.
+- projects "evidence": a SHORT phrase COPIED VERBATIM from the resume that describes
+  the project and names its technologies. Never paraphrase.
 - If a value is unknown, use an empty string "" or 0 — never omit a key.
 """
     raw = logged_llm_call(prompt, run_id, step_id, operation="parse_resume", budget=budget)
@@ -299,6 +401,15 @@ RULES:
         raise ModelOutputInvalid(f"parse_resume: unusable value in model output: {e} "
                                  f"(step_id={step_id})") from e
 
+    # --- Deterministic grounding of projects and education -----------------
+    # Project tech is scored (project relevance), so a technology the model
+    # attributes to a project must be supported by that project's resume text —
+    # the same anti-hallucination rule as skills. Education is grounded too.
+    project_grounding = ground_projects(normalized["projects"], resume_text)
+    education_grounding = ground_education(normalized["education"], resume_text)
+    normalized["projects"] = project_grounding["projects"]
+    normalized["education"] = education_grounding["education"]
+
     # --- Schema validation (core fields) ----------------------------------
     try:
         validated = ParsedResume.model_validate(normalized).model_dump()
@@ -312,5 +423,7 @@ RULES:
 
     # --- Deterministic grounding of the parsed skills ----------------------
     validated.update(ground_skills(skills, parsed.get("skill_evidence"), resume_text))
+    validated["ungrounded_project_claims"] = project_grounding["ungrounded_project_claims"]
+    validated["ungrounded_education"] = education_grounding["ungrounded_education"]
 
     return validated

@@ -620,7 +620,10 @@ def node_finalize(state: LoopState, config):
     from agent_tools import search_space
     exhausted = search_space(goal, work)["exhausted"]
     progress["search_exhausted"] = exhausted
-    # N06: a cancel requested after the last action still wins.
+    # N06: a cancel requested after the last action still wins. This early read
+    # only makes the checkpointed outcome accurate in the common case; it is NOT
+    # the guarantee — a cancel can still commit after it. store.finalize()
+    # re-reads cancel_requested under the terminal row lock and wins there.
     if not stop.get("cancel") and (work.get("cancel_seen") or store.is_cancel_requested(run_id)):
         stop = {"by": "user", "reason": "cancelled by user", "cancel": True}
 
@@ -758,19 +761,56 @@ def pending_interrupt_value(graph, config):
     return v if isinstance(v, dict) else {"payload": v}
 
 
+def _finalize_cancelled(run_id, gen, values, reason="cancelled by user"):
+    """End the run 'cancelled', keeping what it already produced: evaluations that
+    completed are ranked (best effort) before the terminal transition. Used when a
+    cancel is discovered OUTSIDE node_finalize — on resume-to-cancel, and when
+    mark_waiting refuses to park a run whose cancel committed after node_review's
+    check (so no pending review is left behind; finalize supersedes it)."""
+    values = values or {}
+    ok = [v for v in (values.get("evaluated") or {}).values() if v.get("status") == "ok"]
+    if ok:
+        try:
+            from ranker import rank_jobs
+            store.persist_rankings(run_id, gen, rank_jobs(ok))
+        except (store.ExecutionLost, run_lock.ExecutionLost):
+            raise
+        except Exception as e:
+            log.warning("ranking on cancel failed: %s", type(e).__name__,
+                        extra={"run_id": run_id})
+    store.finalize(run_id, gen, "cancelled", reason, ErrorCode.CANCELLED, {})
+    log.info("agent run cancelled", extra={"run_id": run_id})
+    return {"cancelled": True}
+
+
+def _pause_or_cancel(run_id, gen, payload, values):
+    """Park the run for a human — unless a cancel committed first. mark_waiting
+    checks cancel_requested under the run-row lock; if it refuses, the run is
+    finalized 'cancelled' here (never left 'waiting_for_human' with the cancel
+    flag set and no resume job to wake it). Returns None if paused."""
+    try:
+        store.mark_waiting(run_id, gen, payload)
+    except store.RunCancelled:
+        return _finalize_cancelled(run_id, gen, values)
+    log.info("agent run paused (%s)", payload.get("type"), extra={"run_id": run_id})
+    return None
+
+
 def _handle_result(run_id, gen, result):
     if isinstance(result, dict) and result.get("__interrupt__"):
         v = result["__interrupt__"][0].value
         payload = v if isinstance(v, dict) else {"payload": v}
-        store.mark_waiting(run_id, gen, payload)
-        log.info("agent run paused (%s)", payload.get("type"), extra={"run_id": run_id})
-        return result
+        cancelled = _pause_or_cancel(run_id, gen, payload, result)
+        return cancelled or result
     final = (result or {}).get("final") or {"status": "failed", "reason": "no final state",
                                             "error_code": ErrorCode.INTERNAL.value, "progress": {}}
-    store.finalize(run_id, gen, final["status"], final["reason"], final["error_code"],
-                   final["progress"])
-    # Status + code only: the reason can embed model-written or goal text.
-    log.info("agent run finished: %s (code=%s)", final["status"], final.get("error_code"),
+    # finalize() enforces cancellation precedence under the row lock and returns the
+    # status it actually wrote (a cancel that committed after node_finalize's check
+    # still wins). Status + code only in the log: the reason can embed model text.
+    written = store.finalize(run_id, gen, final["status"], final["reason"],
+                             final["error_code"], final["progress"]) or final["status"]
+    log.info("agent run finished: %s (code=%s)", written,
+             final.get("error_code") if written == final["status"] else "cancelled",
              extra={"run_id": run_id})
     return result
 
@@ -897,18 +937,7 @@ def resume_agent_loop(run_id, payload, queue_attempt=1, checkpointer_factory=Non
             # Re-read after begin_execution (cfg is from before it; see run_agent_loop).
             if cfg["cancel_requested"] or store.is_cancel_requested(run_id):
                 # Cancel wins: never apply a decision or run more tools after it.
-                values = graph.get_state(config).values or {}
-                ok = [v for v in (values.get("evaluated") or {}).values() if v.get("status") == "ok"]
-                if ok:
-                    try:
-                        from ranker import rank_jobs
-                        store.persist_rankings(run_id, gen, rank_jobs(ok))
-                    except Exception as e:
-                        log.warning("ranking on cancel failed: %s", type(e).__name__,
-                                    extra={"run_id": run_id})
-                store.finalize(run_id, gen, "cancelled", "cancelled by user",
-                               ErrorCode.CANCELLED, {})
-                return {"cancelled": True}
+                return _finalize_cancelled(run_id, gen, graph.get_state(config).values)
 
             rid = (payload or {}).get("review_id")
             snap = graph.get_state(config)
@@ -920,7 +949,10 @@ def resume_agent_loop(run_id, payload, queue_attempt=1, checkpointer_factory=Non
             if pending and pending.get("review_id") != rid:
                 # Stale job (an old tab, or a retry after the graph moved on to the
                 # NEXT review). The checkpoint is waiting: restore that; apply nothing.
-                store.mark_waiting(run_id, gen, pending)    # also closes the interval
+                cancelled = _pause_or_cancel(run_id, gen, pending,   # closes the interval
+                                             snap.values if snap else None)
+                if cancelled:
+                    return cancelled
                 log.warning("stale resume for review %s ignored (checkpoint waits on %s)",
                             rid, pending.get("review_id"), extra={"run_id": run_id})
                 return {"stale": True, "status": "waiting_for_human"}

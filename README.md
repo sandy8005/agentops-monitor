@@ -106,9 +106,33 @@ Otherwise it sets `cancel_requested` under the run-row lock, and cancellation is
 **precondition of every external dispatch**, not a flag polled near it:
 `reserve_llm_call` (every model request and retry), `authorize_dispatch` (provider
 token counts, retry backoff) and `begin_search_attempt` (Adzuna / Remotive) each
-refuse a cancelled run inside their own transaction. Once the cancel commits, no new
-external request is sent; work completed before it is kept and ranked, and the run
-ends `cancelled`, never `failed`.
+refuse a cancelled run inside their own transaction.
+
+**The contract, precisely:** once the cancel commits, no new external dispatch is
+*authorized*. An external request whose authorization committed *before* the cancel
+may still start or complete — there is an unavoidable interval between the
+authorizing transaction's `COMMIT` and the socket write, and no database lock is
+held across network I/O (that would block the cancel endpoint, and every other
+writer of the run row, for the length of an internet request). Its result is
+recorded like any other; nothing further is dispatched after it.
+
+**Cancellation wins every terminal transition.** The worker's last cancel checks
+(`node_finalize`, `node_review`) are early reads, not the guarantee; a cancel can
+commit after them. So the two writes that end active execution re-read
+`cancel_requested` under the same run-row lock the endpoint takes:
+
+- `agent_store.finalize()` — if a cancel committed first, the run ends `cancelled`
+  whatever outcome the worker computed (`success`, `no_matches`, `failed`, …);
+- `agent_store.mark_waiting()` — refuses to park a cancelled run for human review.
+  Either the cancel commits first (the worker finalizes the run `cancelled` and
+  supersedes the review request) or the pause commits first (the endpoint then
+  sees `waiting_for_human` and enqueues the resume-to-cancel job). A run never sits
+  in `waiting_for_human` with `cancel_requested` set and nothing to wake it.
+
+Work completed before the cancel (evaluations, rankings, advice, traces) is kept and
+ranked, and the run ends `cancelled`, never `failed`. These races are covered by
+real-PostgreSQL concurrency tests (`tests/test_cancel_terminal_races.py`) that hold
+the API's row lock, prove the worker is blocked on it, then commit.
 
 The API locks the *run* row while `job_queue.claim_next` locks the *queue* row, so a
 worker can claim a job while the API still sees the run `queued`. The API then
@@ -223,7 +247,13 @@ wording need the user's confirmation. Rejected suggestions are never returned.
   them across processes with `RATE_LIMIT_STORAGE_URI`).
 - **Uploads** — PDF only; read in 64 KB chunks and rejected with 413 as soon as
   `MAX_UPLOAD_BYTES` (default 5 MB) is exceeded; parsed in a resource-limited child
-  process. **Also set the body limit at the reverse proxy** (e.g. nginx
+  process (20 s wall clock; on POSIX also 15 s CPU, 512 MB memory and a file-size cap;
+  50 pages). Extracted **text is bounded at the source**: the child stops once it has
+  more than `MAX_RESUME_CHARS` (60,000) characters, reports `truncated`, and writes
+  its result to a size-capped file the API reads with a hard byte limit — a small,
+  highly compressible PDF cannot push an unbounded payload into the API process.
+  On Windows only the timeout and that character bound apply.
+  **Also set the body limit at the reverse proxy** (e.g. nginx
   `client_max_body_size 6m`): it is the only layer that can refuse bytes before they
   are received.
 - **Prompt injection** — all untrusted text (resume, postings, observations, human
@@ -290,6 +320,21 @@ returned. Rows from any other source (old seed/CSV/scraped data in a legacy data
 are never returned. Duplicates are collapsed URL-first, then by a
 title + company + location fingerprint.
 
+**Providers are not trusted to obey the query.** Every returned posting is validated
+locally (`job_source._role_matcher`). A target role is split into a *specialization*
+(`AI`, `ML`, `Security`, `Data`; alias-expanded, whole-word) and a *role family*
+(`Engineer`, `Analyst`, `Manager`, …). When the role names both, the specialization
+must appear in the title or description **and** the family in the **title**
+(`Engineer` and `Developer` count as one family). So "AI Engineer" no longer admits
+"AI Product Manager", "Technical Recruiter — AI Engineering" or a product-manager
+posting that mentions "AI engineers" — before any evaluation is spent on them.
+
+**Work mode is a strict constraint.** A remote search returns remote postings,
+onsite returns onsite, hybrid returns hybrid. "Remote (or onsite) preferred, hybrid
+acceptable" is an explicit opt-in, `allow_hybrid` on `POST /runs` (stored in the
+goal's fixed constraints); it never widens a hybrid search. Postings that state no
+work mode are kept (providers often omit it); a "remote" location counts as remote.
+
 **Geographic eligibility** of remote postings is resolved **structurally**
 (`geo.py`): text becomes ISO countries + regions from a hierarchy, by longest-phrase
 matching ("latin america" never also yields "america"; "south africa" never
@@ -320,6 +365,35 @@ The deterministic score (alias normalization, whole-word matching, negation and
 breakdown/provenance) is engineered carefully, but its **category weights and the
 Apply ≥ 75 / Maybe ≥ 55 thresholds are hand-selected** and have not been calibrated.
 Treat scores as a ranking signal, not an objectively validated match percentage.
+
+**A category is scored only if the posting gives it something to score**; an absent
+category's weight is redistributed proportionally over the ones that apply:
+
+| Category (base weight) | Applies when |
+|---|---|
+| required (50) | the job lists required skills or any-of groups (a group is one unit) |
+| preferred (20) | the job lists preferred skills |
+| projects (15) | there are required skills to look for in the candidate's (grounded) project tech, and the candidate has projects — or no professional experience to stand in for them |
+| experience (15) | the job states an explicit minimum (`min_years > 0`); with no minimum there is no requirement to meet, so no points are awarded for it |
+
+A posting that lists only preferred skills is therefore scored on them alone (a full
+match is 100, not 35). A posting that states only a years minimum is scored on
+experience: below the minimum it can be Skip, meeting it gives at most Maybe (one
+number is too thin a basis for an automatic Apply). A posting with no skills of any
+kind and no years minimum is `insufficient_requirements` and goes to human review.
+Each score reports `scored_categories` and the real per-category maximum
+(`breakdown_max`).
+
+**Parsed-resume grounding.** The model's resume parse is checked against the resume
+text before anything is scored. Skills need verbatim evidence or an affirmative
+mention; **project technologies** are kept only when that project's own text — a
+verified verbatim evidence quote, or the description following the project's name —
+affirmatively mentions them (a skill listed elsewhere in the resume is not evidence
+that a given project used it; "no Kubernetes" or "learning Rust" grounds nothing);
+a project whose name and evidence are not in the resume is dropped. Education is
+kept only when its institution or degree appears in the resume. Everything dropped
+is recorded (`ungrounded_skills`, `ungrounded_project_claims`,
+`ungrounded_education`).
 
 Before relying on them, build a labeled benchmark (500–1,000 resume/job pairs with
 human labels across role categories, seniority, location/work-authorization cases and
@@ -449,5 +523,4 @@ the archive.**
 - `scripts/check_release.py`: release-hygiene check (used by CI and make_release.py).
 - `scripts/check_migrations.py`: every migration path ends at the fresh-install schema.
 - `scripts/ci_summary.py`: CI proof that every test ran once, green, unskipped.
-- `scripts/legacy_migrations/`: pre-runner migration scripts, superseded by `migrations/`.
 - `docs/design-history.md`: the original (superseded) human-in-the-loop design.
