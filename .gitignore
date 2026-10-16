@@ -37,3 +37,5 @@ Thumbs.db
 
 # Local CI reports (scripts/ci_summary.py input)
 reports/
+# Personal Claude Code instructions
+CLAUDE.local.md
