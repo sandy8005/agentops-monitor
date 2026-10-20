@@ -619,6 +619,8 @@ def do_process_job(state, run_id):
             "experience_basis": score_result.get("experience_basis"),
             "candidate_years_used": score_result.get("candidate_years_used"),
             "requirements_method": _method,
+            # Model-extracted skills the posting does not mention (dropped, not scored).
+            "ungrounded_requirements": requirements.get("ungrounded_requirements") or [],
             "geo_eligibility": job.get("geo_eligibility"),
             "evaluation": eval_selection or "not_requested",
         })

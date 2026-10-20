@@ -41,6 +41,9 @@ _BYTES_PER_CHAR_BOUND = 12
 _ENVELOPE_BYTES = 1024
 
 
+_TRUNCATION_REASONS = (None, "char_limit", "page_limit")
+
+
 class PdfExtractionError(RuntimeError):
     """The PDF could not be parsed within the resource limits."""
 
@@ -51,28 +54,34 @@ def _result_byte_bound(max_chars):
 
 def extract_text_bounded(file_path, max_chars, max_pages=PDF_MAX_PAGES):
     """In-process extraction that STOPS once more than `max_chars` characters were
-    extracted. Returns {"text": <at most max_chars chars>, "truncated": bool,
-    "chars_seen": int}. chars_seen is exact when not truncated and a lower bound
-    (> max_chars) when truncated — the rest of the document is never extracted."""
+    extracted or `max_pages` pages were read. Returns {"text": <at most max_chars
+    chars>, "truncated": bool, "truncated_reason": None | "char_limit" |
+    "page_limit", "chars_seen": int, "pages_total": int, "pages_read": int}.
+    chars_seen is exact when not truncated and a lower bound when truncated — the
+    rest of the document is never extracted. Truncation is never silent: a PDF
+    with pages beyond max_pages reports truncated=True, reason "page_limit"."""
     from pypdf import PdfReader
     max_chars = int(max_chars)
     reader = PdfReader(file_path)
-    parts, total, truncated = [], 0, False
+    pages_total = len(reader.pages)
+    parts, total, reason = [], 0, None
     for i, page in enumerate(reader.pages):
         if i >= max_pages:
+            reason = "page_limit"                     # pages remain unread
             break
         piece = page.extract_text() or ""
         sep = 1 if parts else 0                       # the "\n" join separator
         parts.append(piece)
         total += sep + len(piece)
         if total > max_chars:
-            truncated = True
+            reason = "char_limit"
             break
     text = "\n".join(parts).strip()
     if len(text) > max_chars:
         text = text[:max_chars]
-        truncated = True
-    return {"text": text, "truncated": truncated, "chars_seen": total}
+        reason = "char_limit"
+    return {"text": text, "truncated": reason is not None, "truncated_reason": reason,
+            "chars_seen": total, "pages_total": pages_total, "pages_read": len(parts)}
 
 
 def _limit_resources(max_output_bytes):   # runs in the child, before exec (POSIX only)
@@ -89,7 +98,8 @@ def read_resume_file_isolated(file_path, max_chars=PDF_MAX_TEXT_CHARS,
                               timeout=PDF_TIMEOUT_SECONDS):
     """Extract text in a resource-limited child process.
 
-    Returns {"text", "truncated", "chars_seen"} (see extract_text_bounded). Raises
+    Returns {"text", "truncated", "truncated_reason", "chars_seen", "pages_total",
+    "pages_read"} (see extract_text_bounded). Raises
     PdfExtractionError on timeout, crash, an oversized or malformed result."""
     max_chars = int(max_chars)
     bound = _result_byte_bound(max_chars)
@@ -121,12 +131,18 @@ def read_resume_file_isolated(file_path, max_chars=PDF_MAX_TEXT_CHARS,
             data = json.loads(raw.decode("utf-8"))
             text = data["text"]
             truncated = bool(data["truncated"])
+            reason = data["truncated_reason"]
             chars_seen = int(data["chars_seen"])
+            pages_total = int(data["pages_total"])
+            pages_read = int(data["pages_read"])
         except (ValueError, KeyError, TypeError, UnicodeDecodeError):
             raise PdfExtractionError("PDF parser returned malformed output")
-        if not isinstance(text, str) or len(text) > max_chars:
+        if (not isinstance(text, str) or len(text) > max_chars
+                or reason not in _TRUNCATION_REASONS or truncated != (reason is not None)):
             raise PdfExtractionError("PDF parser returned malformed output")
-        return {"text": text, "truncated": truncated, "chars_seen": chars_seen}
+        return {"text": text, "truncated": truncated, "truncated_reason": reason,
+                "chars_seen": chars_seen, "pages_total": pages_total,
+                "pages_read": pages_read}
     finally:
         if out_fd is not None:
             os.close(out_fd)

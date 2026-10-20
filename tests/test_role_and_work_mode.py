@@ -105,3 +105,27 @@ def test_goal_defaults_to_strict_and_old_goals_still_load():
     # a goal stored before allow_hybrid existed
     old = AgentGoal(**{"target_role": "AI Engineer", "constraints": {"work_mode": "onsite"}})
     assert old.constraints.allow_hybrid is False
+
+# ------------------------------------------- scientist / researcher family ----
+# Backlog P2: "ML Scientist" matched unrelated scientist jobs (and missed real ones).
+
+@pytest.mark.parametrize("title,description,expected", [
+    ("Machine Learning Scientist", "PyTorch research.", True),
+    ("Research Scientist, ML", "Train large models.", True),
+    ("ML Researcher", "Publish papers.", True),                 # researcher == scientist
+    ("Soil Scientist", "Field sampling of soils.", False),      # no specialization
+    ("Marketing Manager", "Partner with our ML scientists.", False),  # no family in title
+    ("ML Engineer", "Ship ML services.", False),                # different family
+])
+def test_ml_scientist_needs_specialization_and_scientist_family(title, description, expected):
+    assert _role_matcher("ML Scientist")(_job(title, description)) is expected
+
+
+def test_researcher_query_accepts_scientist_titles():
+    m = _role_matcher("AI Researcher")
+    assert m(_job("AI Research Scientist", "")) is True
+    assert m(_job("Clinical Researcher", "wet-lab assays")) is False
+
+
+def test_bare_scientist_query_keeps_single_dimension_rule():
+    assert _role_matcher("Scientist")(_job("Soil Scientist")) is True

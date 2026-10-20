@@ -135,6 +135,124 @@ def _reconcile_experience(parsed_dict):
     return parsed_dict
 
 
+# --- Years-of-experience grounding -----------------------------------------
+# A model-stated total is accepted only up to what the resume TEXT supports: an
+# explicit statement ("5 years of experience") or the union of employment date
+# ranges ("Jan 2019 - Mar 2022", "2020 - Present"). Unparseable dates only LOWER
+# the ceiling, so a claim is never inflated by this step.
+_MONTHS = {m: i for i, m in enumerate(
+    ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"], 1)}
+_MONTH_RX = (r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|"
+             r"aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)")
+_DATE_RX = (r"(?:(?P<{p}m>" + _MONTH_RX + r")\.?,?\s+(?P<{p}my>(?:19|20)\d\d)"
+            r"|(?P<{p}nm>0?[1-9]|1[0-2])\s*/\s*(?P<{p}ny>(?:19|20)\d\d)"
+            r"|(?P<{p}y>(?:19|20)\d\d))")
+_RANGE_RE = re.compile(
+    r"(?<![\w/])" + _DATE_RX.format(p="s")
+    + r"\s*(?:-|–|—|to|until|till)\s*"
+    + r"(?:" + _DATE_RX.format(p="e")
+    + r"|(?P<present>present|current(?:ly)?|now|today|date|ongoing))(?![\w/])",
+    re.IGNORECASE)
+# Sections whose dates are not employment.
+_NON_WORK_HEADING_RE = re.compile(
+    r"^\s*(education|academic background|academics|qualifications|certifications?|"
+    r"awards|honou?rs|publications|languages|interests|volunteer(?:ing)?)\s*:?\s*$", re.I)
+_WORK_HEADING_RE = re.compile(
+    r"^\s*(experience|work experience|professional experience|employment|"
+    r"employment history|work history|career|projects?|personal projects|"
+    r"skills|technical skills|summary|profile)\s*:?\s*$", re.I)
+# A line that is plainly a degree entry (its dates are study, not work).
+_DEGREE_LINE_RE = re.compile(
+    r"\b(bachelor'?s?|master'?s?|b\.?\s?tech|m\.?\s?tech|b\.?\s?sc|m\.?\s?sc|ph\.?\s?d|"
+    r"mba|degree|gpa|cgpa|graduated|coursework)\b", re.I)
+# Slack for month rounding between the model's figure and the resume's ranges.
+_YEARS_TOLERANCE = 0.5
+
+
+def _month_index(m, prefix, end):
+    """Months since year 0 for one side of a range. A year-only start is January
+    and a year-only end is December (generous: this is a CEILING on the claim)."""
+    if m.group(prefix + "m"):
+        return int(m.group(prefix + "my")) * 12 + _MONTHS[m.group(prefix + "m")[:3].lower()] - 1 + end
+    if m.group(prefix + "nm"):
+        return int(m.group(prefix + "ny")) * 12 + int(m.group(prefix + "nm")) - 1 + end
+    return int(m.group(prefix + "y")) * 12 + (12 if end else 0)
+
+
+def employment_years_from_dates(resume_text, today=None):
+    """Total years covered by the UNION of employment date ranges in the resume
+    (overlapping/concurrent roles are counted once), or None if there are none.
+    Ranges under an education-like heading, or on a degree line, are ignored."""
+    import datetime
+    today = today or datetime.date.today()
+    now = today.year * 12 + today.month          # exclusive end of the current month
+    intervals = []
+    in_non_work = False
+    for line in str(resume_text or "").splitlines():
+        s = line.strip()
+        if _NON_WORK_HEADING_RE.match(s):
+            in_non_work = True
+            continue
+        if _WORK_HEADING_RE.match(s):
+            in_non_work = False
+            continue
+        if in_non_work or _DEGREE_LINE_RE.search(s):
+            continue
+        for m in _RANGE_RE.finditer(s):
+            start = _month_index(m, "s", 0)
+            end = now if m.group("present") else _month_index(m, "e", 1)
+            end = min(end, now)
+            if start < 1950 * 12 or end <= start:
+                continue
+            intervals.append((start, end))
+    if not intervals:
+        return None
+    intervals.sort()
+    total, cur_s, cur_e = 0, *intervals[0]
+    for st, en in intervals[1:]:
+        if st <= cur_e:
+            cur_e = max(cur_e, en)
+        else:
+            total += cur_e - cur_s
+            cur_s, cur_e = st, en
+    total += cur_e - cur_s
+    return round(total / 12.0, 2)
+
+
+def ground_years_experience(parsed_dict, resume_text, today=None):
+    """
+    Ground the model's stated years_experience against the resume text.
+
+    Supported ceiling = max(largest explicit "N years of experience" statement,
+    union of employment date ranges). A stated total within _YEARS_TOLERANCE of
+    the ceiling is kept. Above it, years_experience is CLAMPED to the ceiling; with
+    no evidence at all it becomes unknown (None + experience_unknown, the same
+    semantics as the rules parser: never 0, never "sufficient"). Either way the
+    claim is recorded in `ungrounded_experience` (None when grounded).
+    """
+    from rule_resume_parser import extract_years
+    stated = parsed_dict.get("years_experience") or 0.0
+    explicit = extract_years(resume_text)
+    ranged = employment_years_from_dates(resume_text, today=today)
+    evidence = [v for v in (explicit, ranged) if v is not None]
+    ceiling = max(evidence) if evidence else None
+    parsed_dict["years_experience_evidence"] = {"explicit_statement": explicit,
+                                                "date_ranges": ranged}
+    parsed_dict["ungrounded_experience"] = None
+    if stated <= 0 or (ceiling is not None and stated <= ceiling + _YEARS_TOLERANCE):
+        return parsed_dict
+    if ceiling is None:
+        parsed_dict["years_experience"] = None
+        parsed_dict["experience_unknown"] = True
+        reason = "no_resume_evidence"
+    else:
+        parsed_dict["years_experience"] = round(ceiling, 1)
+        reason = "exceeds_resume_evidence"
+    parsed_dict["ungrounded_experience"] = {"stated": stated, "supported": ceiling,
+                                            "reason": reason}
+    return parsed_dict
+
+
 def _norm_ws(text):
     return " ".join(str(text or "").lower().split())
 
@@ -268,8 +386,11 @@ def ground_education(education, resume_text):
     resume_norm = _norm_ws(resume_text)
 
     def _in_resume(v):
+        # Whole-word/phrase match on the normalized text: "MS" must not be grounded
+        # by "systems", nor "2019" by "120190".
         v = _norm_ws(v)
-        return bool(v) and v in resume_norm
+        return bool(v) and re.search(
+            r"(?<![a-z0-9])" + re.escape(v) + r"(?![a-z0-9])", resume_norm) is not None
 
     kept, ungrounded = [], []
     for e in (education or []):
@@ -420,6 +541,8 @@ RULES:
 
     # --- Cross-check stated vs summed experience (adds audit metadata) ----
     validated = _reconcile_experience(validated)
+    # --- Ground the stated total against the resume text (clamp, never raise) --
+    validated = ground_years_experience(validated, resume_text)
 
     # --- Deterministic grounding of the parsed skills ----------------------
     validated.update(ground_skills(skills, parsed.get("skill_evidence"), resume_text))

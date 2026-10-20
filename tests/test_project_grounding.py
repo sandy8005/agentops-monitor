@@ -104,3 +104,20 @@ def test_hallucinated_project_tech_no_longer_earns_project_points():
     after = calculate_match_score({**base, "projects": grounded}, reqs, RESUME)
     assert before["breakdown"]["projects"] > 0
     assert after["breakdown"]["projects"] == 0.0
+
+def test_education_grounding_is_whole_word_not_substring():
+    # Backlog P2: "MS" used to be grounded by the "ms" inside "systems".
+    resume = "Built distributed systems at Acme. Programs in Python since 2019."
+    out = ground_education([{"degree": "MS", "institution": "", "year": "2019"},
+                            {"degree": "BA", "institution": "Acme", "year": "201"}], resume)
+    assert out["ungrounded_education"] == [{"degree": "MS", "institution": "", "year": "2019"}]
+    # Acme is a whole word; "201" is only a fragment of 2019, so the year is dropped.
+    assert out["education"] == [{"degree": "", "institution": "Acme", "year": ""}]
+
+
+def test_education_grounding_still_matches_punctuated_degrees():
+    resume = "Education: M.S. Computer Science, Example Tech, 2021"
+    out = ground_education([{"degree": "M.S. Computer Science", "institution": "Example Tech",
+                             "year": "2021"}], resume)
+    assert out["education"][0] == {"degree": "M.S. Computer Science",
+                                   "institution": "Example Tech", "year": "2021"}

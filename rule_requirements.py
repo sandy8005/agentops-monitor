@@ -60,6 +60,27 @@ _YEARS_NOT_EXPERIENCE = re.compile(
     r"(\d{1,2})[- ]year (contract|term|warranty|commitment))")
 
 
+# A mention that states the OVERALL requirement for the role, judged within the
+# mention's own clause (commas/semicolons bound it), not the whole sentence.
+_YEARS_OVERALL = re.compile(r"\b(overall|in total|total|professional|industry|work experience)\b")
+
+
+def _clause_around(sentence, start, end):
+    """The mention's own clause: bounded by commas/semicolons, by the neighbouring
+    "N years" mentions (so "3 years python and 5 years of industry experience"
+    keeps "industry" with the 5), and by 40 characters either side."""
+    left = max(sentence.rfind(",", 0, start), sentence.rfind(";", 0, start)) + 1
+    rights = [i for i in (sentence.find(",", end), sentence.find(";", end)) if i != -1]
+    right = min(rights) if rights else len(sentence)
+    for other in _YEARS_RE.finditer(sentence):
+        if other.end() <= start:
+            left = max(left, other.end())
+        elif other.start() >= end:
+            right = min(right, other.start())
+            break
+    return sentence[max(left, start - 40):min(right, end + 40)]
+
+
 def _years_from_text(text_lower):
     """Minimum years of experience from a posting, as a DEGRADED fallback.
 
@@ -70,15 +91,18 @@ def _years_from_text(text_lower):
         manager track"),
       * skipped when it is not about experience (company age, "years ago",
         contract length).
-    Among the remaining mentions the SMALLEST is returned: when a posting states
-    several ("3 years Python, 5 years overall") the lowest one is the only value
-    that is a stated minimum for the whole role; a range "3-5 years" counts as 3.
+    When a remaining mention is marked as the OVERALL requirement in its own
+    clause ("5 years overall", "5+ years of professional experience", "total of
+    6 years"), the smallest such mention is returned: "3 years Python, 5 years
+    overall" is 5, not 3. Otherwise the SMALLEST mention is returned, since with
+    no overall marker the lowest figure is the only safe minimum for the whole
+    role. A range "3-5 years" counts as 3.
     Returns 0.0 when nothing qualifies (unknown, not "requires zero years").
 
     This cannot build required_any_of groups or read structure; the extraction is
     tagged requirements_method=rule_based wherever it is used, and matches that
     rest only on it can be excluded (require_verified_matches)."""
-    found = []
+    found, overall = [], []
     for sentence in re.split(r"(?<=[.;!?\n])\s+|\n+|•|\u2022", text_lower):
         for m in _YEARS_RE.finditer(sentence):
             n = int(m.group(1))
@@ -88,6 +112,10 @@ def _years_from_text(text_lower):
                     or _YEARS_NOT_EXPERIENCE.search(sentence)):
                 continue
             found.append(float(n))
+            if _YEARS_OVERALL.search(_clause_around(sentence, m.start(), m.end())):
+                overall.append(float(n))
+    if overall:
+        return min(overall)
     return min(found) if found else 0.0
 
 
@@ -130,6 +158,9 @@ def extract_requirements_rule_based(job):
         "preferred_skills": _uniq(preferred),
         "min_years_experience": _years_from_text(text_lower),
         "responsibilities": [],
+        # Every skill above was FOUND in the posting text, so nothing is ungrounded;
+        # same shape as the grounded LLM extraction (job_parser.ground_requirements).
+        "ungrounded_requirements": [],
         # Provenance travels WITH the data, so downstream evaluation can always tell
         # a crude keyword extraction from an LLM extraction.
         "extraction_method": "rule_based",

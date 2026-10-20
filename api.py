@@ -296,11 +296,13 @@ async def upload_resume(request: Request, file: UploadFile = File(...), name: st
     # experience after the cut are simply not seen by the matcher. When truncated,
     # original_chars is a LOWER BOUND (extraction stopped; the rest was never read).
     truncated = bool(extracted["truncated"])
+    truncated_reason = extracted.get("truncated_reason")   # "char_limit" | "page_limit"
     original_chars = max(int(extracted["chars_seen"]), len(resume_text))
     resume_text = resume_text[:MAX_RESUME_CHARS]       # defensive; already bounded
     if truncated:
-        log.info("resume text truncated: more than %d chars extracted, kept %d",
-                 MAX_RESUME_CHARS, len(resume_text))
+        log.info("resume text truncated (%s): kept %d chars, read %s of %s pages",
+                 truncated_reason, len(resume_text), extracted.get("pages_read"),
+                 extracted.get("pages_total"))
 
     with get_connection() as conn:   # guaranteed release even if the INSERT throws
         cur = conn.cursor()
@@ -317,12 +319,18 @@ async def upload_resume(request: Request, file: UploadFile = File(...), name: st
                     (resume_content_hash(resume_text),))
 
     message = f"Resume stored as #{resume_id}"
-    if truncated:
+    if truncated and truncated_reason == "page_limit":
+        message += (f" — WARNING: the PDF has {extracted.get('pages_total')} pages; only the "
+                    f"first {extracted.get('pages_read')} were read and will be matched.")
+    elif truncated:
         message += (f" — WARNING: the PDF contains more than {MAX_RESUME_CHARS:,} characters "
                     f"of text; only the first {MAX_RESUME_CHARS:,} were kept and will be "
                     f"matched.")
     return {"resume_id": resume_id, "name": name,
             "chars": len(resume_text), "truncated": truncated,
+            "truncated_reason": truncated_reason,
+            "pages_total": extracted.get("pages_total"),
+            "pages_read": extracted.get("pages_read"),
             "original_chars": original_chars, "stored_chars": len(resume_text),
             "message": message}
 

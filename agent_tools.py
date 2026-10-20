@@ -175,6 +175,12 @@ def _tool_state(ctx):
         def check_owner(self):
             ctx.budget.check_owner()
 
+        def authorize_dispatch(self):
+            # llm.py looks this up with getattr(budget, "authorize_dispatch", None):
+            # without it, token counts and retry backoffs skip the ownership /
+            # cancellation / erasure check for tool-driven model calls.
+            ctx.budget.authorize_dispatch()
+
         def can_spend(self):
             return ctx.budget.can_spend()
 

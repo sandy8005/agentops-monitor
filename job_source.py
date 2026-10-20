@@ -9,7 +9,8 @@ log = get_logger(__name__)
 # Generic role words too common to distinguish a role on their own.
 GENERIC_ROLE_WORDS = {
     "engineer", "developer", "analyst", "manager", "specialist", "consultant",
-    "administrator", "architect", "designer", "coordinator", "lead", "senior",
+    "administrator", "architect", "designer", "coordinator", "scientist",
+    "researcher", "lead", "senior",
     "junior", "staff", "principal", "associate", "intern", "assistant",
     "of", "the", "and", "or", "a", "an", "i", "ii", "iii"
 }
@@ -20,12 +21,18 @@ GENERIC_ROLE_WORDS = {
 ROLE_FAMILY_WORDS = {
     "engineer", "developer", "analyst", "manager", "specialist", "consultant",
     "administrator", "architect", "designer", "coordinator", "assistant",
+    "scientist", "researcher",
 }
 # Family words that name the same job family in titles ("AI Engineer" ==
 # "AI Developer"). One-way lookup: query family word -> acceptable title words.
 _FAMILY_EQUIVALENTS = {
     "engineer": {"engineer", "developer"},
     "developer": {"developer", "engineer"},
+    # "ML Researcher" == "Research Scientist, ML"; a scientist query still needs a
+    # scientist/researcher TITLE, so "Soil Scientist" never matches "ML Scientist"
+    # by specialization alone, nor "Marketing Manager" via "our ML scientists".
+    "scientist": {"scientist", "researcher"},
+    "researcher": {"researcher", "scientist"},
 }
 
 
@@ -55,7 +62,10 @@ ROLE_ALIAS_GROUPS = [
     ["fullstack", "full stack", "full-stack"],
     ["devops", "sre", "site reliability"],
     ["qa", "quality assurance", "test engineer", "sdet"],
-    ["data scientist", "ml scientist"],
+    # ("data scientist" / "ml scientist" are no longer one alias phrase: consuming
+    # the phrase whole skipped the scientist family check. "ML Scientist" is now the
+    # specialization "ml" + the scientist family, which matches "Machine Learning
+    # Scientist" and "Research Scientist, ML" and rejects unrelated scientists.)
     ["data engineer", "data engineering"],
     ["ios", "swift developer"],
     ["android", "kotlin developer"],

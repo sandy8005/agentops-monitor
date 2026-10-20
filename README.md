@@ -201,7 +201,11 @@ retried.
 
 For each discovered job: **requirements** (LLM extraction, cached durably with
 provenance; a rules fallback is used only when the *model* is degraded — database
-and programming errors fail visibly) → deterministic **match score** → **judge**
+and programming errors fail visibly; every model-extracted required/preferred skill
+and any-of member must appear in the posting's title or description — whole-word,
+alias-aware, the scorer's own matching — or it is dropped and recorded in
+`ungrounded_requirements`, so an invented requirement cannot cause a false Skip)
+→ deterministic **match score** → **judge**
 (LLM Apply/Maybe/Skip, only in the uncertain 20–80 band) → optional **evaluator** →
 if flagged for any reason, the run **pauses for human review**. `rank_jobs` sorts by
 decision bucket (Apply > Maybe > Skip), then score. `generate_advice` writes
@@ -249,7 +253,9 @@ wording need the user's confirmation. Rejected suggestions are never returned.
   `MAX_UPLOAD_BYTES` (default 5 MB) is exceeded; parsed in a resource-limited child
   process (20 s wall clock; on POSIX also 15 s CPU, 512 MB memory and a file-size cap;
   50 pages). Extracted **text is bounded at the source**: the child stops once it has
-  more than `MAX_RESUME_CHARS` (60,000) characters, reports `truncated`, and writes
+  more than `MAX_RESUME_CHARS` (60,000) characters or has read 50 pages, reports
+  `truncated` with `truncated_reason` (`char_limit` / `page_limit`, plus
+  `pages_read` / `pages_total`; the upload response and dashboard warn either way), and writes
   its result to a size-capped file the API reads with a hard byte limit — a small,
   highly compressible PDF cannot push an unbounded payload into the API process.
   On Windows only the timeout and that character bound apply.
@@ -325,9 +331,11 @@ locally (`job_source._role_matcher`). A target role is split into a *specializat
 (`AI`, `ML`, `Security`, `Data`; alias-expanded, whole-word) and a *role family*
 (`Engineer`, `Analyst`, `Manager`, …). When the role names both, the specialization
 must appear in the title or description **and** the family in the **title**
-(`Engineer` and `Developer` count as one family). So "AI Engineer" no longer admits
-"AI Product Manager", "Technical Recruiter — AI Engineering" or a product-manager
-posting that mentions "AI engineers" — before any evaluation is spent on them.
+(`Engineer` and `Developer` count as one family, as do `Scientist` and `Researcher`).
+So "AI Engineer" no longer admits "AI Product Manager", "Technical Recruiter — AI
+Engineering" or a product-manager posting that mentions "AI engineers", and "ML
+Scientist" admits "Research Scientist, Machine Learning" but not "Soil Scientist" —
+before any evaluation is spent on them.
 
 **Work mode is a strict constraint.** A remote search returns remote postings,
 onsite returns onsite, hybrid returns hybrid. "Remote (or onsite) preferred, hybrid
@@ -373,7 +381,7 @@ category's weight is redistributed proportionally over the ones that apply:
 |---|---|
 | required (50) | the job lists required skills or any-of groups (a group is one unit) |
 | preferred (20) | the job lists preferred skills |
-| projects (15) | there are required skills to look for in the candidate's (grounded) project tech, and the candidate has projects — or no professional experience to stand in for them |
+| projects (15) | there are required skills to look for in the candidate's (grounded) project tech, and the candidate has projects — or no professional experience to stand in for them. With professional experience, project evidence counts only when it raises the total, so adding a truthful project can never lower a score |
 | experience (15) | the job states an explicit minimum (`min_years > 0`); with no minimum there is no requirement to meet, so no points are awarded for it |
 
 A posting that lists only preferred skills is therefore scored on them alone (a full
@@ -391,9 +399,16 @@ verified verbatim evidence quote, or the description following the project's nam
 affirmatively mentions them (a skill listed elsewhere in the resume is not evidence
 that a given project used it; "no Kubernetes" or "learning Rust" grounds nothing);
 a project whose name and evidence are not in the resume is dropped. Education is
-kept only when its institution or degree appears in the resume. Everything dropped
-is recorded (`ungrounded_skills`, `ungrounded_project_claims`,
-`ungrounded_education`).
+kept only when its institution or degree appears in the resume. **Total years of
+experience** is accepted only up to what the resume supports: the larger of an
+explicit statement ("5 years of experience") and the *union* of employment date
+ranges ("Jan 2020 – Mar 2022", "2021 – Present"; overlapping roles count once;
+ranges under an education-type heading or on a degree line are ignored), with 0.5
+years of slack. A higher model figure is clamped to that ceiling
+(`experience_basis = resume_evidence_cap`); with no evidence at all it becomes
+*unknown* (the experience category is then absent and Apply is capped, as for the
+rules parser). Everything dropped is recorded (`ungrounded_skills`,
+`ungrounded_project_claims`, `ungrounded_education`, `ungrounded_experience`).
 
 Before relying on them, build a labeled benchmark (500–1,000 resume/job pairs with
 human labels across role categories, seniority, location/work-authorization cases and
@@ -402,7 +417,9 @@ false-Skip rates, reviewer agreement and calibration by score band.
 
 The **rules-based requirements fallback** (`rule_requirements.py`) is a degraded
 path: it reads "N years" per sentence (skipping preferred, conditional and
-non-experience mentions) but cannot build any-of groups. Extractions are tagged
+non-experience mentions; a mention marked overall/total/professional/industry in its
+own clause wins, so "3 years Python, 5 years overall" is 5, otherwise the smallest
+mention is used) but cannot build any-of groups. Extractions are tagged
 `requirements_method = rule_based`, and `require_verified_matches` excludes matches
 that rest only on it. Measure its drift on your data with:
 

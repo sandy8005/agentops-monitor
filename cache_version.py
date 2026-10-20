@@ -4,8 +4,8 @@ make old cached results invalid, so stale entries become unreachable (via the
 versioned key) instead of being served forever. The cache_version STRING is also
 stored on each row so you can query/prune by version.
 
-- PARSER_VERSION: bump when the resume-parsing PROMPT changes.
-- REQS_VERSION:   bump when the requirements-extraction PROMPT changes.
+- PARSER_VERSION: bump when the resume-parsing PROMPT or its deterministic grounding changes.
+- REQS_VERSION:   bump when the requirements-extraction PROMPT or its grounding changes.
 - SCHEMA_VERSION: bump when Pydantic validation rules change in a way that affects
                   what a valid parsed result looks like.
 - model:          the Gemini model in use is NOT duplicated here — it comes from
@@ -17,8 +17,8 @@ stored on each row so you can query/prune by version.
 """
 from settings import settings
 
-PARSER_VERSION = "4"   # bumped: project evidence in the prompt; project tech + education grounded
-REQS_VERSION = "3"   # bumped: reqs prompt hardened (HARDENING_PREAMBLE + wrap_untrusted); key already includes TITLE + description
+PARSER_VERSION = "5"   # bumped: years_experience grounded against the resume (explicit statement / date-range union)
+REQS_VERSION = "4"   # bumped: extracted skills grounded against the posting (ungrounded_requirements)
 SCHEMA_VERSION = "1"
 
 

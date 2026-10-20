@@ -39,3 +39,5 @@ Thumbs.db
 reports/
 # Personal Claude Code instructions
 CLAUDE.local.md
+
+.claude/agents/kaal.md

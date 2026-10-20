@@ -37,12 +37,20 @@ def effective_years(parsed_resume, mode="conservative"):
     flagged. mode="stated" reproduces the raw stated value (used by the router to
     check whether the discrepancy actually changes the decision).
 
-    Returns (years, basis) with basis in {"stated", "conservative_min", "unknown"}.
+    The parser has already grounded years_experience against the resume text
+    (parser.ground_years_experience): an unsupported total was clamped to the
+    resume's evidence (basis "resume_evidence_cap") or made unknown.
+
+    Returns (years, basis) with basis in {"stated", "resume_evidence_cap",
+    "conservative_min", "unknown"}.
     """
     parsed_resume = parsed_resume or {}
     if parsed_resume.get("years_experience") is None and parsed_resume.get("experience_unknown"):
-        return None, "unknown"          # rules parse found no explicit statement
+        return None, "unknown"          # no explicit statement / no resume evidence
     stated = parsed_resume.get("years_experience") or 0
+    stated_basis = ("resume_evidence_cap"
+                    if isinstance(parsed_resume.get("ungrounded_experience"), dict)
+                    else "stated")
     disc = parsed_resume.get("experience_discrepancy")
     if mode == "conservative" and isinstance(disc, dict):
         summed = disc.get("summed")
@@ -52,7 +60,7 @@ def effective_years(parsed_resume, mode="conservative"):
             summed = None
         if summed is not None and summed < stated:
             return summed, "conservative_min"
-    return stated, "stated"
+    return stated, stated_basis
 
 
 def calculate_match_score(parsed_resume, requirements, resume_text, job=None, user_input=None,
@@ -170,6 +178,13 @@ def calculate_match_score(parsed_resume, requirements, resume_text, job=None, us
 
     projects_category_applies = (total_required_items > 0
                                  and (bool(projects) or not has_professional_experience))
+    # MONOTONIC: a truthful extra project must never LOWER the score. When the
+    # candidate has professional experience, that experience already stands in for
+    # projects (category absent), so project evidence is counted only if it raises
+    # the total — see the comparison after the experience category below. Without
+    # professional experience the category always applies, and adding a project can
+    # only add matched tech units.
+    projects_optional = has_professional_experience
     if projects_category_applies:
         units_met = 0
         for s in required:
@@ -188,6 +203,17 @@ def calculate_match_score(parsed_resume, requirements, resume_text, job=None, us
     if has_experience_requirement and not experience_unknown:
         fractions["experience"] = min(1.0, candidate_years / min_years)
         applicable["experience"] = BASE_WEIGHTS["experience"]
+
+    def _exact_total(cats):
+        weight = sum(cats.values())
+        return sum(fractions[c] * cats[c] * 100.0 / weight for c in cats) if weight else 0.0
+
+    if projects_category_applies and projects_optional:
+        without = {c: w for c, w in applicable.items() if c != "projects"}
+        if _exact_total(applicable) < _exact_total(without):
+            del applicable["projects"]           # project evidence would only hurt
+            del fractions["projects"]
+            projects_category_applies = False
 
     # --- Normalize over applicable weight and build the reported breakdown --------
     # Renormalize the applicable weights so they still sum to 100. The breakdown
