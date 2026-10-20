@@ -19,9 +19,12 @@ def test_date_ranges_are_unioned_not_summed():
 
 
 def test_present_and_numeric_and_year_only_forms():
-    assert employment_years_from_dates("Engineer, X  03/2024 - Present", today=TODAY) == round(28 / 12, 2)
-    assert employment_years_from_dates("Engineer, X  2022 – 2023", today=TODAY) == 2.0
-    assert employment_years_from_dates("Engineer at X since forever", today=TODAY) is None
+    # Dates count only under an experience heading (backlog A: verified records).
+    assert employment_years_from_dates("EXPERIENCE\nEngineer, X  03/2024 - Present",
+                                       today=TODAY) == round(28 / 12, 2)
+    assert employment_years_from_dates("EXPERIENCE\nEngineer, X  2022 – 2023", today=TODAY) == 2.0
+    assert employment_years_from_dates("EXPERIENCE\nEngineer at X since forever",
+                                       today=TODAY) is None
 
 
 def test_education_dates_are_not_employment():
@@ -45,7 +48,8 @@ def test_supported_stated_years_are_kept():
     out = ground_years_experience({"years_experience": 6.0}, text, today=TODAY)
     assert out["years_experience"] == 6.0 and out["ungrounded_experience"] is None
     # within the rounding tolerance of the date ranges
-    out = ground_years_experience({"years_experience": 2.5}, "Acme 2023 - 2024", today=TODAY)
+    out = ground_years_experience({"years_experience": 2.5}, "Experience\nAcme 2023 - 2024",
+                                  today=TODAY)
     assert out["years_experience"] == 2.5 and out["ungrounded_experience"] is None
 
 

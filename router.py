@@ -472,6 +472,11 @@ def do_process_job(state, run_id):
             flag_for_review(step_id, reason="uncertain_skill_evidence")
         if score_result.get("insufficient_requirements"):
             flag_for_review(step_id, reason="insufficient_requirements")
+        # A requirement the posting negates, or whose required/preferred label it
+        # contradicts, was kept OUT of the score (job_parser.ground_requirements);
+        # a human decides what it means.
+        if requirements.get("uncertain_requirements"):
+            flag_for_review(step_id, reason="uncertain_requirements")
 
         # 2b. Experience discrepancy: the scorer already used the CONSERVATIVE years
         #     (the lower of stated vs. summed). If the questionable stated value would
@@ -621,6 +626,10 @@ def do_process_job(state, run_id):
             "requirements_method": _method,
             # Model-extracted skills the posting does not mention (dropped, not scored).
             "ungrounded_requirements": requirements.get("ungrounded_requirements") or [],
+            # Negated / contradicted requirements (not scored; flagged for review).
+            "uncertain_requirements": requirements.get("uncertain_requirements") or [],
+            # A model-stated years minimum the posting does not state (not scored).
+            "ungrounded_min_years": requirements.get("ungrounded_min_years"),
             "geo_eligibility": job.get("geo_eligibility"),
             "evaluation": eval_selection or "not_requested",
         })

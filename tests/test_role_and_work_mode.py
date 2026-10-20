@@ -129,3 +129,21 @@ def test_researcher_query_accepts_scientist_titles():
 
 def test_bare_scientist_query_keeps_single_dimension_rule():
     assert _role_matcher("Scientist")(_job("Soil Scientist")) is True
+
+
+# Backlog H: for scientist/researcher families the specialization must be in the
+# TITLE, or the title must be a generic research title with no other domain; an
+# incidental mention in the description no longer admits another field's scientist.
+@pytest.mark.parametrize("title,description,expected", [
+    ("Soil Scientist", "Field sampling. We use machine learning tools occasionally.", False),
+    ("Clinical Researcher", "Trials team; some AI-assisted reporting.", False),
+    ("Food Scientist", "Recipe R&D. Exposure to ML is a plus.", False),
+    ("Research Scientist", "Train large machine learning models.", True),   # generic title
+    ("Senior Scientist", "Build ML ranking models.", True),
+    ("Scientist II", "Bench chemistry and assays.", False),                 # no specialization
+    ("Research Scientist, Machine Learning", "", True),
+    ("Research Scientist - London (Hybrid)", "Deep learning and ML research.", True),
+    ("Soil Scientist - Remote", "Uses ML models for yield forecasts.", False),
+])
+def test_scientist_needs_specialization_in_title_or_generic_title(title, description, expected):
+    assert _role_matcher("ML Scientist")(_job(title, description)) is expected

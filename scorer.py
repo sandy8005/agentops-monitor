@@ -63,6 +63,23 @@ def effective_years(parsed_resume, mode="conservative"):
     return stated, stated_basis
 
 
+def _has_professional_experience(parsed_resume, candidate_years):
+    """
+    Whether the candidate has professional experience that can stand in for the
+    projects category. The model's itemized `experience` entries are NOT evidence
+    (a fabricated entry used to flip the weights: 76.9 -> 100.0). When the parse
+    carries VERIFIED employment records (parser.employment_records), experience
+    exists iff there is at least one record or an explicit resume statement
+    ("5 years of experience"). A parse without records (legacy / hand-built)
+    falls back to a positive grounded years total only.
+    """
+    records = parsed_resume.get("employment_records")
+    if records is None:
+        return (candidate_years or 0) > 0
+    explicit = (parsed_resume.get("years_experience_evidence") or {}).get("explicit_statement")
+    return bool(records) or bool(explicit and explicit > 0 and (candidate_years or 0) > 0)
+
+
 def calculate_match_score(parsed_resume, requirements, resume_text, job=None, user_input=None,
                           experience_mode="conservative"):
     resume_text_lower, resume_tokens = text_index(resume_text)
@@ -164,8 +181,7 @@ def calculate_match_score(parsed_resume, requirements, resume_text, job=None, us
     # that case the projects category is treated as ABSENT and its weight is
     # redistributed. A candidate with neither projects nor experience still scores
     # 0 here when there are required tech units — that is a real gap.
-    has_professional_experience = bool(
-        (candidate_years or 0) > 0 or (parsed_resume.get("experience") or []))
+    has_professional_experience = _has_professional_experience(parsed_resume, candidate_years)
 
     def _in_projects(skill):
         c = canonical_skill(skill)

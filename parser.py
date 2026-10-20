@@ -18,8 +18,8 @@ def _raw_number(v, default=0.0):
     if v is None:
         return default
     if isinstance(v, (int, float)):
-        return float(v)
-    import re
+        # finite + representable, else ValueError (-> unusable model output)
+        return _strict_float(v, field_name="months")
     m = re.search(r"\d+(\.\d+)?", str(v))
     return float(m.group()) if m else default
 
@@ -135,11 +135,68 @@ def _reconcile_experience(parsed_dict):
     return parsed_dict
 
 
+# --- Resume sections ---------------------------------------------------------
+# A line is a section heading only if, stripped of decoration ("##", "**", ":"),
+# it is EXACTLY one of these names. Each heading opens a section of one KIND; only
+# "employment" sections hold professional experience. Project, academic and
+# volunteer timelines are tracked separately and never count as employment.
+_SECTION_KINDS = (
+    ("employment",
+     r"(?:(?:relevant|professional|work|industry|career)\s+)?experience"
+     r"|employment(?:\s+history)?|work\s+history|career(?:\s+history)?"
+     r"|professional\s+background|internships?(?:\s+experience)?"
+     r"|(?:(?:work|professional)\s+)?experience\s+and\s+internships?"),
+    ("project",
+     r"(?:(?:personal|academic|side|key|selected|technical|relevant|notable|"
+     r"open[\s-]source)\s+)?projects?(?:\s+experience)?"),
+    ("academic",
+     r"education(?:al\s+background)?|academic\s+(?:background|experience)|academics"
+     r"|research(?:\s+experience)?|teaching(?:\s+experience)?|coursework|thesis"
+     r"|qualifications"),
+    ("volunteer",
+     r"volunteer(?:ing)?(?:\s+(?:experience|work|activities))?"
+     r"|community\s+(?:service|involvement)"),
+    ("other",
+     r"(?:(?:technical|core|key)\s+)?skills(?:\s+summary)?|(?:professional\s+)?summary"
+     r"|profile|objective|about(?:\s+me)?|certifications?(?:\s+and\s+licenses)?|licenses"
+     r"|awards(?:\s+and\s+honou?rs)?|honou?rs|achievements|publications|languages"
+     r"|interests|hobbies|activities|extracurricular(?:\s+activities)?"
+     r"|leadership(?:\s+experience)?|references|contact(?:\s+information)?"),
+)
+_SECTION_RES = [(kind, re.compile(rx)) for kind, rx in _SECTION_KINDS]
+
+
+def section_heading(line):
+    """The section KIND a heading line opens ("employment", "project", "academic",
+    "volunteer", "other"), or None when the line is not a recognized heading."""
+    s = re.sub(r"^[\s#*=_\-•]+|[\s:*=_\-]+$", "", str(line or "")).lower()
+    s = " ".join(re.sub(r"\s*&\s*", " and ", s).split())
+    if not s or len(s) > 50:
+        return None
+    for kind, rx in _SECTION_RES:
+        if rx.fullmatch(s):
+            return kind
+    return None
+
+
+def resume_sections(resume_text):
+    """[(kind, [lines])] in order. Text before the first recognized heading has
+    kind None (name, contact, an unlabeled summary)."""
+    sections = [(None, [])]
+    for line in str(resume_text or "").splitlines():
+        kind = section_heading(line)
+        if kind is not None:
+            sections.append((kind, []))
+        else:
+            sections[-1][1].append(line)
+    return sections
+
+
 # --- Years-of-experience grounding -----------------------------------------
 # A model-stated total is accepted only up to what the resume TEXT supports: an
-# explicit statement ("5 years of experience") or the union of employment date
-# ranges ("Jan 2019 - Mar 2022", "2020 - Present"). Unparseable dates only LOWER
-# the ceiling, so a claim is never inflated by this step.
+# explicit statement ("5 years of experience") or the union of VERIFIED employment
+# records ("Jan 2019 - Mar 2022", "2020 - Present" under an experience heading).
+# Unparseable dates only LOWER the ceiling, so a claim is never inflated here.
 _MONTHS = {m: i for i, m in enumerate(
     ["jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"], 1)}
 _MONTH_RX = (r"(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|june?|july?|"
@@ -153,14 +210,6 @@ _RANGE_RE = re.compile(
     + r"(?:" + _DATE_RX.format(p="e")
     + r"|(?P<present>present|current(?:ly)?|now|today|date|ongoing))(?![\w/])",
     re.IGNORECASE)
-# Sections whose dates are not employment.
-_NON_WORK_HEADING_RE = re.compile(
-    r"^\s*(education|academic background|academics|qualifications|certifications?|"
-    r"awards|honou?rs|publications|languages|interests|volunteer(?:ing)?)\s*:?\s*$", re.I)
-_WORK_HEADING_RE = re.compile(
-    r"^\s*(experience|work experience|professional experience|employment|"
-    r"employment history|work history|career|projects?|personal projects|"
-    r"skills|technical skills|summary|profile)\s*:?\s*$", re.I)
 # A line that is plainly a degree entry (its dates are study, not work).
 _DEGREE_LINE_RE = re.compile(
     r"\b(bachelor'?s?|master'?s?|b\.?\s?tech|m\.?\s?tech|b\.?\s?sc|m\.?\s?sc|ph\.?\s?d|"
@@ -179,36 +228,32 @@ def _month_index(m, prefix, end):
     return int(m.group(prefix + "y")) * 12 + (12 if end else 0)
 
 
-def employment_years_from_dates(resume_text, today=None):
-    """Total years covered by the UNION of employment date ranges in the resume
-    (overlapping/concurrent roles are counted once), or None if there are none.
-    Ranges under an education-like heading, or on a degree line, are ignored."""
+def _today_index(today):
     import datetime
     today = today or datetime.date.today()
-    now = today.year * 12 + today.month          # exclusive end of the current month
-    intervals = []
-    in_non_work = False
-    for line in str(resume_text or "").splitlines():
-        s = line.strip()
-        if _NON_WORK_HEADING_RE.match(s):
-            in_non_work = True
+    return today.year * 12 + today.month          # exclusive end of the current month
+
+
+def _line_intervals(line, now):
+    """[(start, end, match)] for each plausible date range on one line."""
+    out = []
+    for m in _RANGE_RE.finditer(line):
+        start = _month_index(m, "s", 0)
+        end = now if m.group("present") else _month_index(m, "e", 1)
+        end = min(end, now)
+        if start < 1950 * 12 or end <= start:
             continue
-        if _WORK_HEADING_RE.match(s):
-            in_non_work = False
-            continue
-        if in_non_work or _DEGREE_LINE_RE.search(s):
-            continue
-        for m in _RANGE_RE.finditer(s):
-            start = _month_index(m, "s", 0)
-            end = now if m.group("present") else _month_index(m, "e", 1)
-            end = min(end, now)
-            if start < 1950 * 12 or end <= start:
-                continue
-            intervals.append((start, end))
+        out.append((start, end, m))
+    return out
+
+
+def _union_years(intervals):
+    """Years covered by the UNION of (start, end) month intervals, or None.
+    Overlapping/concurrent intervals are counted once."""
     if not intervals:
         return None
-    intervals.sort()
-    total, cur_s, cur_e = 0, *intervals[0]
+    intervals = sorted(intervals)
+    total, (cur_s, cur_e) = 0, intervals[0]
     for st, en in intervals[1:]:
         if st <= cur_e:
             cur_e = max(cur_e, en)
@@ -219,27 +264,118 @@ def employment_years_from_dates(resume_text, today=None):
     return round(total / 12.0, 2)
 
 
+def _has_words(text):
+    return re.search(r"[A-Za-z]{2,}", text or "") is not None
+
+
+def _ym(idx):
+    return f"{idx // 12:04d}-{idx % 12 + 1:02d}"
+
+
+def employment_records(resume_text, today=None):
+    """
+    VERIFIED employment records: a date range on a line under an
+    experience/employment heading, with an entry header (title and/or company)
+    either on the same line or on the closest preceding non-bullet line of that
+    section. Degree lines are skipped. Ranges under project, academic, volunteer
+    or other headings — or before any heading — are never employment.
+
+    Returns [{"header", "start": "YYYY-MM", "end": "YYYY-MM", "months"}].
+    """
+    now = _today_index(today)
+    records = []
+    for kind, lines in resume_sections(resume_text):
+        if kind != "employment":
+            continue
+        header = ""
+        for line in lines:
+            s = line.strip()
+            if not s:
+                continue
+            found = [] if _DEGREE_LINE_RE.search(s) else _line_intervals(s, now)
+            if not found:
+                if s[:1] not in "-*•" and _has_words(s):
+                    header = s            # candidate header for a date line below
+                continue
+            rest = s
+            for _st, _en, m in found:
+                rest = rest.replace(m.group(0), " ")
+            rest = " ".join(rest.split()).strip(" |,;()[]-–—•*")
+            this_header = rest if _has_words(rest) else header
+            header = ""
+            if not this_header:
+                continue                  # dates with no title/company: unverified
+            for st, en, _m in found:
+                records.append({"header": this_header[:120], "start": _ym(st),
+                                "end": _ym(en - 1), "months": en - st})
+    return records
+
+
+def _record_interval(rec):
+    sy, sm = (int(x) for x in rec["start"].split("-"))
+    ey, em = (int(x) for x in rec["end"].split("-"))
+    return sy * 12 + sm - 1, ey * 12 + em
+
+
+def employment_years_from_dates(resume_text, today=None):
+    """Total years covered by the UNION of VERIFIED employment records
+    (overlapping/concurrent roles are counted once), or None if there are none."""
+    return _union_years([_record_interval(r) for r in employment_records(resume_text, today)])
+
+
+def non_employment_timelines(resume_text, today=None):
+    """{kind: years} for date ranges OUTSIDE employment sections ("project",
+    "academic", "volunteer", "other", "unsectioned"). Recorded for audit only —
+    these are never professional experience."""
+    now = _today_index(today)
+    per_kind = {}
+    for kind, lines in resume_sections(resume_text):
+        if kind == "employment":
+            continue
+        for line in lines:
+            per_kind.setdefault(kind or "unsectioned", []).extend(
+                (st, en) for st, en, _m in _line_intervals(line.strip(), now))
+    return {k: _union_years(v) for k, v in per_kind.items() if v}
+
+
 def ground_years_experience(parsed_dict, resume_text, today=None):
     """
     Ground the model's stated years_experience against the resume text.
 
     Supported ceiling = max(largest explicit "N years of experience" statement,
-    union of employment date ranges). A stated total within _YEARS_TOLERANCE of
-    the ceiling is kept. Above it, years_experience is CLAMPED to the ceiling; with
-    no evidence at all it becomes unknown (None + experience_unknown, the same
-    semantics as the rules parser: never 0, never "sufficient"). Either way the
-    claim is recorded in `ungrounded_experience` (None when grounded).
+    union of VERIFIED employment records — see employment_records). A stated total
+    within _YEARS_TOLERANCE of the ceiling is kept. Above it, years_experience is
+    CLAMPED to the ceiling; with no evidence at all it becomes unknown (None +
+    experience_unknown, the same semantics as the rules parser: never 0, never
+    "sufficient"). Either way the claim is recorded in `ungrounded_experience`
+    (None when grounded).
+
+    A stated total of 0 (or none) while the verified employment records prove a
+    positive total is CORRECTED to the records' total — never above it — and
+    recorded in `experience_corrected` (None otherwise).
     """
     from rule_resume_parser import extract_years
     stated = parsed_dict.get("years_experience") or 0.0
     explicit = extract_years(resume_text)
-    ranged = employment_years_from_dates(resume_text, today=today)
+    records = employment_records(resume_text, today=today)
+    ranged = _union_years([_record_interval(r) for r in records])
     evidence = [v for v in (explicit, ranged) if v is not None]
     ceiling = max(evidence) if evidence else None
-    parsed_dict["years_experience_evidence"] = {"explicit_statement": explicit,
-                                                "date_ranges": ranged}
+    parsed_dict["employment_records"] = records
+    parsed_dict["years_experience_evidence"] = {
+        "explicit_statement": explicit, "date_ranges": ranged,
+        "non_employment_ranges": non_employment_timelines(resume_text, today=today)}
     parsed_dict["ungrounded_experience"] = None
-    if stated <= 0 or (ceiling is not None and stated <= ceiling + _YEARS_TOLERANCE):
+    parsed_dict["experience_corrected"] = None
+    if stated <= 0:
+        if ranged:
+            parsed_dict["years_experience"] = ranged
+            parsed_dict["experience_corrected"] = {
+                "stated": float(stated), "corrected_to": ranged,
+                "reason": "verified_employment_records"}
+            _refresh_discrepancy(parsed_dict)
+        return parsed_dict
+    if ceiling is not None and stated <= ceiling + _YEARS_TOLERANCE:
         return parsed_dict
     if ceiling is None:
         parsed_dict["years_experience"] = None
@@ -251,6 +387,44 @@ def ground_years_experience(parsed_dict, resume_text, today=None):
     parsed_dict["ungrounded_experience"] = {"stated": stated, "supported": ceiling,
                                             "reason": reason}
     return parsed_dict
+
+
+def _refresh_discrepancy(parsed_dict):
+    """After a correction, re-judge stated-vs-summed against the CORRECTED total
+    (the model's original figure stays in years_experience_stated)."""
+    if "years_experience_summed" not in parsed_dict:
+        return
+    years = parsed_dict.get("years_experience") or 0.0
+    summed = parsed_dict.get("years_experience_summed") or 0.0
+    if summed > 0 and abs(years - summed) > 1.0:
+        parsed_dict["experience_discrepancy"] = {
+            "stated": years, "summed": summed,
+            "note": ("verified employment total and summed itemized-role durations "
+                     "diverge by >1 year — flagged for review.")}
+    else:
+        parsed_dict["experience_discrepancy"] = None
+
+
+def ground_experience_entries(experience, resume_text):
+    """
+    Keep a model-itemized experience entry only if its title or company occurs
+    (whole phrase, whitespace/case-normalized) in an EMPLOYMENT section of the
+    resume. An entry named only under Projects, or nowhere, is not employment and
+    must not influence scoring. Returns {"experience": [...],
+    "ungrounded_experience_entries": [...]}.
+    """
+    emp_text = _norm_ws("\n".join(line for kind, lines in resume_sections(resume_text)
+                                  if kind == "employment" for line in lines))
+
+    def _in_emp(v):
+        v = _norm_ws(v)
+        return bool(v) and re.search(
+            r"(?<![a-z0-9])" + re.escape(v) + r"(?![a-z0-9])", emp_text) is not None
+
+    kept, dropped = [], []
+    for e in (experience or []):
+        (kept if (_in_emp(e.get("title")) or _in_emp(e.get("company"))) else dropped).append(e)
+    return {"experience": kept, "ungrounded_experience_entries": dropped}
 
 
 def _norm_ws(text):
@@ -318,19 +492,34 @@ def _phrase_regex(phrase):
     return re.compile(r"(?<![a-z0-9])" + r"\s+".join(words) + r"(?![a-z0-9])", re.IGNORECASE)
 
 
-def _project_windows(name, resume_text):
-    """The resume text that follows each occurrence of the project's NAME, up to a
-    blank line or _PROJECT_WINDOW_CHARS — i.e. that project's own description."""
+def _project_windows(name, resume_text, other_names=()):
+    """The resume text that follows each occurrence of the project's NAME — i.e.
+    that project's own description. It ends at the first of: a blank line, a
+    recognized section heading (section_heading), a line naming another project,
+    or _PROJECT_WINDOW_CHARS. A resume without blank lines therefore cannot leak
+    the next section's technologies into the project."""
     rx = _phrase_regex(name)
     if rx is None:
         return []
+    others = [r for r in (_phrase_regex(n) for n in other_names
+                          if _norm_ws(n) and _norm_ws(n) != _norm_ws(name)) if r]
     text = str(resume_text or "")
     out = []
     for m in rx.finditer(text):
-        chunk = text[m.start():m.start() + _PROJECT_WINDOW_CHARS]
-        blank = re.search(r"\n\s*\n", chunk)
-        out.append(chunk[:blank.start()] if blank else chunk)
+        lines = text[m.start():m.start() + _PROJECT_WINDOW_CHARS].split("\n")
+        kept = lines[:1]
+        for line in lines[1:]:
+            if (not line.strip() or section_heading(line) is not None
+                    or any(o.search(line) for o in others)):
+                break
+            kept.append(line)
+        out.append("\n".join(kept))
     return out
+
+
+def _section_texts(resume_text):
+    """Whitespace/case-normalized text of each section, headings excluded."""
+    return [_norm_ws("\n".join(lines)) for _kind, lines in resume_sections(resume_text)]
 
 
 def ground_projects(projects, resume_text):
@@ -339,10 +528,11 @@ def ground_projects(projects, resume_text):
     the SAME deterministic grounding as skills: a model-claimed technology is kept
     only if the resume itself affirmatively mentions it IN THAT PROJECT'S CONTEXT —
 
-      * in the model's verbatim evidence quote, when that quote really occurs in
-        the resume (whitespace/case-normalized); or
+      * in the model's verbatim evidence quote, when that quote really occurs
+        within ONE section of the resume (whitespace/case-normalized); or
       * in the text that follows the project's name in the resume (its own
-        description, up to a blank line).
+        description, up to a blank line, the next section heading or the next
+        project's name — see _project_windows).
 
     A project is kept only if its name occurs in the resume or its evidence quote
     is verified; otherwise the whole project is an ungrounded claim. Mentioning a
@@ -355,14 +545,17 @@ def ground_projects(projects, resume_text):
              [{"project": name, "tech": [dropped...], "dropped_project": bool}]}.
     """
     from skills import affirmative_skill_in_text
-    resume_norm = _norm_ws(resume_text)
+    # An evidence quote must lie within ONE section: a quote that runs across a
+    # heading ("... Python Experience Data Engineer ... AWS") is not one project's text.
+    sections = _section_texts(resume_text)
+    all_names = [str(p.get("name") or "").strip() for p in (projects or [])]
     kept, ungrounded = [], []
     for p in (projects or []):
         name = str(p.get("name") or "").strip()
         tech = [str(t).strip() for t in (p.get("tech") or []) if str(t).strip()]
         ev = str(p.get("evidence") or "").strip()
-        ev_ok = bool(ev) and _norm_ws(ev) in resume_norm
-        contexts = ([ev] if ev_ok else []) + _project_windows(name, resume_text)
+        ev_ok = bool(ev) and any(_norm_ws(ev) in sec for sec in sections)
+        contexts = ([ev] if ev_ok else []) + _project_windows(name, resume_text, all_names)
         if not contexts:
             ungrounded.append({"project": name, "tech": tech, "dropped_project": True})
             continue
@@ -528,8 +721,13 @@ RULES:
     # the same anti-hallucination rule as skills. Education is grounded too.
     project_grounding = ground_projects(normalized["projects"], resume_text)
     education_grounding = ground_education(normalized["education"], resume_text)
+    # Itemized experience entries are kept only when an EMPLOYMENT section of the
+    # resume names their title or company (a fabricated or project-only "role" is
+    # dropped and recorded, never scored as professional experience).
+    experience_grounding = ground_experience_entries(normalized["experience"], resume_text)
     normalized["projects"] = project_grounding["projects"]
     normalized["education"] = education_grounding["education"]
+    normalized["experience"] = experience_grounding["experience"]
 
     # --- Schema validation (core fields) ----------------------------------
     try:
@@ -541,12 +739,15 @@ RULES:
 
     # --- Cross-check stated vs summed experience (adds audit metadata) ----
     validated = _reconcile_experience(validated)
-    # --- Ground the stated total against the resume text (clamp, never raise) --
+    # --- Ground the stated total against the resume text: clamp to the evidence;
+    #     a stated 0 is corrected UP only to the verified employment total ------
     validated = ground_years_experience(validated, resume_text)
 
     # --- Deterministic grounding of the parsed skills ----------------------
     validated.update(ground_skills(skills, parsed.get("skill_evidence"), resume_text))
     validated["ungrounded_project_claims"] = project_grounding["ungrounded_project_claims"]
     validated["ungrounded_education"] = education_grounding["ungrounded_education"]
+    validated["ungrounded_experience_entries"] = experience_grounding[
+        "ungrounded_experience_entries"]
 
     return validated

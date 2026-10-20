@@ -58,7 +58,8 @@ def test_parse_resume_end_to_end_with_mocked_llm(monkeypatch):
         '```'
     )
     monkeypatch.setattr(parsermod, "logged_llm_call", lambda *a, **k: mock_json)
-    resume = ("Engineer at Acme, Senior Eng at Beta. BS CS, MIT, 2019. Skills: Python, SQL.\n"
+    resume = ("Experience\nEngineer at Acme, Senior Eng at Beta. BS CS, MIT, 2019. "
+              "Skills: Python, SQL.\n"
               "AgentOps: monitoring service built with Python and FastAPI.")
     result = parsermod.parse_resume(resume, run_id=1, step_id=1)
     assert isinstance(result, dict)                        # NOT None — the regression

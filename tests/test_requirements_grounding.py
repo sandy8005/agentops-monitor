@@ -52,7 +52,9 @@ def test_extract_requirements_grounds_model_output(monkeypatch):
     monkeypatch.setattr(job_parser, "logged_llm_call", lambda *a, **k: json.dumps(model))
     out = job_parser.extract_requirements(JOB, run_id=1, step_id=1)
     assert out["required_skills"] == ["Python"]
-    assert out["min_years_experience"] == 2.0
+    # JOB states no years minimum, so the model's 2 is not grounded (backlog C)
+    assert out["min_years_experience"] == 0.0
+    assert out["ungrounded_min_years"] == {"stated": 2.0, "reason": "not_in_posting"}
     assert out["ungrounded_requirements"] == [{"field": "required_skills", "skill": "Scala"}]
 
 
@@ -70,3 +72,52 @@ def test_invented_requirement_no_longer_causes_false_skip(monkeypatch):
 def test_rules_fallback_has_same_shape():
     out = extract_requirements_rule_based(JOB)
     assert out["ungrounded_requirements"] == []
+
+
+# --- Backlog C: the model's min_years_experience must be stated by the posting ---
+
+def test_invented_min_years_is_unknown_counterexample():
+    job = {"title": "Backend Engineer", "description": "We need Python and SQL."}
+    out = ground_requirements(_reqs(required_skills=["Python"], min_years_experience=20), job)
+    assert out["min_years_experience"] == 0.0
+    assert out["ungrounded_min_years"] == {"stated": 20.0, "reason": "not_in_posting"}
+
+
+def test_invented_min_years_no_longer_lowers_a_qualified_score(monkeypatch):
+    job = {"title": "Backend Engineer", "description": "We need Python and SQL."}
+    model = _reqs(required_skills=["Python"], min_years_experience=20)
+    monkeypatch.setattr(job_parser, "logged_llm_call", lambda *a, **k: json.dumps(model))
+    grounded = job_parser.extract_requirements(job, run_id=1, step_id=1)
+    parsed = {"skills": ["Python"], "years_experience": 5, "education": [], "projects": [],
+              "experience": []}
+    resume = "Skills: Python"
+    assert calculate_match_score(parsed, model, resume)["score"] < 100.0
+    assert calculate_match_score(parsed, grounded, resume)["score"] == 100.0
+
+
+def test_stated_min_years_is_kept():
+    for desc in ("5+ years of experience with Python required.",
+                 "Requires 5 yrs of professional experience.",
+                 "You have 5-8 years building backends."):
+        out = ground_requirements(_reqs(min_years_experience=5),
+                                  {"title": "Dev", "description": desc})
+        assert out["min_years_experience"] == 5.0, desc
+        assert out["ungrounded_min_years"] is None
+
+
+def test_non_requirement_year_mentions_do_not_ground():
+    for desc, n in (("Founded 20 years ago, we build Python tools.", 20),
+                    ("7 years of experience preferred.", 7),
+                    ("10 years for the manager track; Python developers welcome.", 10)):
+        out = ground_requirements(_reqs(min_years_experience=n),
+                                  {"title": "Dev", "description": desc})
+        assert out["min_years_experience"] == 0.0, desc
+        assert out["ungrounded_min_years"]["reason"] == "not_in_posting"
+
+
+def test_range_upper_bound_is_lowered_to_the_stated_minimum():
+    out = ground_requirements(_reqs(min_years_experience=5),
+                              {"title": "Dev", "description": "3-5 years of experience."})
+    assert out["min_years_experience"] == 3.0
+    assert out["ungrounded_min_years"] == {"stated": 5.0, "reason": "range_upper_bound",
+                                           "used": 3.0}

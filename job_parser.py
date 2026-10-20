@@ -40,7 +40,43 @@ def ground_requirements(reqs, job):
             groups.append(kept)
     out["required_any_of"] = groups
     out["ungrounded_requirements"] = dropped
-    return out
+    out.update(_ground_min_years(reqs.get("min_years_experience"), job))
+    # Grounded by MEANING too: a requirement the posting negates, or whose label
+    # the posting contradicts, becomes uncertain (recorded, flagged for review by
+    # the router, and kept out of the deterministic score).
+    from rule_requirements import classify_requirements
+    return classify_requirements(out, job)
+
+
+def _ground_min_years(stated, job):
+    """
+    The model's min_years_experience is accepted only when the posting states it:
+    it must equal the minimum of an "N years" requirement mention, judged per
+    sentence by the rules extractor (rule_requirements.years_requirement_mentions:
+    company age, "years ago", preferred and conditional mentions do not count).
+
+      * the upper end of a stated range ("3-5 years", model says 5) is lowered to
+        the range's minimum (3) — reason "range_upper_bound";
+      * anything else unsupported becomes 0 (= no stated minimum, the experience
+        category is absent) — reason "not_in_posting".
+
+    Returns {"min_years_experience", "ungrounded_min_years"} (None when grounded).
+    """
+    from rule_requirements import years_requirement_mentions
+    v = float(stated or 0.0)
+    if v <= 0:
+        return {"min_years_experience": v, "ungrounded_min_years": None}
+    text = f"{job.get('title') or ''}\n{job.get('description') or ''}".lower()
+    mentions = years_requirement_mentions(text)
+    if any(abs(v - lo) < 1e-9 for lo, _hi, _o in mentions):
+        return {"min_years_experience": v, "ungrounded_min_years": None}
+    lows = [lo for lo, hi, _o in mentions if hi != lo and abs(v - hi) < 1e-9]
+    if lows:
+        return {"min_years_experience": min(lows),
+                "ungrounded_min_years": {"stated": v, "reason": "range_upper_bound",
+                                         "used": min(lows)}}
+    return {"min_years_experience": 0.0,
+            "ungrounded_min_years": {"stated": v, "reason": "not_in_posting"}}
 
 
 def extract_requirements(job, run_id, step_id, budget=None):

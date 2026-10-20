@@ -34,6 +34,13 @@ _FAMILY_EQUIVALENTS = {
     "scientist": {"scientist", "researcher"},
     "researcher": {"researcher", "scientist"},
 }
+_RESEARCH_FAMILIES = {"scientist", "researcher"}
+# Title words that do not name a scientific FIELD ("Research Scientist II",
+# "Applied Scientist", "Scientists").
+_GENERIC_RESEARCH_TITLE_WORDS = {
+    "research", "applied", "scientists", "researchers", "postdoctoral", "postdoc",
+    "fellow", "iv", "v", "sr", "jr", "mid", "level", "remote", "hybrid", "onsite",
+}
 
 
 STALE_AFTER_DAYS = 14   # jobs not seen in this many days drop out of search
@@ -182,6 +189,14 @@ def _role_matcher(target_role):
             return t in haystack_lower
         return t in haystack_tokens        # single word: WHOLE-WORD (token) match
 
+    # Scientist / researcher titles name a FIELD ("Soil Scientist", "Clinical
+    # Researcher"), so for these families an incidental mention of the
+    # specialization in the description ("we use machine learning tools") is not
+    # enough: the specialization must be in the TITLE, or the title must be a
+    # generic research title with no other field ("Research Scientist",
+    # "Senior Scientist") whose description names the specialization.
+    research_family = any(f in _RESEARCH_FAMILIES for f in families)
+
     def matches(job):
         title_lower = str(job.get("title") or "").lower()
         haystack_lower = f"{title_lower} {job.get('description') or ''}".lower()
@@ -190,7 +205,16 @@ def _role_matcher(target_role):
             return False
         if title_family_words:
             title_tokens = set(re.findall(r"[a-z0-9\+\#\.]+", title_lower))
-            return bool(title_tokens & title_family_words)
+            if not title_tokens & title_family_words:
+                return False
+            if research_family:
+                if any(_term_present(t, title_lower, title_tokens) for t in terms):
+                    return True
+                # the title HEAD only: "Research Scientist - London (Remote)"
+                head = re.split(r"\s[-–—|]\s|[(,|/]", title_lower)[0]
+                other = {w for w in re.findall(r"[a-z]+", head)
+                         if w not in GENERIC_ROLE_WORDS and w not in _GENERIC_RESEARCH_TITLE_WORDS}
+                return not other
         return True
 
     return matches

@@ -204,7 +204,22 @@ provenance; a rules fallback is used only when the *model* is degraded — datab
 and programming errors fail visibly; every model-extracted required/preferred skill
 and any-of member must appear in the posting's title or description — whole-word,
 alias-aware, the scorer's own matching — or it is dropped and recorded in
-`ungrounded_requirements`, so an invented requirement cannot cause a false Skip)
+`ungrounded_requirements`, so an invented requirement cannot cause a false Skip;
+each kept skill's *label* is then checked against the posting's wording around its
+mentions — clause, then sentence, then the posting section it sits under
+("Requirements:" / "Nice to have:") — as required, preferred, negated or
+context-only. A skill the posting negates ("Python is not required", "no prior
+Kubernetes experience") or whose label it contradicts (labeled required but only
+"nice to have", or the reverse) becomes **uncertain**: it is removed from the
+score, recorded in `uncertain_requirements`, and the job is flagged for review
+(`uncertain_requirements`). A skill mentioned with no signal at all keeps the
+model's label, recorded as `context_only` in `requirement_classification`. The
+rules fallback applies the negation check only. The model's
+`min_years_experience` must equal the minimum of an "N years"/"N yrs" requirement
+in the posting, judged per sentence by the rules extractor (company age, "years
+ago", preferred and conditional mentions do not count); the upper end of a range
+is lowered to its minimum, and anything else unsupported becomes 0 (no stated
+minimum), recorded in `ungrounded_min_years`)
 → deterministic **match score** → **judge**
 (LLM Apply/Maybe/Skip, only in the uncertain 20–80 band) → optional **evaluator** →
 if flagged for any reason, the run **pauses for human review**. `rank_jobs` sorts by
@@ -335,7 +350,11 @@ must appear in the title or description **and** the family in the **title**
 So "AI Engineer" no longer admits "AI Product Manager", "Technical Recruiter — AI
 Engineering" or a product-manager posting that mentions "AI engineers", and "ML
 Scientist" admits "Research Scientist, Machine Learning" but not "Soil Scientist" —
-before any evaluation is spent on them.
+before any evaluation is spent on them. Because scientist/researcher titles name a
+field, for those families the specialization must be in the **title**, or the title
+must be a generic research title with no other field ("Research Scientist",
+"Senior Scientist – London") whose description names it: "Soil Scientist" with "we
+use machine learning tools" in the description is rejected.
 
 **Work mode is a strict constraint.** A remote search returns remote postings,
 onsite returns onsite, hybrid returns hybrid. "Remote (or onsite) preferred, hybrid
@@ -381,7 +400,7 @@ category's weight is redistributed proportionally over the ones that apply:
 |---|---|
 | required (50) | the job lists required skills or any-of groups (a group is one unit) |
 | preferred (20) | the job lists preferred skills |
-| projects (15) | there are required skills to look for in the candidate's (grounded) project tech, and the candidate has projects — or no professional experience to stand in for them. With professional experience, project evidence counts only when it raises the total, so adding a truthful project can never lower a score |
+| projects (15) | there are required skills to look for in the candidate's (grounded) project tech, and the candidate has projects — or no professional experience to stand in for them. Professional experience means at least one *verified employment record* or an explicit "N years of experience" statement; the model's itemized experience entries never count by themselves. With professional experience, project evidence counts only when it raises the total, so adding a truthful project can never lower a score |
 | experience (15) | the job states an explicit minimum (`min_years > 0`); with no minimum there is no requirement to meet, so no points are awarded for it |
 
 A posting that lists only preferred skills is therefore scored on them alone (a full
@@ -395,20 +414,42 @@ Each score reports `scored_categories` and the real per-category maximum
 **Parsed-resume grounding.** The model's resume parse is checked against the resume
 text before anything is scored. Skills need verbatim evidence or an affirmative
 mention; **project technologies** are kept only when that project's own text — a
-verified verbatim evidence quote, or the description following the project's name —
-affirmatively mentions them (a skill listed elsewhere in the resume is not evidence
-that a given project used it; "no Kubernetes" or "learning Rust" grounds nothing);
-a project whose name and evidence are not in the resume is dropped. Education is
-kept only when its institution or degree appears in the resume. **Total years of
-experience** is accepted only up to what the resume supports: the larger of an
-explicit statement ("5 years of experience") and the *union* of employment date
-ranges ("Jan 2020 – Mar 2022", "2021 – Present"; overlapping roles count once;
-ranges under an education-type heading or on a degree line are ignored), with 0.5
-years of slack. A higher model figure is clamped to that ceiling
+verified verbatim evidence quote lying within one resume section, or the
+description following the project's name up to a blank line, the next section
+heading or the next project's name — affirmatively mentions them (a skill listed
+elsewhere in the resume is not evidence that a given project used it; "no
+Kubernetes" or "learning Rust" grounds nothing); a project whose name and evidence
+are not in the resume is dropped. Education is kept only when its institution or
+degree appears in the resume.
+
+**Verified employment records.** The resume is split into sections by recognized
+headings (experience/employment/work history/internships; projects; education,
+research, teaching; volunteer; skills, summary and other). A *verified employment
+record* is a date range ("Jan 2020 – Mar 2022", "03/2021 – Present", "2019 – 2021")
+on a line under an **experience/employment heading**, with a title or company on
+the same line or the entry line above it (degree lines are skipped). Project,
+academic, volunteer and unsectioned dates are recorded separately
+(`years_experience_evidence.non_employment_ranges`) and never count as
+employment. Itemized experience entries from the model are kept only when an
+employment section names their title or company; the rest are dropped
+(`ungrounded_experience_entries`).
+
+**Total years of experience** is accepted only up to what the resume supports: the
+larger of an explicit statement ("5 years of experience") and the *union* of the
+verified employment records (overlapping roles count once), with 0.5 years of
+slack. A higher model figure is clamped to that ceiling
 (`experience_basis = resume_evidence_cap`); with no evidence at all it becomes
 *unknown* (the experience category is then absent and Apply is capped, as for the
-rules parser). Everything dropped is recorded (`ungrounded_skills`,
-`ungrounded_project_claims`, `ungrounded_education`, `ungrounded_experience`).
+rules parser). A stated 0 (or missing) total while verified records prove a
+positive one is corrected up to the records' total — never above it — and recorded
+in `experience_corrected`. Everything dropped is recorded (`ungrounded_skills`,
+`ungrounded_project_claims`, `ungrounded_education`, `ungrounded_experience`,
+`ungrounded_experience_entries`).
+
+**Numbers from the model** must be finite: `inf`, `-inf` and `NaN` (including JSON
+`1e999`, which parses to infinity, and the strings "inf"/"Infinity"/"nan") are
+rejected as unusable model output, and every years figure (total, per role, a job's
+minimum) is bounded at 60 (`schemas.MAX_YEARS`).
 
 Before relying on them, build a labeled benchmark (500–1,000 resume/job pairs with
 human labels across role categories, seniority, location/work-authorization cases and

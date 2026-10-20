@@ -39,11 +39,15 @@ def _state(evaluate=False):
     return s
 
 
-def _wire(mp, *, score_decision, llm_decision, flag_injection=False, halluc=False):
+def _wire(mp, *, score_decision, llm_decision, flag_injection=False, halluc=False,
+          uncertain=False):
     mp.setattr(router, "_reqs_cache_get", lambda dhash: (None, None))  # force extraction
 
     reqs = {"required_skills": ["python"], "required_any_of": [],
             "preferred_skills": [], "min_years_experience": 3}
+    if uncertain:   # job_parser.ground_requirements kept a negated requirement out
+        reqs["uncertain_requirements"] = [{"field": "required_skills", "skill": "scala",
+                                           "reason": "negated"}]
 
     def fake_extract(job, run_id, step_id, budget=None):
         if flag_injection:  # simulate job_parser's prompt-injection detection
@@ -112,3 +116,13 @@ def test_multiple_reasons_pause(monkeypatch):
     s = _run_job(monkeypatch, _run(uid), score_decision="Apply", llm_decision="Skip",
                  flag_injection=True)
     assert s.last_job_needs_review is True
+
+
+def test_uncertain_requirement_pauses(monkeypatch):
+    # Backlog B: score and judge agree, but a requirement was negated / contradicted
+    # by the posting and kept out of the score; a human must look.
+    uid = create_user("h6_" + uuid.uuid4().hex[:8], "password-1234")
+    s = _run_job(monkeypatch, _run(uid), score_decision="Apply", llm_decision="Apply",
+                 uncertain=True)
+    assert s.last_job_needs_review is True
+    assert "uncertain_requirements" in (s.last_review_info["review_reason"] or "")

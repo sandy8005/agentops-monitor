@@ -46,7 +46,8 @@ def _skill_in(skill, text_lower, tokens):
     return s in tokens
 
 
-_YEARS_RE = re.compile(r"(\d{1,2})\s*(?:\+|plus)?\s*(?:(?:-|–|to)\s*\d{1,2}\s*)?years?\b")
+_YEARS_RE = re.compile(
+    r"(\d{1,2})\s*(?:\+|plus)?\s*(?:(?:-|–|to)\s*(\d{1,2})\s*)?(?:years?|yrs?)\b")
 # Sentence-level context that makes a "N years" mention NOT a minimum requirement.
 _YEARS_NOT_REQUIRED = re.compile(
     r"\b(preferred|nice to have|nice-to-have|bonus|a plus|is a plus|ideally|desirable|"
@@ -102,8 +103,20 @@ def _years_from_text(text_lower):
     This cannot build required_any_of groups or read structure; the extraction is
     tagged requirements_method=rule_based wherever it is used, and matches that
     rest only on it can be excluded (require_verified_matches)."""
-    found, overall = [], []
-    for sentence in re.split(r"(?<=[.;!?\n])\s+|\n+|•|\u2022", text_lower):
+    mentions = years_requirement_mentions(text_lower)
+    overall = [lo for lo, _hi, is_overall in mentions if is_overall]
+    if overall:
+        return min(overall)
+    return min(lo for lo, _hi, _o in mentions) if mentions else 0.0
+
+
+def years_requirement_mentions(text_lower):
+    """[(low, high, is_overall)] for every "N years" / "N yrs" mention that states a
+    years REQUIREMENT, judged per sentence exactly as _years_from_text describes
+    (preferred, conditional and non-experience sentences are skipped). `high` is
+    the upper end of a range ("3-5 years" -> (3.0, 5.0)), else equal to `low`."""
+    out = []
+    for sentence in re.split(r"(?<=[.;!?\n])\s+|\n+|•", text_lower):
         for m in _YEARS_RE.finditer(sentence):
             n = int(m.group(1))
             if not 0 < n <= 30:
@@ -111,12 +124,176 @@ def _years_from_text(text_lower):
             if (_YEARS_NOT_REQUIRED.search(sentence) or _YEARS_CONDITIONAL.search(sentence)
                     or _YEARS_NOT_EXPERIENCE.search(sentence)):
                 continue
-            found.append(float(n))
-            if _YEARS_OVERALL.search(_clause_around(sentence, m.start(), m.end())):
-                overall.append(float(n))
-    if overall:
-        return min(overall)
-    return min(found) if found else 0.0
+            hi = int(m.group(2)) if m.group(2) else n
+            is_overall = bool(_YEARS_OVERALL.search(_clause_around(sentence, m.start(), m.end())))
+            out.append((float(n), float(max(hi, n)), is_overall))
+    return out
+
+
+# --- Requirement classification from the posting's own wording (backlog B) ----
+# A skill's label (required / preferred) must be supported by what the posting
+# says AROUND its mentions. Each mention is classified, most specific first:
+#   negated     "Python is not required", "no prior Kubernetes experience"
+#   preferred   a preferred signal in its clause, else its sentence
+#   required    a required signal in its clause, else its sentence
+#   <heading>   otherwise the context of the posting section it sits under
+#               ("Requirements:" / "Nice to have:")
+#   context     a bare mention ("our team uses Python")
+_SENTENCE_END_RE = re.compile(r"[.!?](?=\s|$)|[;\n•|]")
+_CLAUSE_END_RE = re.compile(r"[,:]|\b(?:but|while|whereas|however|although)\b")
+_PREF_SIGNAL_RE = re.compile(
+    r"\b(?:preferred|prefer|nice[\s-]to[\s-]haves?|good[\s-]to[\s-]have|bonus|a plus|"
+    r"pluses|desirable|desired|advantageous|ideally|optional|would be (?:great|nice))\b")
+_REQ_SIGNAL_RE = re.compile(
+    r"\b(?:required|requires?|requirements?|must|must[\s-]haves?|mandatory|essential|"
+    r"needed|needs?|qualifications|you have|you bring|you will need|you'll need|"
+    r"proficien(?:t|cy)|strong|solid|expert(?:ise)?|hands-on|demonstrated|"
+    r"experience (?:with|in|using))\b")
+# Negation AFTER the mention, within its own clause: "Python is not required".
+_POST_NEG_RE = re.compile(
+    r"(?:\bnot\b|n't\b|\bnever\b)\s+(?:\w+\s+){0,2}?(?:required|needed|necessary|"
+    r"mandatory|essential|expected|a\s+(?:requirement|must|prerequisite))\b")
+_POST_STOP_RE = re.compile(r"[,.;:!?\n•|]|\b(?:and|but|or|while|whereas)\b")
+# A posting section label: "Nice to have:", "Requirements", "What you'll bring:".
+_SECTION_LABEL_RE = re.compile(r"^\s*[-*#•]*\s*([^:\n]{1,60}?)\s*:\s*(\S.*)?$")
+_BARE_LABEL_RE = re.compile(
+    r"(?:(?:minimum|basic|preferred|required|desired|additional)\s+)?"
+    r"(?:qualifications|requirements|skills)|nice[\s-]to[\s-]haves?|bonus(?:\s+points)?|"
+    r"must[\s-]haves?|responsibilities|what you(?:'ll| will) (?:do|bring|need)|benefits|"
+    r"about (?:us|the role)")
+
+
+def _label_context(label):
+    if _PREF_SIGNAL_RE.search(label):
+        return "preferred"
+    if _REQ_SIGNAL_RE.search(label) or re.search(r"\b(skills|what you)\b", label):
+        return "required"
+    return "context"
+
+
+def _line_contexts(text_lower):
+    """[(line_start, context)] — the section context in force on each line."""
+    out, ctx, pos = [], None, 0
+    for line in text_lower.split("\n"):
+        stripped = line.strip(" \t-*#•")
+        m = _SECTION_LABEL_RE.match(line)
+        if m and len(m.group(1).split()) <= 6:
+            ctx = _label_context(m.group(1))
+        elif stripped and len(stripped.split()) <= 5 and _BARE_LABEL_RE.fullmatch(stripped):
+            ctx = _label_context(stripped)
+        out.append((pos, ctx))
+        pos += len(line) + 1
+    return out
+
+
+def _span(text, start, end, end_re, lo=0, hi=None):
+    hi = len(text) if hi is None else hi
+    s = lo
+    for m in end_re.finditer(text, lo, start):
+        s = m.end()
+    e = end_re.search(text, end, hi)
+    return s, (e.start() if e else hi)
+
+
+# Negation BEFORE the mention, at most three words earlier in the same clause
+# (a colon does not end it: "Not required: Java"): "no prior Kubernetes",
+# "without Python", "don't need Go". Unlike resume negation, "zero"/"none"/"lack"
+# are not cues here ("zero-downtime deploys with Kubernetes" requires Kubernetes).
+_PRE_NEG_RE = re.compile(r"(?:\bno|\bnot|\bwithout|\bnever|n't)(?:\W+\w+){0,3}\W*$")
+_PRE_CLAUSE_END_RE = re.compile(r"[.!?](?=\s|$)|[;,\n•|]|\b(?:but|however|while|whereas)\b")
+
+
+def _mention_class(low, start, end, contexts):
+    p0, _p1 = _span(low, start, end, _PRE_CLAUSE_END_RE)
+    if _PRE_NEG_RE.search(low[p0:start]):
+        return "negated"
+    post = low[end:end + 60]
+    stop = _POST_STOP_RE.search(post)
+    if _POST_NEG_RE.search(post[:stop.start()] if stop else post):
+        return "negated"
+    s0, s1 = _span(low, start, end, _SENTENCE_END_RE)
+    c0, c1 = _span(low, start, end, _CLAUSE_END_RE, s0, s1)
+    for span in (low[c0:c1], low[s0:s1]):
+        if _PREF_SIGNAL_RE.search(span):
+            return "preferred"
+        if _REQ_SIGNAL_RE.search(span):
+            return "required"
+    ctx = None
+    for line_start, line_ctx in contexts:
+        if line_start > start:
+            break
+        ctx = line_ctx
+    return ctx or "context"
+
+
+def mention_classes(skill, text):
+    """The set of classes of every mention of `skill` (alias-aware, whole word)."""
+    from skills import _allowed_variants, _variant_regex
+    low = str(text or "").lower()
+    contexts = _line_contexts(low)
+    classes = set()
+    for v in _allowed_variants(skill):
+        for m in _variant_regex(v).finditer(low):
+            classes.add(_mention_class(low, m.start(), m.end(), contexts))
+    return classes
+
+
+def classify_requirements(reqs, job, negation_only=False):
+    """
+    Verify each required / preferred / any-of skill's LABEL against the posting.
+
+    A skill becomes UNCERTAIN — removed from the scored lists and recorded in
+    `uncertain_requirements` as {"field", "skill", "reason"} — when:
+      * any of its mentions is negated                    (reason "negated");
+      * it is labeled required but the posting only marks it preferred
+                                                          ("classified_preferred");
+      * it is labeled preferred but the posting only marks it required
+                                                          ("classified_required").
+    With negation_only=True (the degraded rules extractor, whose labels are a
+    keyword heuristic) only the negation check applies. A skill whose mentions
+    carry no signal at all keeps its label, recorded as "context_only" in
+    `requirement_classification`. An any-of group left with no members is dropped.
+    Returns a NEW dict.
+    """
+    text = f"{job.get('title') or ''}\n{job.get('description') or ''}"
+    out = dict(reqs)
+    uncertain = list(reqs.get("uncertain_requirements") or [])
+    classified = []
+
+    def _check(field, label, skills):
+        kept = []
+        for s in skills or []:
+            classes = mention_classes(s, text)
+            reason = None
+            if "negated" in classes:
+                reason = "negated"
+            elif not negation_only and label == "required" \
+                    and "preferred" in classes and "required" not in classes:
+                reason = "classified_preferred"
+            elif not negation_only and label == "preferred" \
+                    and "required" in classes and "preferred" not in classes:
+                reason = "classified_required"
+            if reason:
+                uncertain.append({"field": field, "skill": s, "reason": reason})
+                continue
+            kept.append(s)
+            classified.append({"field": field, "skill": s,
+                               "classification": label if label in classes
+                               else "context_only"})
+        return kept
+
+    out["required_skills"] = _check("required_skills", "required", reqs.get("required_skills"))
+    out["preferred_skills"] = _check("preferred_skills", "preferred",
+                                     reqs.get("preferred_skills"))
+    groups = []
+    for g in reqs.get("required_any_of") or []:
+        kept = _check("required_any_of", "required", g)
+        if kept:
+            groups.append(kept)
+    out["required_any_of"] = groups
+    out["uncertain_requirements"] = uncertain
+    out["requirement_classification"] = classified
+    return out
 
 
 def extract_requirements_rule_based(job):
@@ -152,7 +329,7 @@ def extract_requirements_rule_based(job):
                 seen.add(x); out.append(x)
         return out
 
-    return {
+    out = {
         "required_skills": _uniq(required),
         "required_any_of": [],
         "preferred_skills": _uniq(preferred),
@@ -161,7 +338,12 @@ def extract_requirements_rule_based(job):
         # Every skill above was FOUND in the posting text, so nothing is ungrounded;
         # same shape as the grounded LLM extraction (job_parser.ground_requirements).
         "ungrounded_requirements": [],
+        # min_years_experience above is read from the posting itself.
+        "ungrounded_min_years": None,
         # Provenance travels WITH the data, so downstream evaluation can always tell
         # a crude keyword extraction from an LLM extraction.
         "extraction_method": "rule_based",
     }
+    # A negated mention ("Python is not required") is never a requirement, here
+    # either; the keyword labels themselves are too crude to cross-check.
+    return classify_requirements(out, job, negation_only=True)

@@ -17,9 +17,9 @@ stored on each row so you can query/prune by version.
 """
 from settings import settings
 
-PARSER_VERSION = "5"   # bumped: years_experience grounded against the resume (explicit statement / date-range union)
-REQS_VERSION = "4"   # bumped: extracted skills grounded against the posting (ungrounded_requirements)
-SCHEMA_VERSION = "1"
+PARSER_VERSION = "6"   # bumped: verified employment records (only experience-section dates count), experience entries grounded, stated 0 corrected, project windows end at headings
+REQS_VERSION = "5"   # bumped: requirement labels verified (uncertain_requirements), min_years_experience grounded
+SCHEMA_VERSION = "2"   # bumped: non-finite numbers rejected, years bounded at MAX_YEARS (60)
 
 
 def model_version():

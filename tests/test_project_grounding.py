@@ -121,3 +121,36 @@ def test_education_grounding_still_matches_punctuated_degrees():
                              "year": "2021"}], resume)
     assert out["education"][0] == {"degree": "M.S. Computer Science",
                                    "institution": "Example Tech", "year": "2021"}
+
+
+# --- Backlog E: a project's evidence window ends at the next section heading ----
+# or the next project entry, not only at a blank line or a character count.
+
+NO_BLANKS = ("Projects\n"
+             "ML Dashboard — built using Python\n"
+             "Experience\n"
+             "Data Engineer — worked with AWS and Docker\n")
+
+
+def test_project_window_stops_at_next_section_heading():
+    out = ground_projects([{"name": "ML Dashboard", "tech": ["Python", "AWS", "Docker"],
+                            "evidence": ""}], NO_BLANKS)
+    assert out["projects"] == [{"name": "ML Dashboard", "tech": ["Python"]}]
+    assert out["ungrounded_project_claims"] == [
+        {"project": "ML Dashboard", "tech": ["AWS", "Docker"], "dropped_project": False}]
+
+
+def test_project_window_stops_at_next_project_entry():
+    text = ("Projects\nChat Bot - Python service\n  - deployed with Docker\n"
+            "Price Tracker - built with Go\n")
+    out = ground_projects([{"name": "Chat Bot", "tech": ["Python", "Docker", "Go"], "evidence": ""},
+                           {"name": "Price Tracker", "tech": ["Go"], "evidence": ""}], text)
+    assert out["projects"] == [{"name": "Chat Bot", "tech": ["Python", "Docker"]},
+                               {"name": "Price Tracker", "tech": ["Go"]}]
+
+
+def test_evidence_quote_crossing_a_section_heading_does_not_ground():
+    ev = "ML Dashboard — built using Python Experience Data Engineer — worked with AWS"
+    out = ground_projects([{"name": "Dashboard tool", "tech": ["Python", "AWS"], "evidence": ev}],
+                          NO_BLANKS)
+    assert out["projects"] == []          # the only verified context would span sections

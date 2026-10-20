@@ -126,9 +126,15 @@ def extract_projects(text):
 
 
 def parse_resume_rules(resume_text):
+    from parser import employment_records
     skills = extract_skills(resume_text)
     years = extract_years(resume_text)
     return {
+        # Verified employment records (dated entries under an experience heading):
+        # the scorer's only evidence of professional experience besides an
+        # explicit statement. They do not change years_experience here.
+        "employment_records": employment_records(resume_text),
+        "years_experience_evidence": {"explicit_statement": years},
         "skills": [s for s, _ in skills],
         "years_experience": years,
         "experience_unknown": years is None,

@@ -1,7 +1,13 @@
+import math
 import re
 from pydantic import BaseModel, field_validator, Field
 from typing import List
 from enum import Enum
+
+# Upper bound for every years figure (a career, a role, a job's minimum). Anything
+# larger is not a plausible fact but a model/serialization error; it is rejected
+# before it can reach the scorer or the database.
+MAX_YEARS = 60
 
 
 def _strict_float(v, field_name="value"):
@@ -11,6 +17,8 @@ def _strict_float(v, field_name="value"):
     - "2 years", "24 months"      -> extracted number (months converted to years)
     - None                        -> raises (caller decides if None is acceptable)
     - "about two", "N/A", "lots"  -> raises ValueError (garbage must NOT become 0.0)
+    - inf, -inf, NaN              -> raises ValueError, including JSON 1e999 (which
+                                     parses to inf) and "inf"/"Infinity"/"nan" strings
 
     The point: recoverable variation is coerced, but genuinely unparseable values
     raise instead of silently becoming 0.0 — hiding bad LLM output as a false fact
@@ -22,7 +30,13 @@ def _strict_float(v, field_name="value"):
     if isinstance(v, bool):
         raise ValueError(f"{field_name}: bool is not a valid number")
     if isinstance(v, (int, float)):
-        return float(v)
+        try:
+            f = float(v)
+        except OverflowError:        # an int too large for a float
+            raise ValueError(f"{field_name}: number out of range") from None
+        if not math.isfinite(f):
+            raise ValueError(f"{field_name}: non-finite number")
+        return f
     if isinstance(v, str):
         s = v.strip().lower()
         m_months = re.fullmatch(r"(\d+(?:\.\d+)?)\s*months?", s)
@@ -54,7 +68,7 @@ class Project(BaseModel):
 class Experience(BaseModel):
     title: str
     company: str
-    years: float = Field(ge=0)   # negative years are impossible
+    years: float = Field(ge=0, le=MAX_YEARS)   # negative years are impossible
 
     @field_validator("years", mode="before")
     @classmethod
@@ -67,7 +81,7 @@ class Experience(BaseModel):
 
 class ParsedResume(BaseModel):
     skills: List[str]
-    years_experience: float = Field(ge=0)   # negative total experience is impossible
+    years_experience: float = Field(ge=0, le=MAX_YEARS)   # negative total is impossible
     education: List[Education]
     projects: List[Project]
     experience: List[Experience]
@@ -84,7 +98,7 @@ class JobRequirements(BaseModel):
     required_skills: List[str]
     required_any_of: List[List[str]] = []
     preferred_skills: List[str]
-    min_years_experience: float = Field(ge=0)
+    min_years_experience: float = Field(ge=0, le=MAX_YEARS)
     responsibilities: List[str]
 
     @field_validator("min_years_experience", mode="before")
