@@ -192,7 +192,7 @@ class FakeStore:
         mp.setattr(agent_store, "record_action_outcome",
                    lambda rid, g, i, st, obs=None, error=None, step_id=None, replayed=False:
                    s.actions[i].update(status=st, observation=obs))
-        mp.setattr(agent_store, "qualified_job_ids", lambda rid, d, verified_only=False: list(s.qualified))
+        mp.setattr(agent_store, "qualified_job_ids", lambda rid, d, verified_only=False, **k: list(s.qualified))
         mp.setattr(agent_store, "unverified_qualified_count", lambda rid, d: 0)
         mp.setattr(agent_store, "advised_job_ids", lambda rid: list(s.advised))
         mp.setattr(agent_store, "create_review_request",

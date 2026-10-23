@@ -387,21 +387,31 @@ _COST_LATERAL_SQL = """
                          WHERE run_id = r.id AND cost_status = 'unknown'), 0)
              + COALESCE((SELECT SUM(amount_usd) FROM llm_cost_reservations
                          WHERE run_id = r.id AND status IN ('abandoned', 'open')), 0)
-                   AS unknown_bound
+                   AS unknown_bound,
+               (SELECT COUNT(*) FROM llm_cost_reservations
+                WHERE run_id = r.id AND status = 'open') AS open_reservations,
+               COALESCE((SELECT SUM(amount_usd) FROM llm_cost_reservations
+                         WHERE run_id = r.id AND status = 'open'), 0) AS open_usd
     ) c ON TRUE"""
 
 
-def _cost_fields(known, unknown_calls, unknown_bound=0.0):
+def _cost_fields(known, unknown_calls, unknown_bound=0.0, open_reservations=0, open_usd=0.0):
     """One cost shape for every endpoint. total_cost is only a number when it is
-    COMPLETE; otherwise the known part, the number of calls with unknown cost and
-    a conservative upper bound are explicit (a bare SUM() of a partly-unknown run
-    would look complete)."""
+    COMPLETE: no call of unknown cost AND no LLM reservation still open (a request
+    may be in flight and billed). Otherwise the known part, the number of calls
+    with unknown cost, the open reservations (provisional_usd = their reserved
+    maximum) and a conservative upper bound (which includes them) are explicit — a
+    bare SUM() of a partly-unknown or in-flight run would look complete."""
     known = float(known or 0)
     unknown_calls = int(unknown_calls or 0)
     bound = float(unknown_bound or 0)
-    complete = unknown_calls == 0
+    open_reservations = int(open_reservations or 0)
+    complete = unknown_calls == 0 and open_reservations == 0
     return {"total_cost": known if complete else None, "known_cost_usd": known,
             "unknown_cost_calls": unknown_calls, "cost_complete": complete,
+            "open_reservations": open_reservations,
+            "provisional_usd": float(open_usd or 0),
+            "cost_provisional": open_reservations > 0,
             "cost_upper_bound_usd": known + bound,
             "cost_basis": "estimated_paid_tier"}
 
@@ -413,7 +423,8 @@ def list_runs(limit: int = Query(20, ge=1, le=100), user: dict = Depends(require
         cur.execute(f"""
             SELECT r.id, r.status, r.started_at, r.total_tokens,
                    r.target_role, r.location, r.work_mode, r.error_code,
-                   COALESCE(c.known, 0), c.unknown_calls, c.unknown_bound
+                   COALESCE(c.known, 0), c.unknown_calls, c.unknown_bound,
+                   c.open_reservations, c.open_usd
             FROM runs r
             {_COST_LATERAL_SQL}
             WHERE r.user_id = %s ORDER BY r.id DESC LIMIT %s
@@ -422,7 +433,7 @@ def list_runs(limit: int = Query(20, ge=1, le=100), user: dict = Depends(require
         return [{"id": r[0], "status": r[1],
                  "started_at": r[2].isoformat() if r[2] else None,
                  "total_tokens": r[3], "target_role": r[4], "location": r[5],
-                 "work_mode": r[6], "error_code": r[7], **_cost_fields(r[8], r[9], r[10])}
+                 "work_mode": r[6], "error_code": r[7], **_cost_fields(*r[8:13])}
                 for r in rows]
 
 
@@ -461,6 +472,9 @@ class StartRunRequest(BaseModel):
     work_mode: WorkMode = ""
     # remote/onsite search: also accept hybrid postings (explicit; default strict)
     allow_hybrid: bool = False
+    # remote search: let postings that state NO work mode count toward the goal
+    # (they are always labeled work_mode_verified=false; default: shown, not counted)
+    accept_unknown_work_mode: bool = False
     employment_type: EmploymentType = ""
     evaluate: bool = False
     # The controller agent is the ONLY execution engine (the fixed "pipeline"
@@ -499,6 +513,8 @@ def _build_agent_goal(body):
             constraints={"location": body.location.strip(), "work_mode": body.work_mode,
                          "allow_hybrid": bool(body.allow_hybrid and body.work_mode
                                               in ("remote", "onsite")),
+                         "accept_unknown_work_mode": bool(body.accept_unknown_work_mode
+                                                          and body.work_mode == "remote"),
                          "employment_type": body.employment_type, "seniority": g.seniority},
             limits={"max_iterations": g.max_iterations, "max_searches": g.max_searches,
                     "max_llm_calls": g.max_llm_calls,
@@ -715,7 +731,8 @@ def get_run(run_id: int, user: dict = Depends(require_auth)):
         run = cur.fetchone()
         if not run:
             raise HTTPException(status_code=404, detail=f"Run {run_id} not found")
-        cur.execute(f"""SELECT COALESCE(c.known, 0), c.unknown_calls, c.unknown_bound
+        cur.execute(f"""SELECT COALESCE(c.known, 0), c.unknown_calls, c.unknown_bound,
+                               c.open_reservations, c.open_usd
                         FROM runs r {_COST_LATERAL_SQL} WHERE r.id = %s""", (run_id,))
         cost_row = cur.fetchone()
 
@@ -937,7 +954,8 @@ def get_run_rankings(run_id: int, user: dict = Depends(require_auth)):
                 "validation_notes": r[8]})
 
         cur.execute("""
-            SELECT rank_position, job_id, title, company, score, final_decision, apply_url
+            SELECT rank_position, job_id, title, company, score, final_decision, apply_url,
+                   work_mode, work_mode_verified
             FROM run_rankings WHERE run_id = %s ORDER BY rank_position
         """, (run_id,))
         rows = cur.fetchall()
@@ -946,7 +964,7 @@ def get_run_rankings(run_id: int, user: dict = Depends(require_auth)):
     for r in rows:
         title_counts[r[2]] = title_counts.get(r[2], 0) + 1
     rankings = []
-    for pos, job_id, title, company, score, final_decision, apply_url in rows:
+    for pos, job_id, title, company, score, final_decision, apply_url, wm, wm_ok in rows:
         advice = advice_by_job.get(job_id) if job_id is not None else None
         if advice is None and job_id is None and title_counts.get(title) == 1 \
                 and len(legacy_by_title.get(title, [])) == 1:
@@ -955,6 +973,9 @@ def get_run_rankings(run_id: int, user: dict = Depends(require_auth)):
             "rank": pos, "job_id": job_id, "title": title, "company": company,
             "score": float(score) if score is not None else None,
             "final_decision": final_decision, "apply_url": _safe_url(apply_url),
+            # false = the posting states no work mode: NOT a confirmed match of the
+            # run's work-mode constraint (null = ranked before labels existed).
+            "work_mode": wm, "work_mode_verified": wm_ok,
             "advice": advice,
             "suggestions": suggestions_by_job.get(job_id, []) if job_id is not None else [],
         })
@@ -1030,8 +1051,11 @@ def get_agent_timeline(run_id: int, user: dict = Depends(require_auth)):
                      "calls_with_unknown_cost": usage["unknown_cost_calls"],
                      "unknown_cost_upper_bound_usd": usage["unknown_cost_bound_usd"],
                      "in_flight_reserved_usd": usage["reserved_open_usd"],
+                     "open_reservations": usage["open_reservations"],
                      "committed_usd": usage["committed_usd"],
                      "limit_usd": ((row[1] or {}).get("limits") or {}).get("max_cost_usd"),
-                     "complete": usage["unknown_cost_calls"] == 0,
+                     # never complete while a reservation is open (in flight)
+                     "complete": (usage["unknown_cost_calls"] == 0
+                                  and usage["open_reservations"] == 0),
                      "basis": "estimated_paid_tier"},
             "actions": actions}

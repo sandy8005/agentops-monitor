@@ -30,7 +30,8 @@ Resumes cannot be un-deleted and an erased resume's text cannot be rewritten.
 install_app_guards() runs in migration 0015; install_checkpoint_guards() runs in
 the same migration when LangGraph's tables already exist and after every
 checkpointing.setup_schema(), so the checkpoint tables are covered on fresh
-databases too. Both are idempotent.
+databases too. install_snapshot_guards() covers tables added later (migration
+0016: evaluation_requirements). All are idempotent.
 """
 
 TOMBSTONE_REASONS = ("resume_erased", "run_deleted", "retention")
@@ -49,6 +50,11 @@ APP_GUARDS = (
     ("agent_action_attempts", "null", ("observation", "error")),
     ("review_requests", "null", ("payload", "comment", "answer")),
     ("resume_suggestions", "skip", ()),
+)
+# Guards for tables created AFTER migration 0015 (installed by the migration that
+# creates the table — 0015 runs install_app_guards() before they exist).
+SNAPSHOT_GUARDS = (
+    ("evaluation_requirements", "null", ("requirements",)),     # migration 0016
 )
 CHECKPOINT_TABLES = ("checkpoints", "checkpoint_blobs", "checkpoint_writes")
 
@@ -142,10 +148,16 @@ _CHECKPOINT_FUNCTION_SQL = r"""
 CREATE OR REPLACE FUNCTION erasure_guard_checkpoint() RETURNS trigger
 LANGUAGE plpgsql AS $$
 BEGIN
-    -- Agent runs use thread_id = str(run_id).
-    IF NEW.thread_id ~ '^[0-9]{1,18}$'
-       AND erasure_is_tombstoned(NEW.thread_id::bigint) THEN
-        RETURN NULL;
+    -- Agent runs use thread_id = str(run_id); any BIGINT id (up to 19 digits).
+    -- Nested IFs: SQL does not promise AND short-circuits, and a 19-digit value
+    -- above 9223372036854775807 must be compared as NUMERIC, never cast to
+    -- BIGINT (that would raise inside the trigger and fail the write).
+    IF NEW.thread_id ~ '^[0-9]{1,19}$' THEN
+        IF NEW.thread_id::numeric <= 9223372036854775807 THEN
+            IF erasure_is_tombstoned(NEW.thread_id::bigint) THEN
+                RETURN NULL;
+            END IF;
+        END IF;
     END IF;
     RETURN NEW;
 END $$;
@@ -191,6 +203,13 @@ def install_app_guards(cur):
                 "FOR EACH ROW EXECUTE FUNCTION erasure_guard_resumes()")
 
 
+def install_snapshot_guards(cur):
+    """Payload guards on the post-0015 tables (SNAPSHOT_GUARDS). Requires
+    install_app_guards() (it creates erasure_guard_payload). Idempotent."""
+    for table, mode, cols in SNAPSHOT_GUARDS:
+        _trigger(cur, table, f"{table}_erasure_guard", "erasure_guard_payload", (mode,) + cols)
+
+
 def install_checkpoint_guards(cur):
     """Triggers on LangGraph's checkpoint tables (only those that exist). Requires
     install_app_guards() to have run (it creates erasure_is_tombstoned)."""
@@ -218,6 +237,7 @@ def missing_guards(cur):
     expected += ["runs_erasure_guard", "job_queue_erasure_guard",
                  "parsed_resume_cache_erasure_guard", "resumes_erasure_guard",
                  "erasure_tombstones_append_only"]
+    expected += [f"{t}_erasure_guard" for t, _m, _c in SNAPSHOT_GUARDS if t in tables]
     expected += [f"{t}_erasure_guard" for t in CHECKPOINT_TABLES if t in tables]
     cur.execute("SELECT tgname FROM pg_trigger WHERE NOT tgisinternal")
     have = {(r["tgname"] if isinstance(r, dict) else r[0]) for r in cur.fetchall()}

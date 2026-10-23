@@ -105,6 +105,9 @@ def _scrub_run_payloads(cur, run_ids):
     cur.execute("UPDATE review_requests SET payload = NULL, comment = NULL, answer = NULL "
                 "WHERE run_id = ANY(%s)", (run_ids,))
     cur.execute("DELETE FROM resume_suggestions WHERE run_id = ANY(%s)", (run_ids,))
+    # Requirements snapshots (migration 0016) quote job-posting content.
+    cur.execute("UPDATE evaluation_requirements SET requirements = NULL "
+                "WHERE run_id = ANY(%s)", (run_ids,))
     threads = [str(r) for r in run_ids]
     for t in _existing_checkpoint_tables(cur):
         cur.execute(f"DELETE FROM {t} WHERE thread_id = ANY(%s)", (threads,))
@@ -173,7 +176,7 @@ def delete_run(run_id, user_id):
         _scrub_run_payloads(cur, [run_id])       # checkpoints live outside the FK graph
         for table in ("evaluations", "llm_calls", "tool_calls", "run_rankings", "run_advice",
                       "agent_action_attempts", "agent_actions", "agent_searches", "review_requests",
-                      "resume_suggestions"):
+                      "resume_suggestions", "evaluation_requirements"):
             cur.execute(f"DELETE FROM {table} WHERE run_id = %s", (run_id,))
         cur.execute("DELETE FROM steps WHERE run_id = %s", (run_id,))
         cur.execute("DELETE FROM job_searches WHERE run_id = %s", (run_id,))  # results cascade

@@ -110,19 +110,76 @@ def _years_from_text(text_lower):
     return min(lo for lo, _hi, _o in mentions) if mentions else 0.0
 
 
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.;!?\n])\s+|\n+|•")
+# An explicit "this is required" marker inside a mention's own clause.
+_YEARS_REQUIRED_CLAUSE = re.compile(
+    r"\b(required|requires?|requirement|must|mandatory|essential|minimum|at least|needed)\b")
+
+
+_YEARS_CONJUNCTION = re.compile(r"\b(?:and|but|while|whereas|however|although)\b")
+
+
+def _sentences_with_offsets(text):
+    pos = 0
+    for m in _SENTENCE_SPLIT_RE.finditer(text):
+        yield pos, text[pos:m.start()]
+        pos = m.end()
+    yield pos, text[pos:]
+
+
+def _years_mention_is_preferred(sentence, start, end, section):
+    """Classify ONE "N years" mention by its own clause first (backlog C), so
+    "3+ years Python required, while 5+ years Java preferred" keeps the 3:
+      * a preferred signal in its clause            -> preferred (skipped)
+      * "not required" right after it in its clause -> not a requirement (skipped)
+      * an explicit required marker in its clause   -> required
+      * under a "Requirements:" section heading     -> required
+      * a preferred signal elsewhere in the sentence, or a "Nice to have:"
+        section heading                             -> preferred (conservative)
+      * otherwise                                   -> required."""
+    clause = _clause_around(sentence, start, end)
+    # The words before the mention belong to it only after the last conjunction:
+    # "5 years of Java preferred and 3 years of Python required" -> the 3's clause
+    # starts at "3 years", so the 5's "preferred" is not read as the 3's.
+    lead = clause[:clause.find(sentence[start:end])]
+    cut = list(_YEARS_CONJUNCTION.finditer(lead))
+    if cut:
+        clause = clause[cut[-1].end():]
+    if _YEARS_NOT_REQUIRED.search(clause) or _PREF_SIGNAL_RE.search(clause):
+        return True
+    post = sentence[end:end + 60]
+    stop = _POST_STOP_RE.search(post)
+    if _POST_NEG_RE.search(post[:stop.start()] if stop else post):
+        return True
+    if _YEARS_REQUIRED_CLAUSE.search(clause) or section == "required":
+        return False
+    if _YEARS_NOT_REQUIRED.search(sentence):
+        return True
+    return section == "preferred"
+
+
 def years_requirement_mentions(text_lower):
     """[(low, high, is_overall)] for every "N years" / "N yrs" mention that states a
-    years REQUIREMENT, judged per sentence exactly as _years_from_text describes
-    (preferred, conditional and non-experience sentences are skipped). `high` is
-    the upper end of a range ("3-5 years" -> (3.0, 5.0)), else equal to `low`."""
+    years REQUIREMENT. Conditional and non-experience SENTENCES are skipped as a
+    whole; whether a mention is preferred is judged within its own CLAUSE, then
+    its sentence, then the posting section it sits under
+    (_years_mention_is_preferred). `high` is the upper end of a range
+    ("3-5 years" -> (3.0, 5.0)), else equal to `low`."""
     out = []
-    for sentence in re.split(r"(?<=[.;!?\n])\s+|\n+|•", text_lower):
+    contexts = _line_contexts(text_lower)
+    for offset, sentence in _sentences_with_offsets(text_lower):
+        if _YEARS_CONDITIONAL.search(sentence) or _YEARS_NOT_EXPERIENCE.search(sentence):
+            continue
         for m in _YEARS_RE.finditer(sentence):
             n = int(m.group(1))
             if not 0 < n <= 30:
                 continue
-            if (_YEARS_NOT_REQUIRED.search(sentence) or _YEARS_CONDITIONAL.search(sentence)
-                    or _YEARS_NOT_EXPERIENCE.search(sentence)):
+            section = None
+            for line_start, line_ctx in contexts:
+                if line_start > offset + m.start():
+                    break
+                section = line_ctx
+            if _years_mention_is_preferred(sentence, m.start(), m.end(), section):
                 continue
             hi = int(m.group(2)) if m.group(2) else n
             is_overall = bool(_YEARS_OVERALL.search(_clause_around(sentence, m.start(), m.end())))

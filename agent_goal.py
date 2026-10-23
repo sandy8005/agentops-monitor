@@ -80,6 +80,10 @@ class FixedConstraints(BaseModel):
     # Explicit relaxation of work_mode: a remote/onsite search also accepts HYBRID
     # postings. Off by default — work mode is otherwise matched exactly.
     allow_hybrid: bool = False
+    # A remote search keeps postings that state no work mode, labeled
+    # work_mode_verified = False. They count toward the goal only if the user
+    # explicitly accepts that (otherwise they are shown, not counted).
+    accept_unknown_work_mode: bool = False
     employment_type: Literal["", "full-time", "part-time", "contract", "internship"] = ""
     seniority: Seniority = ""
 
@@ -150,6 +154,15 @@ class AgentGoal(BaseModel):
             object.__setattr__(self, "use_llm_advice", False)
             object.__setattr__(self, "evaluate_quality", False)
         return self
+
+
+def require_verified_work_mode(goal: AgentGoal):
+    """True when only matches whose work mode is CONFIRMED count toward the goal:
+    a remote search, unless the user accepted unknown-mode postings. (Onsite /
+    hybrid searches keep counting unknown-mode postings: Adzuna rarely states a
+    mode and its search is location-based; they are still labeled unverified.)"""
+    c = goal.constraints
+    return c.work_mode == "remote" and not c.accept_unknown_work_mode
 
 
 def validate_search_query(query, goal: AgentGoal):

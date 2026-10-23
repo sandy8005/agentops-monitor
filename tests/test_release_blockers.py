@@ -684,6 +684,9 @@ def test_database_error_during_advice_is_not_a_per_job_failure(monkeypatch):
     monkeypatch.setattr(llm, "finish_step", lambda *a, **k: None)
     monkeypatch.setattr(llm, "fail_step", lambda *a, **k: None)
     monkeypatch.setattr(router, "_reqs_cache_get", lambda h: (None, None))
+    # Advice reads the evaluation's requirements snapshot (backlog D).
+    monkeypatch.setattr(agent_store, "evaluation_requirements",
+                        lambda rid, sid: ({"required_skills": ["python"]}, {}))
 
     def db_down(*a, **k):
         raise psycopg2.OperationalError("connection reset")

@@ -149,15 +149,37 @@ class ToolContext:
         self.limit_check = limit_check or (lambda: None)
 
 
+# Per-job cap on evaluation ATTEMPTS in a run. A failed evaluation is recorded as
+# status 'failed' with its attempt count; it stays "unevaluated" (offered again,
+# blocks finish) until it succeeds or reaches this cap. A permanently invalid
+# posting (e.g. deleted) is 'terminal' at once.
+MAX_EVALUATION_ATTEMPTS = 2
+
+
+def evaluation_settled(entry):
+    """True when a job needs no further evaluation attempt: it succeeded, or it
+    failed terminally / reached MAX_EVALUATION_ATTEMPTS. A legacy failed entry with
+    no attempt count counts as one attempt."""
+    if not entry:
+        return False
+    if entry.get("status") == "ok":
+        return True
+    return bool(entry.get("terminal")) or \
+        int(entry.get("attempts") or 1) >= MAX_EVALUATION_ATTEMPTS
+
+
 def unevaluated_eligible_ids(state):
     ev = state.get("evaluated") or {}
     return [int(k) for k, v in (state.get("discovered") or {}).items()
-            if v.get("eligible") and k not in ev]
+            if v.get("eligible") and not evaluation_settled(ev.get(k))]
 
 
 def qualified_count(ctx):
+    from agent_goal import require_verified_work_mode
     return len(store.qualified_job_ids(ctx.run_id, ctx.goal.qualifying_decisions,
-                                       verified_only=ctx.goal.require_verified_matches))
+                                       verified_only=ctx.goal.require_verified_matches,
+                                       require_work_mode_verified=require_verified_work_mode(
+                                           ctx.goal)))
 
 
 def _tool_state(ctx):
@@ -190,6 +212,11 @@ def _tool_state(ctx):
         def budget_exceeded(self):
             return ctx.budget.exhausted()
 
+        def record_requirements_snapshot(self, step_id, job_id, requirements, provenance):
+            # Fenced by the generation, like every agent write (migration 0016).
+            store.record_evaluation_requirements(ctx.run_id, ctx.generation, step_id,
+                                                 job_id, requirements, provenance)
+
     ts = _ToolState(goal=g.description or "agent", resume_id=ctx.state.get("resume_id"),
                     target_role=g.target_role, location=g.constraints.location or None,
                     work_mode=g.constraints.work_mode or None,
@@ -204,16 +231,42 @@ def _tool_state(ctx):
 # ------------------------------------------------------------------- search --
 
 def _collect_candidates(ctx, provider, query):
-    """Postings THIS run fetched from `provider`, filtered by the fixed constraints."""
+    """Postings THIS search — (provider, query) in this run — returned, filtered by
+    the fixed constraints. Never postings another query returned (an empty search
+    is reported as empty); run-wide dedup is a separate step (_run_duplicate)."""
+    from agent_goal import normalize_query
     from job_source import search_jobs as run_search
     c = ctx.goal.constraints
     jobs = run_search(query, c.location or None, c.work_mode or None,
                       c.employment_type or None, run_id=ctx.run_id,
-                      allow_hybrid=c.allow_hybrid)
+                      allow_hybrid=c.allow_hybrid, provider=provider,
+                      query_norm=normalize_query(query))
     jobs = [j for j in jobs if (j.get("source") or "").lower() == provider]
     # Deterministic, bounded selection (R14): newest ids first, capped.
     jobs = sorted(jobs, key=lambda j: j["id"], reverse=True)[:ctx.goal.limits.max_jobs_per_search]
     return jobs
+
+
+def _dedup_keys(job):
+    """Run-wide identity of a posting across searches: its canonical URL, and its
+    content fingerprint when it has no URL (job_source's dedup tiers)."""
+    from job_source import _canonical_url, _fingerprint
+    url = _canonical_url(job)
+    return {"url": url, "fp": None if url else "|".join(_fingerprint(job))}
+
+
+def _run_duplicate(discovered, job):
+    """True when an earlier search of this run already discovered this posting —
+    the same id, the same canonical URL, or (URL-less) the same fingerprint."""
+    if str(job["id"]) in discovered:
+        return True
+    keys = _dedup_keys(job)
+    for d in discovered.values():
+        if keys["url"] and d.get("url_key") == keys["url"]:
+            return True
+        if keys["fp"] and d.get("fp_key") == keys["fp"]:
+            return True
+    return False
 
 
 # Provider outcomes that can change on a retry (a later worker generation should
@@ -396,16 +449,18 @@ def tool_search_jobs(ctx, args: SearchArgs):
         reused_from = (None if fetched or prior is None
                        else prior.get("execution_generation"))
 
+        from job_source import _stated_work_mode
         succeeded = provider_status in ("success", "empty")
-        candidates = _collect_candidates(ctx, args.provider, args.query) if succeeded else []
+        candidates =_collect_candidates(ctx, args.provider, args.query) if succeeded else []
         discovered = state.setdefault("discovered", {})
-        new = dup = eligible = 0
+        new = dup = eligible = unknown_mode = 0
         rejections = {}
         for j in candidates:
             key = str(j["id"])
-            if key in discovered:
+            if _run_duplicate(discovered, j):
                 dup += 1
                 continue
+            keys = _dedup_keys(j)
             new += 1
             reason = None
             conflict = seniority_conflict(j.get("title"), goal.constraints.seniority)
@@ -421,13 +476,21 @@ def tool_search_jobs(ctx, args: SearchArgs):
                                "company": (j.get("company") or "")[:80],
                                "source": j.get("source"), "apply_url": j.get("apply_url"),
                                "eligible": reason is None, "reject_reason": reason,
-                               "found_by": f"{args.provider}:{qnorm}"}
+                               "found_by": f"{args.provider}:{qnorm}",
+                               "url_key": keys["url"], "fp_key": keys["fp"],
+                               # Never presented as a confirmed match of the
+                               # work-mode constraint unless the posting states it.
+                               "work_mode": _stated_work_mode(j) or "unknown",
+                               "work_mode_verified": j.get("work_mode_verified", True)}
+            if not discovered[key]["work_mode_verified"]:
+                unknown_mode += 1
         obs = {
             "provider": args.provider, "query": qnorm,
             "provider_status": "success" if succeeded else "failed",
             "provider_detail": provider_status,
             "new_jobs": new, "duplicates": dup, "eligible_jobs": eligible,
             "rejection_summary": rejections,
+            "unknown_work_mode": unknown_mode,
             "fetched": fetched,
         }
         if plan["mode"] == "fetch" and plan.get("retrying_generation") is not None:
@@ -487,6 +550,14 @@ def tool_evaluate_jobs(ctx, args: EvaluateArgs):
     evaluated = state.setdefault("evaluated", {})
     counts = {"Apply": 0, "Maybe": 0, "Skip": 0}
     failed, flagged, step_ids = [], [], []
+
+    def _record_failure(job_id, error, terminal):
+        attempts = int((evaluated.get(str(job_id)) or {}).get("attempts") or 0) + 1
+        terminal = terminal or attempts >= MAX_EVALUATION_ATTEMPTS
+        failed.append(job_id)
+        evaluated[str(job_id)] = {"job_id": job_id, "status": "failed", "error": error,
+                                  "attempts": attempts, "terminal": terminal}
+
     for job_id in args.job_ids:
         stop = ctx.limit_check()                           # N06: between work units
         if stop:
@@ -496,30 +567,31 @@ def tool_evaluate_jobs(ctx, args: EvaluateArgs):
             break
         meta = state["discovered"][str(job_id)]
         prior = _existing_evaluation(ctx.run_id, job_id)
+        mode = {"work_mode": meta.get("work_mode") or "unknown",
+                "work_mode_verified": meta.get("work_mode_verified", True)}
         if prior is not None:
             result = {**prior, "job_id": job_id, "title": meta["title"],
                       "company": meta["company"], "apply_url": meta.get("apply_url")}
         else:
             job = postings.get(job_id)
             if job is None:
-                failed.append(job_id)
-                evaluated[str(job_id)] = {"job_id": job_id, "status": "failed",
-                                          "error": "posting no longer exists"}
+                # Permanently invalid: retrying cannot bring the posting back.
+                _record_failure(job_id, "posting no longer exists", terminal=True)
                 continue
             ts = _tool_state(ctx)
-            ts.jobs = [job]
+            ts.jobs = [{**job, **mode}]
             ts.current_job_index = 0
             do_process_job(ts, ctx.run_id)
             if ts.cancelled:
                 state["cancel_seen"] = True
                 break
             if ts.failed_jobs or not ts.job_results:
-                failed.append(job_id)
-                evaluated[str(job_id)] = {"job_id": job_id, "status": "failed",
-                                          "error": "evaluation failed (see trace)"}
+                # Possibly transient: retried until MAX_EVALUATION_ATTEMPTS.
+                _record_failure(job_id, "evaluation failed (see trace)", terminal=False)
                 continue
             result = dict(ts.job_results[-1])
             result["job_id"] = job_id
+        result.update(mode)
         result["status"] = "ok"
         evaluated[str(job_id)] = result
         step_ids.append(result.get("step_id"))
@@ -534,6 +606,8 @@ def tool_evaluate_jobs(ctx, args: EvaluateArgs):
                 queue.append({"review_id": rid, "step_id": result["step_id"], "job_id": job_id})
     state["ranked"] = False          # new evaluations invalidate the last ranking
     obs = {"evaluated": len(step_ids), "decisions": counts, "failed_job_ids": failed,
+           "retry_pending_job_ids": [i for i in failed
+                                     if not evaluation_settled(evaluated.get(str(i)))],
            "needs_human_review": flagged, "qualified_so_far": qualified_count(ctx),
            "target_count": goal.target_count,
            "unevaluated_eligible_remaining": len(unevaluated_eligible_ids(state))}
@@ -561,7 +635,7 @@ def tool_rank_jobs(ctx, args: RankArgs):
 # ------------------------------------------------------------------- advice --
 
 def tool_generate_advice(ctx, args: AdviceArgs):
-    from router import _reqs_cache_get, _reqs_cache_key, resume_content_hash
+    from router import resume_content_hash
     from scorer import calculate_match_score
     from resume_advisor import build_suggestions, advice_summary
     from llm import create_step, finish_step, fail_step
@@ -612,13 +686,19 @@ def tool_generate_advice(ctx, args: AdviceArgs):
             if job is None:
                 failed.append(job_id)
                 continue
+            # Only the requirements the EVALUATION used (persisted snapshot). A
+            # missing snapshot is a visible failure of this item — never a re-read of
+            # a cache row that may have expired, and never empty placeholders.
+            snap = store.evaluation_requirements(
+                ctx.run_id, (evaluated.get(str(job_id)) or {}).get("step_id"))
+            if snap is None:
+                log.warning("advice for job %s: no requirements snapshot", job_id,
+                            extra={"run_id": ctx.run_id, "step_id": step_id})
+                failed.append(job_id)
+                notes[str(job_id)] = "requirements_snapshot_missing"
+                continue
+            reqs, _prov = snap
             try:
-                reqs, _prov = _reqs_cache_get(_reqs_cache_key(job["title"], job["description"]))
-                reqs = reqs or {"required_skills": [], "required_any_of": [],
-                                "preferred_skills": [], "min_years_experience": 0,
-                                "responsibilities": []}
-                from skills import normalize_requirements
-                reqs = normalize_requirements(reqs)
                 sc = calculate_match_score(state.get("parsed_resume"), reqs,
                                            state.get("resume_text"), job, None)
                 suggestions, note = build_suggestions(

@@ -18,7 +18,7 @@ stored on each row so you can query/prune by version.
 from settings import settings
 
 PARSER_VERSION = "6"   # bumped: verified employment records (only experience-section dates count), experience entries grounded, stated 0 corrected, project windows end at headings
-REQS_VERSION = "5"   # bumped: requirement labels verified (uncertain_requirements), min_years_experience grounded
+REQS_VERSION = "6"   # bumped: "N years" mentions classified per clause (mixed required/preferred sentences keep the required minimum)
 SCHEMA_VERSION = "2"   # bumped: non-finite numbers rejected, years bounded at MAX_YEARS (60)
 
 

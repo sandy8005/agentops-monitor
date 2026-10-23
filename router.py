@@ -450,6 +450,19 @@ def do_process_job(state, run_id):
         # 1. requirements — structured, optional-aware, cache- and quality-aware.
         requirements, cache_hit, _method = _get_requirements(state, job, run_id, step_id)
 
+        # 1a. Snapshot the EXACT requirements this evaluation decides on (with
+        #     provenance), so later advice never depends on a cache row that can
+        #     expire or change (agent_tools.tool_generate_advice). The engine's state
+        #     persists it fenced by the execution generation; written before the
+        #     step can succeed, so a successful evaluation always has one.
+        snapshot = getattr(state, "record_requirements_snapshot", None)
+        if snapshot is not None and job.get("id") is not None:
+            from skills import normalize_requirements
+            from cache_version import reqs_cache_version as _rcv
+            snapshot(step_id, job.get("id"), normalize_requirements(requirements),
+                     {"extraction_method": _method, "cache_hit": bool(cache_hit),
+                      "reqs_cache_version": _rcv()})
+
         # 2. deterministic score — traced (0 LLM calls), runs FIRST (#4)
         user_input = {
             "target_role": state.target_role, "location": state.location,
@@ -631,6 +644,11 @@ def do_process_job(state, run_id):
             # A model-stated years minimum the posting does not state (not scored).
             "ungrounded_min_years": requirements.get("ungrounded_min_years"),
             "geo_eligibility": job.get("geo_eligibility"),
+            # Work mode as STATED by the posting; false = no stated mode, so the
+            # job is never presented (or, for a remote goal, counted) as a
+            # confirmed match of the constraint (agent_store.qualified_job_ids).
+            "work_mode": job.get("work_mode") or "unknown",
+            "work_mode_verified": job.get("work_mode_verified", True),
             "evaluation": eval_selection or "not_requested",
         })
 

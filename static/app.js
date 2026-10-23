@@ -1,7 +1,14 @@
 // Cost cell: a total is only shown as a total when it is COMPLETE. A run with
 // calls of unknown cost (usage missing / failed after dispatch) shows the known
-// part as a lower bound and the conservative upper bound.
+// part as a lower bound and the conservative upper bound. While an LLM request is
+// in flight (open reservation) the total is PROVISIONAL, never complete.
 function formatCost(r) {
+  if (r.cost_provisional) {
+    return '<span title="provisional: LLM request(s) in flight; cost not final">est. $' +
+      escapeHtml(Number(r.known_cost_usd || 0).toFixed(6)) + ' + up to $' +
+      escapeHtml(Number(r.provisional_usd || 0).toFixed(6)) + ' in flight (' +
+      escapeHtml(r.open_reservations) + ' open, provisional)</span>';
+  }
   if (r.cost_complete === false) {
     return '<span title="partial: some calls have unknown cost">est. $' +
       escapeHtml(Number(r.known_cost_usd || 0).toFixed(6)) + ' \u2013 $' +
@@ -271,6 +278,10 @@ var NL = String.fromCharCode(10);
           '<strong>#' + escapeHtml(r.rank) + ' ' + escapeHtml(r.final_decision || '') + '</strong> &nbsp; ' +
           escapeHtml(r.title) + ' <span class="note">@ ' + escapeHtml(r.company || '') + '</span>' +
           ' <span class="call">score ' + escapeHtml(r.score) + '</span>';
+        if (r.work_mode_verified === false) {
+          // The posting states no work mode: not a confirmed match of the constraint.
+          html += ' <span class="note" title="the posting does not state its work mode">work mode unverified</span>';
+        }
         if (r.apply_url) {
           html += ' <a href="' + escapeHtml(r.apply_url) + '" target="_blank" rel="noopener noreferrer">apply &#8599;</a>';
         }

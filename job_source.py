@@ -507,7 +507,27 @@ def geo_eligibility(job, requested_location):
     return eligibility((job.get("location") or "").strip(), (requested_location or "").strip())
 
 
-def work_mode_ok(job, work_mode, allow_hybrid=False):
+def work_mode_status(job, work_mode, allow_hybrid=False):
+    """How a posting relates to the work-mode constraint:
+      'verified' — its stated mode (or a "remote" location) satisfies it;
+      'unknown'  — it states no mode: kept (work_mode_ok) but NEVER presented as a
+                   confirmed match (work_mode_verified = False);
+      'mismatch' — it states a different mode.
+    With no constraint every posting is 'verified'."""
+    if not work_mode:
+        return "verified"
+    return ("verified" if work_mode_ok(job, work_mode, allow_hybrid, unknown=False)
+            else "unknown" if _stated_work_mode(job) is None else "mismatch")
+
+
+def _stated_work_mode(job):
+    jm = (job.get("work_mode") or "").lower().strip()
+    if not jm and "remote" in (job.get("location") or "").lower():
+        jm = "remote"
+    return jm or None
+
+
+def work_mode_ok(job, work_mode, allow_hybrid=False, unknown=True):
     """
     Work mode is a FIXED constraint, so the match is STRICT: a remote search
     returns remote postings, onsite returns onsite, hybrid returns hybrid.
@@ -518,23 +538,22 @@ def work_mode_ok(job, work_mode, allow_hybrid=False):
 
     A posting with NO stated mode (and no "remote" in its location) is kept: the
     providers often omit the field, and excluding it would drop most onsite jobs.
+    It is labeled unverified (work_mode_status); unknown=False treats it as no match.
     """
     if not work_mode:
         return True
     wm = work_mode.lower().strip()
-    jm = (job.get("work_mode") or "").lower().strip()
-    jl = (job.get("location") or "").lower()
-    if not jm and "remote" in jl:
-        jm = "remote"
+    jm = _stated_work_mode(job)
     if not jm:
-        return True
+        return unknown
     if wm == jm:
         return True
     return bool(allow_hybrid) and jm == "hybrid" and wm in ("remote", "onsite")
 
 
 def search_jobs(target_role=None, location=None, work_mode=None,
-                employment_type=None, run_id=None, allow_hybrid=False):
+                employment_type=None, run_id=None, allow_hybrid=False,
+                provider=None, query_norm=None):
     """
     Search the postings THIS run fetched from the live providers (Adzuna/Remotive).
 
@@ -548,9 +567,21 @@ def search_jobs(target_role=None, location=None, work_mode=None,
     Remote postings from a provider that does not geo-filter (Remotive) are kept
     unless their stated candidate region clearly excludes the requested location
     (geo_eligibility); each returned job is annotated with "geo_eligibility".
+
+    provider + query_norm scope the result to ONE search: only the job_searches
+    rows that provider recorded for that (normalized) query in this run — every
+    generation's retry of it, nothing another query returned. Run-wide
+    de-duplication against earlier searches is the caller's separate step.
     """
     if run_id is None:
         raise ValueError("search_jobs requires the run_id whose searches to read")
+    scope_sql, scope_args = "", ()
+    if provider is not None or query_norm is not None:
+        if not provider or not query_norm:
+            raise ValueError("a search scope needs both provider and query_norm")
+        scope_sql = (" AND s.source = %s AND lower(regexp_replace("
+                     "btrim(COALESCE(s.target_role, '')), '\\s+', ' ', 'g')) = %s")
+        scope_args = (provider, query_norm)
     with get_connection() as conn:
         cur = conn.cursor()
         cur.execute("""
@@ -567,10 +598,10 @@ def search_jobs(target_role=None, location=None, work_mode=None,
             FROM job_postings p
             JOIN job_search_results r ON r.job_id = p.id
             JOIN job_searches s ON s.id = r.search_id
-            WHERE s.run_id = %s AND lower(p.source) = ANY(%s)
+            WHERE s.run_id = %s AND lower(p.source) = ANY(%s)""" + scope_sql + """
             GROUP BY p.id
             ORDER BY p.id
-        """, (run_id, sorted(LIVE_SOURCES)))
+        """, (run_id, sorted(LIVE_SOURCES)) + scope_args)
         rows = cur.fetchall()
 
     all_jobs = [
@@ -631,6 +662,11 @@ def search_jobs(target_role=None, location=None, work_mode=None,
                     or (j.get("employment_type") or "").lower().strip() == et]
 
     filtered = _dedupe_jobs(filtered)
+    # Kept postings are LABELED (after dedup, which can backfill a mode): an
+    # unstated mode is "unknown", never a confirmed match of the constraint.
+    if work_mode:
+        for j in filtered:
+            j["work_mode_verified"] = work_mode_status(j, work_mode, allow_hybrid) == "verified"
     # Counts only — the query text is user input and stays out of the logs.
     log.info("search matched %d of %d fetched posting(s)", len(filtered), len(all_jobs),
              extra={"run_id": run_id})

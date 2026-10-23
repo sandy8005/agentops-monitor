@@ -29,7 +29,7 @@ import agent_store as store
 import run_lock
 from agent_controller import (ControllerDecision, ControllerOutputInvalid, allowed_actions_for,
                               llm_decide, rules_decide)
-from agent_goal import AgentGoal
+from agent_goal import AgentGoal, require_verified_work_mode
 from agent_tools import ToolContext, ToolRejected, execute, qualified_count
 from error_codes import ErrorCode, classify_exception, stage_error_code
 from logging_config import get_logger
@@ -261,7 +261,9 @@ def qualified_count_safe(run_id, goal):
     """For DISPLAY only (None = unknown). Finalization uses the raising variant."""
     try:
         return len(store.qualified_job_ids(run_id, goal.qualifying_decisions,
-                                           verified_only=goal.require_verified_matches))
+                                           verified_only=goal.require_verified_matches,
+                                           require_work_mode_verified=(
+                                               require_verified_work_mode(goal))))
     except Exception:
         return None
 
@@ -612,7 +614,8 @@ def node_finalize(state: LoopState, config):
     # N07: the authoritative count RAISES on a database error (-> run failed with a
     # classified error); an unknown count is never treated as zero matches.
     q = len(store.qualified_job_ids(run_id, goal.qualifying_decisions,
-                                    verified_only=goal.require_verified_matches))
+                                    verified_only=goal.require_verified_matches,
+                                    require_work_mode_verified=require_verified_work_mode(goal)))
     progress["qualified"] = q
     searches = work.get("searches") or []
     all_failed = bool(searches) and all(s.get("provider_status") == "failed" for s in searches)

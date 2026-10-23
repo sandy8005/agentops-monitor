@@ -243,6 +243,7 @@ def cost_summary(cur, run_id):
       unbounded_unknown       unknown calls with NO bound (legacy rows) — a cap
                               cannot be proven while any exist (fail closed)
       reserved_open_usd       requests in flight right now
+      open_reservations       how many reservations are open (cost not final)
       committed_usd           known + unknown bound + open reservations: what a
                               hard cap is enforced against
     """
@@ -256,12 +257,13 @@ def cost_summary(cur, run_id):
     known, unknown_calls, unknown_bound, unbounded = cur.fetchone()
     cur.execute("""
         SELECT COALESCE(SUM(amount_usd) FILTER (WHERE status = 'open'), 0),
+               COUNT(*) FILTER (WHERE status = 'open'),
                COUNT(*) FILTER (WHERE status = 'abandoned'),
                COALESCE(SUM(amount_usd) FILTER (WHERE status = 'abandoned'), 0),
                COUNT(*) FILTER (WHERE status IN ('open', 'abandoned') AND amount_usd IS NULL)
         FROM llm_cost_reservations WHERE run_id = %s
     """, (run_id,))
-    open_amt, abandoned_n, abandoned_amt, unbounded_res = cur.fetchone()
+    open_amt, open_n, abandoned_n, abandoned_amt, unbounded_res = cur.fetchone()
     known = float(known or 0)
     bound = float(unknown_bound or 0) + float(abandoned_amt or 0)
     open_amt = float(open_amt or 0)
@@ -270,6 +272,7 @@ def cost_summary(cur, run_id):
             "unknown_cost_bound_usd": bound,
             "unbounded_unknown": int(unbounded or 0) + int(unbounded_res or 0),
             "reserved_open_usd": open_amt,
+            "open_reservations": int(open_n or 0),
             "committed_usd": known + bound + open_amt}
 
 
@@ -568,13 +571,18 @@ _UNVERIFIED_SQL = """(retrieved_context->>'requirements_method' = 'rule_based'
                       AND review_status IS NULL)"""
 
 
-def qualified_job_ids(run_id, qualifying_decisions, verified_only=False):
+def qualified_job_ids(run_id, qualifying_decisions, verified_only=False,
+                      require_work_mode_verified=False):
     """BACKEND-VERIFIED progress: distinct jobs whose persisted AUTHORITATIVE final
     decision qualifies and which are not still awaiting a human review. With
     verified_only, matches that rest ONLY on rule-based requirement extraction (no
-    judge, no human) are excluded. Raises on database errors — an unknown count is
-    never reported as zero (N07)."""
+    judge, no human) are excluded. With require_work_mode_verified, matches whose
+    posting states no work mode (work_mode_verified = false in the step context)
+    are excluded — shown, not counted. Raises on database errors — an unknown
+    count is never reported as zero (N07)."""
     extra = f" AND NOT {_UNVERIFIED_SQL}" if verified_only else ""
+    if require_work_mode_verified:
+        extra += " AND COALESCE(retrieved_context->>'work_mode_verified', 'true') <> 'false'"
     with get_connection() as conn:
         cur = conn.cursor()
         cur.execute(f"""
@@ -604,6 +612,39 @@ def unverified_qualified_count(run_id, qualifying_decisions):
               AND {_UNVERIFIED_SQL}
         """, (run_id, list(qualifying_decisions)))
         return int(cur.fetchone()[0] or 0)
+
+
+def record_evaluation_requirements(run_id, generation, step_id, job_id, requirements,
+                                   provenance):
+    """Snapshot of the exact normalized requirements one evaluation step used, with
+    provenance (migration 0016). Fenced by the execution generation; idempotent per
+    step (a replay never rewrites what the evaluation decided on)."""
+    with get_connection() as conn:
+        cur = conn.cursor()
+        _check_generation(cur, run_id, generation)
+        cur.execute("""
+            INSERT INTO evaluation_requirements
+                (run_id, step_id, job_id, execution_generation, requirements, provenance)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            ON CONFLICT (step_id) DO NOTHING
+        """, (run_id, step_id, job_id, generation, json.dumps(requirements, default=str),
+              json.dumps(provenance or {}, default=str)))
+
+
+def evaluation_requirements(run_id, step_id):
+    """(requirements, provenance) persisted for this evaluation step of this run, or
+    None when there is no usable snapshot (never written, or erased)."""
+    if step_id is None:
+        return None
+    with get_connection() as conn:
+        cur = conn.cursor()
+        cur.execute("""SELECT requirements, provenance FROM evaluation_requirements
+                       WHERE run_id = %s AND step_id = %s""", (run_id, step_id))
+        row = cur.fetchone()
+    if not row or row[0] is None:
+        return None
+    reqs = _j(row[0])
+    return (reqs, _j(row[1]) or {}) if isinstance(reqs, dict) else None
 
 
 def advised_job_ids(run_id):
@@ -668,11 +709,13 @@ def persist_rankings(run_id, generation, ranked):
         for pos, r in enumerate(ranked or [], start=1):
             cur.execute("""
                 INSERT INTO run_rankings (run_id, job_id, rank_position, title, company,
-                                          score, final_decision, apply_url)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                                          score, final_decision, apply_url,
+                                          work_mode, work_mode_verified)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """, (run_id, r.get("job_id"), pos, r.get("title"), r.get("company"),
                   r.get("score"), r.get("final_decision") or r.get("decision"),
-                  r.get("apply_url")))
+                  r.get("apply_url"), r.get("work_mode"),
+                  r.get("work_mode_verified", True)))
 
 
 def persist_advice(run_id, generation, job_id, title, advice_text, suggestions,

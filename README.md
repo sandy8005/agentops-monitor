@@ -47,7 +47,12 @@ the goal is met (verified from persisted results) **or** the search space is
 exhausted — the search limit is reached, or every *candidate title × enabled
 provider* combination was searched (providers that failed with bad credentials or
 missing keys count as unusable) — **and** no discovered eligible job is left
-unevaluated. Until then `finish` is neither offered to the model nor accepted from
+unevaluated. A job whose evaluation **failed** still counts as unevaluated until it
+succeeds or reaches the per-job cap of 2 attempts (`MAX_EVALUATION_ATTEMPTS`); a
+permanently invalid posting (deleted before evaluation) is a terminal failure at
+once. Failed entries carry `attempts` and `terminal`, so one transient failure
+never silently removes an eligible job and a persistent one cannot loop. Until then
+`finish` is neither offered to the model nor accepted from
 it. Cancellation, hard limits and repeated tool failures stop a run through the
 guard, never through `finish`. A run that never searched can therefore never end
 as `no_matches`.
@@ -160,7 +165,12 @@ agree; costs are stored as `NUMERIC(18,10)` so small calls are not rounded to $0
 | `not_billed` | the provider rejected it before doing work (429, 401/403, 400) | `NULL` |
 
 Every endpoint returns `known_cost_usd`, `unknown_cost_calls`, `cost_complete` and
-`cost_upper_bound_usd`; `total_cost` is a number only when it is complete. A capped
+`cost_upper_bound_usd`; `total_cost` is a number only when it is complete. Cost is
+**never complete while an LLM reservation is open** (a request may be in flight
+and billed): `open_reservations` and `provisional_usd` (their reserved maximum)
+are reported separately, `cost_provisional` is true, the upper bound includes
+them, and the dashboard shows the spend as provisional. The agent timeline's
+`cost.complete` follows the same rule. A capped
 run with unknown cost *and no bound* (legacy rows) stops with `cost_unknown`.
 
 **Pricing is effective-dated** (`pricing.py`): each model has price windows
@@ -225,6 +235,16 @@ minimum), recorded in `ungrounded_min_years`)
 if flagged for any reason, the run **pauses for human review**. `rank_jobs` sorts by
 decision bucket (Apply > Maybe > Skip), then score. `generate_advice` writes
 evidence-checked resume suggestions (below).
+
+Each evaluation persists the **exact normalized requirements it decided on**, with
+provenance (`extraction_method`, `cache_hit`, requirements-cache version), in
+`evaluation_requirements` (migration `0016`; written fenced by the execution
+generation before the step can succeed, deleted with the run, blanked by erasure).
+Advice is generated **only from that snapshot**, never by re-reading the
+requirements cache (a rule-based row expires after a day, so a run resumed after a
+long review pause would otherwise get advice built on different or empty
+requirements). A job without a snapshot fails that advice item visibly
+(`requirements_snapshot_missing`).
 
 ### Human approval workflow
 
@@ -341,6 +361,14 @@ returned. Rows from any other source (old seed/CSV/scraped data in a legacy data
 are never returned. Duplicates are collapsed URL-first, then by a
 title + company + location fingerprint.
 
+Within a run, each `search_jobs` action is credited **only with the postings that
+search returned** (the `job_searches` rows its provider recorded for that query,
+across retries, and their `job_search_results`), so a query that returned nothing
+reports 0 even when an earlier query found a matching posting. Run-wide
+deduplication is a separate step: a posting an earlier search already discovered
+(same id, same canonical URL, or — without a URL — the same fingerprint) counts as
+a duplicate and is never evaluated twice.
+
 **Providers are not trusted to obey the query.** Every returned posting is validated
 locally (`job_source._role_matcher`). A target role is split into a *specialization*
 (`AI`, `ML`, `Security`, `Data`; alias-expanded, whole-word) and a *role family*
@@ -361,6 +389,15 @@ onsite returns onsite, hybrid returns hybrid. "Remote (or onsite) preferred, hyb
 acceptable" is an explicit opt-in, `allow_hybrid` on `POST /runs` (stored in the
 goal's fixed constraints); it never widens a hybrid search. Postings that state no
 work mode are kept (providers often omit it); a "remote" location counts as remote.
+A kept posting with no stated mode is **never presented as a confirmed match**: it
+is labeled `work_mode: "unknown"`, `work_mode_verified: false` in discovery, the
+search observation (`unknown_work_mode`), the evaluation's step context, the
+persisted ranking (migration `0017`) and `GET /runs/{id}/rankings`, and the
+dashboard marks it "work mode unverified". For a **remote** search such matches are
+shown but **do not count toward the goal** unless the user opts in with
+`accept_unknown_work_mode` on `POST /runs`. Onsite and hybrid searches still count
+them (Adzuna rarely states a mode and its search is location-based), labeled the
+same way.
 
 **Geographic eligibility** of remote postings is resolved **structurally**
 (`geo.py`): text becomes ISO countries + regions from a hierarchy, by longest-phrase
@@ -457,10 +494,14 @@ required/preferred skill cases) and measure precision, recall, false-Apply and
 false-Skip rates, reviewer agreement and calibration by score band.
 
 The **rules-based requirements fallback** (`rule_requirements.py`) is a degraded
-path: it reads "N years" per sentence (skipping preferred, conditional and
-non-experience mentions; a mention marked overall/total/professional/industry in its
-own clause wins, so "3 years Python, 5 years overall" is 5, otherwise the smallest
-mention is used) but cannot build any-of groups. Extractions are tagged
+path: it reads "N years" per sentence, skipping conditional and non-experience
+sentences, and classifies each mention as required or preferred **within its own
+clause** first — "3+ years Python required, while 5+ years Java preferred" is 3 —
+then its sentence, then the section heading it sits under ("Requirements:" keeps
+it, "Nice to have:" drops it); an unmarked mention in a sentence that marks
+something else preferred is still skipped (conservative). A mention marked
+overall/total/professional/industry in its own clause wins, so "3 years Python, 5
+years overall" is 5, otherwise the smallest mention is used but cannot build any-of groups. Extractions are tagged
 `requirements_method = rule_based`, and `require_verified_matches` excludes matches
 that rest only on it. Measure its drift on your data with:
 
@@ -478,7 +519,8 @@ python scripts/eval/fallback_agreement.py --limit 500 --resume-id <id>
   retention) gets an append-only **tombstone** and a new execution generation.
   Database triggers then blank or drop any *late* write for it — trace prompts and
   responses, tool payloads, step context, review payloads, advice, resume
-  suggestions, LangGraph checkpoints — so a stale worker that was still finishing
+  suggestions, evaluation requirements snapshots, LangGraph checkpoints (matched
+  for any BIGINT run id, up to 19 digits; migration `0018`) — so a stale worker that was still finishing
   cannot re-persist erased data; metrics (tokens, cost, status) are kept. An erased
   resume cannot be restored or rewritten and its parse cannot be re-cached (until
   the same text is uploaded again).
