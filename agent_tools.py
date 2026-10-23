@@ -449,7 +449,7 @@ def tool_search_jobs(ctx, args: SearchArgs):
         reused_from = (None if fetched or prior is None
                        else prior.get("execution_generation"))
 
-        from job_source import _stated_work_mode
+        from job_source import _stated_work_mode, work_mode_verified
         succeeded = provider_status in ("success", "empty")
         candidates =_collect_candidates(ctx, args.provider, args.query) if succeeded else []
         discovered = state.setdefault("discovered", {})
@@ -481,7 +481,9 @@ def tool_search_jobs(ctx, args: SearchArgs):
                                # Never presented as a confirmed match of the
                                # work-mode constraint unless the posting states it.
                                "work_mode": _stated_work_mode(j) or "unknown",
-                               "work_mode_verified": j.get("work_mode_verified", True)}
+                               # A missing flag is computed, never assumed (fail closed).
+                               "work_mode_verified": work_mode_verified(
+                                   j, goal.constraints.work_mode, goal.constraints.allow_hybrid)}
             if not discovered[key]["work_mode_verified"]:
                 unknown_mode += 1
         obs = {
@@ -535,6 +537,20 @@ def _existing_evaluation(run_id, job_id):
             "needs_review": bool(r[5]) and r[6] is None}
 
 
+def _work_mode_label(meta, posting, goal):
+    """The discovered entry's work-mode label. Entries from older checkpoints may
+    lack the flag: it is then computed from the stored posting's stated mode
+    (fail closed; the legacy entry's own label is not trusted), never assumed."""
+    from job_source import _stated_work_mode, work_mode_verified
+    if isinstance(meta.get("work_mode_verified"), bool):
+        return {"work_mode": meta.get("work_mode") or "unknown",
+                "work_mode_verified": meta["work_mode_verified"]}
+    src = {k: v for k, v in (posting or {}).items() if k != "work_mode_verified"}
+    return {"work_mode": _stated_work_mode(src) or "unknown",
+            "work_mode_verified": work_mode_verified(src, goal.constraints.work_mode,
+                                                     goal.constraints.allow_hybrid)}
+
+
 def tool_evaluate_jobs(ctx, args: EvaluateArgs):
     goal, state = ctx.goal, ctx.state
     if len(args.job_ids) > goal.limits.max_evaluate_batch:
@@ -567,8 +583,7 @@ def tool_evaluate_jobs(ctx, args: EvaluateArgs):
             break
         meta = state["discovered"][str(job_id)]
         prior = _existing_evaluation(ctx.run_id, job_id)
-        mode = {"work_mode": meta.get("work_mode") or "unknown",
-                "work_mode_verified": meta.get("work_mode_verified", True)}
+        mode = _work_mode_label(meta, postings.get(job_id), goal)
         if prior is not None:
             result = {**prior, "job_id": job_id, "title": meta["title"],
                       "company": meta["company"], "apply_url": meta.get("apply_url")}
@@ -634,6 +649,26 @@ def tool_rank_jobs(ctx, args: RankArgs):
 
 # ------------------------------------------------------------------- advice --
 
+def _reconstruct_snapshot(ctx, job_id, eval_step, job):
+    """Recovery for an evaluation without a requirements snapshot (pre-0016):
+    re-derive (router.reconstruct_requirements: cache or rules, no model call),
+    persist fenced by the execution generation, then RE-READ, so what advice uses
+    is exactly what is stored (an erased run's snapshot is blanked by its guard and
+    reads back as None). None when reconstruction is impossible."""
+    from router import reconstruct_requirements
+    if eval_step is None:
+        return None
+    derived = reconstruct_requirements(job)
+    if derived is None:
+        return None
+    reqs, prov = derived
+    store.record_evaluation_requirements(ctx.run_id, ctx.generation, eval_step, job_id,
+                                         reqs, prov)
+    log.info("advice for job %s: requirements reconstructed (%s)", job_id, prov["source"],
+             extra={"run_id": ctx.run_id, "step_id": eval_step})
+    return store.evaluation_requirements(ctx.run_id, eval_step)
+
+
 def tool_generate_advice(ctx, args: AdviceArgs):
     from router import resume_content_hash
     from scorer import calculate_match_score
@@ -664,7 +699,7 @@ def tool_generate_advice(ctx, args: AdviceArgs):
     state["advice_attempted"] = sorted(attempted | set(args.job_ids))
     postings = store.load_postings(args.job_ids)
     step_id = create_step(ctx.run_id, "agent_generate_advice", ctx.iteration)
-    done, failed, notes = [], [], {}
+    done, failed, notes, reconstructed = [], [], {}, []
     interrupted = None
     resume_hash = resume_content_hash(state.get("resume_text") or "")
     try:
@@ -685,12 +720,20 @@ def tool_generate_advice(ctx, args: AdviceArgs):
             job = postings.get(job_id)
             if job is None:
                 failed.append(job_id)
+                notes[str(job_id)] = "posting_missing"
                 continue
-            # Only the requirements the EVALUATION used (persisted snapshot). A
-            # missing snapshot is a visible failure of this item — never a re-read of
-            # a cache row that may have expired, and never empty placeholders.
-            snap = store.evaluation_requirements(
-                ctx.run_id, (evaluated.get(str(job_id)) or {}).get("step_id"))
+            # Only the requirements the EVALUATION used (persisted snapshot). An
+            # evaluation from before migration 0016 has none: its requirements are
+            # RECONSTRUCTED (cache hit or rules, never a model call), persisted as a
+            # snapshot tagged "reconstructed" and the advice is marked as such. When
+            # even that is impossible (posting text erased) the item fails visibly —
+            # never empty placeholder requirements.
+            eval_step = (evaluated.get(str(job_id)) or {}).get("step_id")
+            snap = store.evaluation_requirements(ctx.run_id, eval_step)
+            if snap is None:
+                snap = _reconstruct_snapshot(ctx, job_id, eval_step, job)
+                if snap is not None and (snap[1] or {}).get("provenance") == "reconstructed":
+                    reconstructed.append(job_id)
             if snap is None:
                 log.warning("advice for job %s: no requirements snapshot", job_id,
                             extra={"run_id": ctx.run_id, "step_id": step_id})
@@ -731,6 +774,9 @@ def tool_generate_advice(ctx, args: AdviceArgs):
     if failed:
         state["output_failures"] = int(state.get("output_failures") or 0) + len(failed)
     obs = {"advised": done, "failed_job_ids": failed, "generation": notes}
+    if reconstructed:
+        # ids only: advice built on requirements reconstructed for a pre-0016 run
+        obs["requirements_reconstructed"] = [i for i in reconstructed if i in done]
     if interrupted:
         obs["stopped"] = interrupted.get("reason")
         obs["not_advised"] = [i for i in args.job_ids if i not in done and i not in failed]

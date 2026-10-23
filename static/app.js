@@ -1,19 +1,24 @@
-// Cost cell: a total is only shown as a total when it is COMPLETE. A run with
-// calls of unknown cost (usage missing / failed after dispatch) shows the known
-// part as a lower bound and the conservative upper bound. While an LLM request is
-// in flight (open reservation) the total is PROVISIONAL, never complete.
+// Cost cell: a total is only shown as a total when it is COMPLETE. Otherwise the
+// known part and the FULL conservative upper bound (known + unknown-cost call
+// bounds + open reservations) are always shown, with every source listed: calls
+// of unknown cost (usage missing / failed after dispatch) and LLM requests in
+// flight (open reservations: the total is PROVISIONAL, never complete).
+function costSources(unknownCalls, openRes, inFlightUsd) {
+  var parts = [];
+  if (Number(unknownCalls) > 0) parts.push(escapeHtml(unknownCalls) + ' call(s) with unknown cost');
+  if (Number(openRes) > 0) parts.push(escapeHtml(openRes) + ' in flight, up to $' +
+    escapeHtml(Number(inFlightUsd || 0).toFixed(6)) + ' (provisional)');
+  return parts.join('; ');
+}
 function formatCost(r) {
-  if (r.cost_provisional) {
-    return '<span title="provisional: LLM request(s) in flight; cost not final">est. $' +
-      escapeHtml(Number(r.known_cost_usd || 0).toFixed(6)) + ' + up to $' +
-      escapeHtml(Number(r.provisional_usd || 0).toFixed(6)) + ' in flight (' +
-      escapeHtml(r.open_reservations) + ' open, provisional)</span>';
-  }
-  if (r.cost_complete === false) {
-    return '<span title="partial: some calls have unknown cost">est. $' +
+  if (r.cost_complete === false || r.cost_provisional) {
+    var title = r.cost_provisional ? 'provisional: LLM request(s) in flight; cost not final'
+                                   : 'partial: some calls have unknown cost';
+    var src = costSources(r.unknown_cost_calls, r.open_reservations, r.provisional_usd);
+    return '<span title="' + title + '">est. $' +
       escapeHtml(Number(r.known_cost_usd || 0).toFixed(6)) + ' \u2013 $' +
-      escapeHtml(Number(r.cost_upper_bound_usd || 0).toFixed(6)) + ' (' +
-      escapeHtml(r.unknown_cost_calls) + ' call(s) with unknown cost)</span>';
+      escapeHtml(Number(r.cost_upper_bound_usd || 0).toFixed(6)) +
+      (src ? ' (' + src + ')' : '') + '</span>';
   }
   return r.total_cost == null ? 'unknown' : 'est. $' + escapeHtml(Number(r.total_cost).toFixed(6));
 }
@@ -360,6 +365,10 @@ var NL = String.fromCharCode(10);
         if (applyHref) {
           html += ' <a href="' + escapeHtml(applyHref) + '" target="_blank" rel="noopener noreferrer">apply &#8599;</a>';
         }
+        if (r.advice_requirements === 'reconstructed') {
+          // Advice for a run evaluated before requirement snapshots existed.
+          html += ' <span class="note" title="the evaluation stored no requirements; advice used requirements re-derived from the posting">advice from reconstructed requirements</span>';
+        }
         var sug = r.suggestions || [];
         if (sug.length) {
           html += '<details><summary>' + escapeHtml(sug.length) + ' resume suggestion(s)</summary>';
@@ -465,8 +474,9 @@ var NL = String.fromCharCode(10);
         (p.controller_note ? ' <span class="reason">(' + escapeHtml(p.controller_note) + ')</span>' : '') + '</div>' +
         '<div class="note">LLM calls reserved ' + escapeHtml(a.llm_calls.reserved) + '/' + escapeHtml(a.llm_calls.budget) +
         ' &nbsp; est. cost $' + escapeHtml((a.cost.known_estimated_usd || 0).toFixed(6)) +
-        (a.cost.complete ? '' : ' (+' + escapeHtml(a.cost.calls_with_unknown_cost) + ' call(s) with unknown cost, bound $' +
-          escapeHtml((a.cost.unknown_cost_upper_bound_usd || 0).toFixed(6)) + ')') +
+        (a.cost.complete ? '' : ' – up to $' + escapeHtml(Number(a.cost.upper_bound_usd || 0).toFixed(6)) +
+          ' (' + costSources(a.cost.calls_with_unknown_cost, a.cost.open_reservations,
+                             a.cost.in_flight_reserved_usd) + ')') +
         (a.cost.limit_usd ? ' &nbsp; committed $' + escapeHtml((a.cost.committed_usd || 0).toFixed(6)) +
           ' of $' + escapeHtml(a.cost.limit_usd) + ' hard limit' : '') + '</div>' +
         (a.runtime ? '<div class="note">Active runtime ' + escapeHtml(Math.round(a.runtime.active_seconds)) + 's' +

@@ -126,9 +126,9 @@ def test_unknown_mode_matches_are_not_counted_unless_allowed():
     _uid, rid, _gen = _db_run()
     _step(rid, 1, True)
     _step(rid, 2, False)
-    _step(rid, 3, None)            # legacy context without the label: counted as before
+    _step(rid, 3, None)            # legacy context, no stored posting: fails closed (backlog D)
     assert agent_store.qualified_job_ids(rid, ["Apply"]) == [1, 2, 3]
-    assert agent_store.qualified_job_ids(rid, ["Apply"], require_work_mode_verified=True) == [1, 3]
+    assert agent_store.qualified_job_ids(rid, ["Apply"], require_work_mode_verified=True) == [1]
 
 
 @pytest.mark.db

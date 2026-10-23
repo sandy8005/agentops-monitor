@@ -45,6 +45,17 @@ _LLM_OUTAGE_CODES = {ErrorCode.LLM_UNAVAILABLE, ErrorCode.LLM_RATE_LIMITED,
                      ErrorCode.LLM_QUOTA_EXHAUSTED, ErrorCode.LLM_INVALID_RESPONSE}
 
 
+def controller_model_degraded(e):
+    """True when a controller model call failed for a MODEL-side reason, so the
+    decide node switches to the rules policy (or asks the user): a budget/cost
+    stop, an outage code, or any degraded-model error (llm.is_degraded_model_error,
+    e.g. a Gemini 500 or an empty-message transport timeout). Anything else (a
+    database or programming error) propagates and fails the run visibly."""
+    from llm import BudgetExceeded, is_degraded_model_error
+    return (isinstance(e, BudgetExceeded) or classify_exception(e) in _LLM_OUTAGE_CODES
+            or is_degraded_model_error(e))
+
+
 class StaleReviewDecision(RuntimeError):
     """A resume value does not belong to the interrupt the graph is paused on."""
 
@@ -397,9 +408,8 @@ def node_decide(state: LoopState, config):
                     mode, note = "rules", "controller switched to rules: repeated invalid output"
             except Exception as e:
                 fail_step(step_id, e)
-                from llm import BudgetExceeded
                 code = classify_exception(e)
-                if isinstance(e, BudgetExceeded) or code in _LLM_OUTAGE_CODES:
+                if controller_model_degraded(e):
                     if goal.on_model_unavailable == "pause" and int(state.get("input_requests") or 0) < 2:
                         decision = ControllerDecision(
                             action="request_human_input",

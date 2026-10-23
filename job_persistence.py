@@ -30,6 +30,8 @@ def upsert_postings(jobs, conn=None):
     if conn is None:
         with _get_connection() as own:
             return upsert_postings(jobs, conn=own)
+    # An invalid provider URL is stored as NO apply_url (never as a bad link).
+    from job_source import safe_http_url
     cur = conn.cursor()
     now = utcnow()
     inserted = 0
@@ -59,7 +61,7 @@ def upsert_postings(jobs, conn=None):
             RETURNING id, (xmax = 0) AS was_inserted
         """, (j["title"], j["company"], j["description"], j["location"],
               j["work_mode"], j["employment_type"], j["source"], j["external_id"],
-              now, now, j.get("posted_at") or None, j.get("apply_url") or None))
+              now, now, j.get("posted_at") or None, safe_http_url(j.get("apply_url"))))
         row = cur.fetchone()
         job_ids.append(row[0])
         if row[1]:                 # xmax = 0 → fresh INSERT, not an UPDATE

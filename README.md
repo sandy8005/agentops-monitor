@@ -170,7 +170,12 @@ Every endpoint returns `known_cost_usd`, `unknown_cost_calls`, `cost_complete` a
 and billed): `open_reservations` and `provisional_usd` (their reserved maximum)
 are reported separately, `cost_provisional` is true, the upper bound includes
 them, and the dashboard shows the spend as provisional. The agent timeline's
-`cost.complete` follows the same rule. A capped
+`cost.complete` follows the same rule, and its `cost.upper_bound_usd` is the same
+full bound. Whenever cost isn't complete, the dashboard (run list and agent
+detail) shows the known amount **and the full upper bound** (known + unknown-call
+bounds + open reservations), listing each source: calls of unknown cost and
+requests in flight. A run that is both provisional and has unknown-cost calls
+shows both. A capped
 run with unknown cost *and no bound* (legacy rows) stops with `cost_unknown`.
 
 **Pricing is effective-dated** (`pricing.py`): each model has price windows
@@ -243,8 +248,22 @@ generation before the step can succeed, deleted with the run, blanked by erasure
 Advice is generated **only from that snapshot**, never by re-reading the
 requirements cache (a rule-based row expires after a day, so a run resumed after a
 long review pause would otherwise get advice built on different or empty
-requirements). A job without a snapshot fails that advice item visibly
-(`requirements_snapshot_missing`).
+requirements).
+
+**Recovery for runs evaluated before `0016`.** Their evaluations have no snapshot.
+Advice then reconstructs the requirements without a model call: an unexpired
+requirements-cache row if one exists, otherwise the rules extractor
+(`router.reconstruct_requirements`). The result is persisted as that step's
+snapshot (fenced, erasure-guarded) with provenance `"provenance": "reconstructed"`
+and `source` (`cache` / `rules`), then read back, and advice is built from what was
+stored. The advice is marked: the action observation lists
+`requirements_reconstructed` (job ids), `GET /runs/{id}/rankings` returns
+`advice_requirements: "reconstructed"` (`"evaluation"` for a normal snapshot), and
+the dashboard labels it. Since `REQS_VERSION` changes the cache key, older runs
+usually reconstruct from the rules. The item still fails visibly when
+reconstruction is impossible: `posting_missing` when the posting row is gone, and
+`requirements_snapshot_missing` when its text is erased or blank, the evaluation
+has no step id, or the run's snapshot was blanked by erasure.
 
 ### Human approval workflow
 
@@ -353,7 +372,18 @@ re-raises them so the run fails (or retries) with a classified error code:
   `ImportError`, `AssertionError`, `NotImplementedError`, `RecursionError`.
 
 Model degradation (not configured, quota, outage, invalid output) is classified
-separately by `llm.is_degraded_model_error` and takes the rules fallback. API
+separately by `llm.is_degraded_model_error` and takes the rules fallback. Provider
+outages are classified by type and status code, not only by message: any Gemini
+SDK 5xx (`500 INTERNAL`, `504 DEADLINE_EXCEEDED`, ...) and transport failures
+(httpx or builtin timeouts and connection errors, which often have an empty
+message) are `llm_unavailable`, so they are retried as transient and never surface
+as `internal_error`. The controller's decide node switches to the rules policy for
+every degraded-model error (`agent_loop.controller_model_degraded`), so a Gemini 500
+cannot fail a run. Unusable model output is `ModelOutputInvalid` in every prompt's
+parser: the judge (`router._parse_decision`) and a resume parse whose object lacks
+the core `skills` / `experience` fields (it used to normalize to an empty parse that
+was cached as a model parse). The contract for every prompt type is pinned by
+`tests/test_gemini_contract.py` (recorded responses, no network). API
 validation returns 422 only for `ValueError`/pydantic errors; anything else is a
 500. The remaining broad handlers are provider-SDK boundaries, best-effort logging
 and worker supervision. `tests/test_exception_policy.py` covers each case.
@@ -379,6 +409,13 @@ Each search is **run-scoped**: a run only ever sees postings its own searches
 returned. Rows from any other source (old seed/CSV/scraped data in a legacy database)
 are never returned. Duplicates are collapsed URL-first, then by a
 title + company + location fingerprint.
+
+Provider URLs are untrusted data (`job_source.safe_http_url`). A URL counts only if
+it is a string with no whitespace or control characters, an `http`/`https` scheme, a
+non-empty well-formed host (valid IPv6 brackets) and a port in 1–65535. Anything else
+is treated as **no URL**: deduplication falls back to the fingerprint, the posting is
+stored without an `apply_url`, and the API returns no link. Validation never raises,
+so one malformed posting can't abort a search.
 
 Within a run, each `search_jobs` action is credited **only with the postings that
 search returned** (the `job_searches` rows its provider recorded for that query,
@@ -407,7 +444,10 @@ use machine learning tools" in the description is rejected.
 onsite returns onsite, hybrid returns hybrid. "Remote (or onsite) preferred, hybrid
 acceptable" is an explicit opt-in, `allow_hybrid` on `POST /runs` (stored in the
 goal's fixed constraints); it never widens a hybrid search. Postings that state no
-work mode are kept (providers often omit it); a "remote" location counts as remote.
+work mode are kept (providers often omit it). A location counts as stating remote
+only when it says so plainly ("Remote", "Remote - Europe", "US (Remote)"); negated,
+hedged or mixed wording ("Not remote", "Remote-friendly", "Remote possible",
+"Hybrid (remote 2 days)", "Remote or onsite") states no mode.
 A kept posting with no stated mode is **never presented as a confirmed match**: it
 is labeled `work_mode: "unknown"`, `work_mode_verified: false` in discovery, the
 search observation (`unknown_work_mode`), the evaluation's step context, the
@@ -418,6 +458,14 @@ shown but **do not count toward the goal** unless the user opts in with
 them (Adzuna rarely states a mode and its search is location-based), labeled the
 same way. The dashboard's search form exposes both opt-ins as checkboxes, enabled
 only for the work modes they apply to.
+
+The label **fails closed** (`job_source.work_mode_verified`): a posting, a
+discovered entry from an older checkpoint, a ranking row or a step context that
+reaches the backend without the flag is never assumed verified. The flag is
+computed from the stored posting's stated mode against the goal's constraint; a
+ranking row without it is stored as unverified; and when goal counting meets a step
+context without the flag, the job counts toward a remote goal only if its stored
+posting states `remote`.
 
 **Geographic eligibility** of remote postings is resolved **structurally**
 (`geo.py`): text becomes ISO countries + regions from a hierarchy, by longest-phrase
@@ -519,7 +567,11 @@ sentences, and classifies each mention as required or preferred **within its own
 clause** first — "3+ years Python required, while 5+ years Java preferred" is 3 —
 then its sentence, then the section heading it sits under ("Requirements:" keeps
 it, "Nice to have:" drops it); an unmarked mention in a sentence that marks
-something else preferred is still skipped (conservative). A mention marked
+something else preferred is still skipped (conservative). Counts may be digits or
+spelled out (one–twenty), with or without a parenthesized digit ("three (3) years"),
+and "N or more years" reads as N. A soft "ideally/preferably M" right after a mention
+("3-5 years of experience, ideally 5") applies to the higher value only, so the
+minimum stays 3. A mention marked
 overall/total/professional/industry in its own clause wins, so "3 years Python, 5
 years overall" is 5, otherwise the smallest mention is used but cannot build any-of groups. Extractions are tagged
 `requirements_method = rule_based`, and `require_verified_matches` excludes matches
@@ -582,8 +634,22 @@ pytest -m "not db"            # pure logic, no database
 pytest -m "db and not e2e"    # PostgreSQL integration, authorization, pause/resume,
                               # concurrency, cost ledger, erasure guards
 pytest -m e2e                 # start -> two human-review pauses -> completion through
-                              # the real worker, API, store and Postgres checkpointer
+                              # the real worker, API, store and Postgres checkpointer;
+                              # recovery: a worker killed mid-tool, lease expiry and a
+                              # new generation resuming without duplicates; a restart
+                              # while waiting for a human (tests/test_recovery_e2e.py)
 ```
+
+Gemini behavior is covered by contract tests with recorded responses and the SDK's
+own error types (`tests/test_gemini_contract.py`): each prompt type (parse,
+requirements, judge, evaluator, advice, controller) against valid output, malformed
+JSON, missing fields, a safety block, 429, 5xx and a timeout, asserting the
+classification, the rules fallback and the cost-ledger rows. No test needs a key or
+the network. The live check is a separate operator script, never collected by
+pytest: `python scripts/smoke_live.py` runs one tiny capped run (`max_cost_usd` ≤
+0.05) against the real API. See the
+[production readiness checklist](docs/production-readiness.md) for the full
+deploy sequence.
 
 Migration paths are checked with the real CLI against throwaway databases (the
 `DB_USER` needs `CREATEDB`):

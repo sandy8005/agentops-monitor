@@ -330,12 +330,45 @@ def _is_tracking_param(key):
     return k.startswith("utm") or k in _TRACKING_PARAMS
 
 
+_URL_BAD_HOST_CHARS = set('<>"\\^`{|}')
+
+
+def safe_http_url(u):
+    """
+    The stripped URL when it is a usable http(s) link, else None. Provider URLs are
+    untrusted data, so this NEVER raises: non-strings, whitespace or control
+    characters anywhere, a non-http(s) scheme, an empty/malformed host, a bad IPv6
+    bracket or an out-of-range port all mean "no URL". Used for dedupe identity,
+    for the stored apply_url and for every URL the API returns.
+    """
+    from urllib.parse import urlsplit
+    if not isinstance(u, str):
+        return None
+    u = u.strip()
+    if not u or any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in u):
+        return None
+    try:
+        parts = urlsplit(u)
+        host = parts.hostname
+        port = parts.port
+    except ValueError:
+        return None
+    if parts.scheme.lower() not in ("http", "https") or not host:
+        return None
+    if any(c in _URL_BAD_HOST_CHARS for c in host):
+        return None
+    if port is not None and not (1 <= port <= 65535):
+        return None
+    return u
+
+
 def _canonical_url(job):
     """
     A normalized apply/source URL used as the PRIMARY dedup identity. Two postings
     with the same canonical URL are the same job (even across providers); postings
     with DIFFERENT URLs are kept DISTINCT. Returns None when the posting has no usable
-    URL (then we fall back to the content fingerprint).
+    URL (then we fall back to the content fingerprint). An invalid URL (safe_http_url)
+    counts as no URL; this never raises on provider data.
 
     Normalization is deliberately conservative (urllib.parse, not string surgery):
       * scheme and HOST are lowercased (they're case-insensitive); default ports and
@@ -347,17 +380,14 @@ def _canonical_url(job):
     """
     from urllib.parse import urlsplit, urlunsplit, parse_qsl, urlencode
     for f in ("apply_url", "url", "source_url"):
-        u = job.get(f)
-        if not (u and isinstance(u, str) and u.strip()):
+        u = safe_http_url(job.get(f))
+        if u is None:
             continue
-        try:
-            parts = urlsplit(u.strip())
-        except ValueError:
-            continue
-        if not parts.netloc:
-            continue
+        parts = urlsplit(u)          # cannot raise: safe_http_url parsed it already
         scheme = parts.scheme.lower()
-        host = (parts.hostname or "").lower()
+        host = parts.hostname.lower()
+        if ":" in host:              # IPv6 literal keeps its brackets
+            host = f"[{host}]"
         port = parts.port
         if port and not ((scheme == "http" and port == 80) or (scheme == "https" and port == 443)):
             host = f"{host}:{port}"
@@ -509,7 +539,7 @@ def geo_eligibility(job, requested_location):
 
 def work_mode_status(job, work_mode, allow_hybrid=False):
     """How a posting relates to the work-mode constraint:
-      'verified' — its stated mode (or a "remote" location) satisfies it;
+      'verified' — its stated mode (or an explicitly "remote" location) satisfies it;
       'unknown'  — it states no mode: kept (work_mode_ok) but NEVER presented as a
                    confirmed match (work_mode_verified = False);
       'mismatch' — it states a different mode.
@@ -520,11 +550,45 @@ def work_mode_status(job, work_mode, allow_hybrid=False):
             else "unknown" if _stated_work_mode(job) is None else "mismatch")
 
 
+# A location counts as STATING remote only when it says so plainly: "Remote",
+# "Remote - Europe", "US (Remote)", "Fully remote". Negated, hedged or mixed
+# wording ("Not remote", "Remote-friendly", "Remote possible", "Hybrid (remote 2
+# days)", "Remote or onsite") states no mode, so the posting stays "unknown".
+_LOC_REMOTE_RE = re.compile(r"\bremote\b")
+_LOC_REMOTE_DOUBT_RE = re.compile(
+    r"\b(?:not|non|no|without|hybrid|on-?site|in[- ]office|office|partial(?:ly)?|"
+    r"possible|optional|option|friendly|flexible|occasional(?:ly)?|negotiable|"
+    r"considered|available|may|some|or)\b|remote-")
+
+
+def _location_says_remote(location):
+    loc = (location or "").lower()
+    return bool(_LOC_REMOTE_RE.search(loc)) and not _LOC_REMOTE_DOUBT_RE.search(loc)
+
+
 def _stated_work_mode(job):
     jm = (job.get("work_mode") or "").lower().strip()
-    if not jm and "remote" in (job.get("location") or "").lower():
+    if jm == "unknown":            # a label, not a stated mode
+        jm = ""
+    if not jm and _location_says_remote(job.get("location")):
         jm = "remote"
     return jm or None
+
+
+def work_mode_verified(job, work_mode=None, allow_hybrid=False):
+    """
+    The posting's work_mode_verified flag, FAIL-CLOSED: an explicit boolean flag is
+    used as is; a missing (or non-boolean) flag is computed from the posting's
+    stated mode, never defaulted to True. With the constraint known, verified means
+    work_mode_status == 'verified'; without it (a caller that doesn't know the
+    goal), only a posting that states a mode is verified.
+    """
+    flag = job.get("work_mode_verified")
+    if isinstance(flag, bool):
+        return flag
+    if work_mode:
+        return work_mode_status(job, work_mode, allow_hybrid) == "verified"
+    return _stated_work_mode(job) is not None
 
 
 def work_mode_ok(job, work_mode, allow_hybrid=False, unknown=True):
@@ -607,7 +671,7 @@ def search_jobs(target_role=None, location=None, work_mode=None,
     all_jobs = [
         {"id": r[0], "title": r[1], "company": r[2], "description": r[3],
          "location": r[4], "work_mode": r[5], "employment_type": r[6], "source": r[7],
-         "external_id": r[8], "last_seen_at": r[9], "apply_url": r[10],
+         "external_id": r[8], "last_seen_at": r[9], "apply_url": safe_http_url(r[10]),
          "assoc_locations": set(r[11] or [])}
         for r in rows
     ]

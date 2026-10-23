@@ -1064,6 +1064,17 @@ def get_run_rankings(run_id: int, user: dict = Depends(require_auth)):
                 "reason": r[4], "evidence": r[5], "method": r[6], "status": r[7],
                 "validation_notes": r[8]})
 
+        # Which requirements the advice was built on: the evaluation's own
+        # snapshot, or one RECONSTRUCTED for a run evaluated before migration 0016
+        # (latest snapshot per job; the advice tool reads the latest evaluation's).
+        cur.execute("""
+            SELECT DISTINCT ON (job_id) job_id, provenance->>'provenance'
+            FROM evaluation_requirements WHERE run_id = %s AND requirements IS NOT NULL
+            ORDER BY job_id, id DESC
+        """, (run_id,))
+        reqs_basis = {jid: ("reconstructed" if p == "reconstructed" else "evaluation")
+                      for jid, p in cur.fetchall()}
+
         cur.execute("""
             SELECT rank_position, job_id, title, company, score, final_decision, apply_url,
                    work_mode, work_mode_verified
@@ -1089,6 +1100,10 @@ def get_run_rankings(run_id: int, user: dict = Depends(require_auth)):
             "work_mode": wm, "work_mode_verified": wm_ok,
             "advice": advice,
             "suggestions": suggestions_by_job.get(job_id, []) if job_id is not None else [],
+            # "reconstructed" = advice built on requirements re-derived for a run
+            # evaluated before snapshots existed (null when there is no advice).
+            "advice_requirements": (reqs_basis.get(job_id)
+                                    if advice is not None and job_id is not None else None),
         })
     return {"run_id": run_id, "rankings": rankings}
 
@@ -1130,9 +1145,10 @@ def _safe_action(a):
 
 
 def _safe_url(url):
-    """Only http(s) provider URLs are returned as clickable links (R07)."""
-    u = (url or "").strip()
-    return u if u.lower().startswith(("https://", "http://")) else None
+    """Only valid http(s) provider URLs are returned as clickable links (R07):
+    bad scheme, host, IPv6 bracket or port means no link (job_source.safe_http_url)."""
+    from job_source import safe_http_url
+    return safe_http_url(url)
 
 
 @app.get("/runs/{run_id}/agent")
@@ -1163,6 +1179,8 @@ def get_agent_timeline(run_id: int, user: dict = Depends(require_auth)):
                      "unknown_cost_upper_bound_usd": usage["unknown_cost_bound_usd"],
                      "in_flight_reserved_usd": usage["reserved_open_usd"],
                      "open_reservations": usage["open_reservations"],
+                     # the FULL upper bound: known + unknown-call bounds + in flight
+                     "upper_bound_usd": usage["committed_usd"],
                      "committed_usd": usage["committed_usd"],
                      "limit_usd": ((row[1] or {}).get("limits") or {}).get("max_cost_usd"),
                      # never complete while a reservation is open (in flight)

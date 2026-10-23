@@ -91,6 +91,24 @@ def _is_429(msg):
     return "429" in msg or "RESOURCE_EXHAUSTED" in msg
 
 
+def _provider_unavailable(exc):
+    """A model-provider outage that the message heuristics miss: any 5xx from the
+    Gemini SDK (500 INTERNAL, 504 DEADLINE_EXCEEDED, ...) and transport failures
+    (httpx / builtin timeouts and connection errors, often with an EMPTY message).
+    Matched by type and status code, never by message text."""
+    if not isinstance(exc, BaseException):
+        return False
+    if isinstance(exc, (TimeoutError, ConnectionError)):
+        return True
+    mod = type(exc).__module__ or ""
+    if mod.startswith(("httpx", "httpcore")):
+        return True
+    if mod.startswith("google"):
+        code = getattr(exc, "code", None)
+        return isinstance(code, int) and 500 <= code <= 599
+    return False
+
+
 def classify_exception(exc):
     """
     Best-effort mapping of an exception (or an error string) to an ErrorCode, for the
@@ -122,6 +140,8 @@ def classify_exception(exc):
             return ErrorCode.LLM_QUOTA_EXHAUSTED
         return ErrorCode.LLM_RATE_LIMITED
     if "503" in msg or "UNAVAILABLE" in msg or "timeout" in low or "timed out" in low:
+        return ErrorCode.LLM_UNAVAILABLE
+    if _provider_unavailable(exc):
         return ErrorCode.LLM_UNAVAILABLE
     if name == "CostUnknown" or "cost_unknown" in low:
         return ErrorCode.COST_UNKNOWN

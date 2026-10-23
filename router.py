@@ -351,6 +351,30 @@ def _get_requirements(state, job, run_id, step_id):
     return reqs, False, "rule_based"
 
 
+def reconstruct_requirements(job):
+    """
+    Requirements for an evaluation that has NO snapshot (it ran before migration
+    0016), for advice only. Never a model call: an unexpired requirements-cache
+    row is reused, otherwise the rules extractor runs. Returns (normalized
+    requirements, provenance tagged "reconstructed"), or None when the posting text
+    is gone (erased / blank), since nothing can be derived from it.
+    """
+    from rule_requirements import extract_requirements_rule_based
+    from skills import normalize_requirements
+    from cache_version import reqs_cache_version as _rcv
+    if not (job.get("description") or "").strip():
+        return None
+    cached, prov = _reqs_cache_get(_reqs_cache_key(job.get("title") or "", job["description"]))
+    if cached is not None:
+        return normalize_requirements(cached), {
+            "provenance": "reconstructed", "source": "cache",
+            "extraction_method": (prov or {}).get("extraction_method") or "unknown",
+            "source_model": (prov or {}).get("source_model"), "reqs_cache_version": _rcv()}
+    return normalize_requirements(extract_requirements_rule_based(job)), {
+        "provenance": "reconstructed", "source": "rules",
+        "extraction_method": "rule_based", "reqs_cache_version": _rcv()}
+
+
 _REAL_DECISIONS = {"Apply", "Maybe", "Skip"}
 
 
@@ -376,8 +400,16 @@ def _store_final_decision(step_id, final_decision):
 
 
 def _parse_decision(raw):
-    cleaned = raw.strip().replace("```json", "").replace("```", "").strip()
-    return JobDecision(**json.loads(cleaned)).decision.value
+    """The judge's decision. Unusable MODEL output (not JSON, not an object, missing
+    or invalid fields) is ModelOutputInvalid, a degraded-model condition, so it is
+    never confused with a bug in our own code."""
+    from llm import ModelOutputInvalid
+    from pydantic import ValidationError
+    cleaned = (raw or "").strip().replace("```json", "").replace("```", "").strip()
+    try:
+        return JobDecision(**json.loads(cleaned)).decision.value
+    except (json.JSONDecodeError, ValidationError, TypeError) as e:
+        raise ModelOutputInvalid(f"judge: unusable model output ({type(e).__name__})") from None
 
 
 def _step_needs_review(step_id):
@@ -416,6 +448,13 @@ def _evaluation_selection(run_id, step_id, flagged):
         return None
     h = int(hashlib.sha256(f"{run_id}:{step_id}".encode()).hexdigest()[:8], 16)
     return "sampled" if (h / 0xFFFFFFFF) < rate else None
+
+
+def _work_mode_verified(job):
+    """The job's work_mode_verified flag; a missing one is computed from the stated
+    mode (job_source.work_mode_verified), never defaulted to True."""
+    from job_source import work_mode_verified
+    return work_mode_verified(job)
 
 
 def do_process_job(state, run_id):
@@ -549,6 +588,8 @@ def do_process_job(state, run_id):
                     # The call succeeded but the structured output was invalid — an
                     # AI-quality failure, not a judgment. Ask a human. (Logged by
                     # exception TYPE only: the message can quote model output.)
+                    if must_propagate(parse_err):
+                        raise
                     judge_status = "invalid_output"
                     judge_skip_reason = "parse_error"
                     llm_decision = "Unknown"
@@ -648,7 +689,7 @@ def do_process_job(state, run_id):
             # job is never presented (or, for a remote goal, counted) as a
             # confirmed match of the constraint (agent_store.qualified_job_ids).
             "work_mode": job.get("work_mode") or "unknown",
-            "work_mode_verified": job.get("work_mode_verified", True),
+            "work_mode_verified": _work_mode_verified(job),
             "evaluation": eval_selection or "not_requested",
         })
 

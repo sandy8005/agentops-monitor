@@ -578,11 +578,18 @@ def qualified_job_ids(run_id, qualifying_decisions, verified_only=False,
     verified_only, matches that rest ONLY on rule-based requirement extraction (no
     judge, no human) are excluded. With require_work_mode_verified, matches whose
     posting states no work mode (work_mode_verified = false in the step context)
-    are excluded — shown, not counted. Raises on database errors — an unknown
+    are excluded — shown, not counted; a context WITHOUT the flag counts only when
+    the stored posting states remote (fail closed). Raises on database errors — an unknown
     count is never reported as zero (N07)."""
     extra = f" AND NOT {_UNVERIFIED_SQL}" if verified_only else ""
     if require_work_mode_verified:
-        extra += " AND COALESCE(retrieved_context->>'work_mode_verified', 'true') <> 'false'"
+        # Fail closed: a context without the flag (older steps) counts only when
+        # the stored posting states remote; anything else is unverified.
+        extra += """ AND CASE WHEN retrieved_context->>'work_mode_verified' IS NOT NULL
+                              THEN retrieved_context->>'work_mode_verified' = 'true'
+                              ELSE EXISTS (SELECT 1 FROM job_postings p
+                                           WHERE p.id::text = retrieved_context->>'job_id'
+                                             AND lower(btrim(p.work_mode)) = 'remote') END"""
     with get_connection() as conn:
         cur = conn.cursor()
         cur.execute(f"""
@@ -715,7 +722,7 @@ def persist_rankings(run_id, generation, ranked):
             """, (run_id, r.get("job_id"), pos, r.get("title"), r.get("company"),
                   r.get("score"), r.get("final_decision") or r.get("decision"),
                   r.get("apply_url"), r.get("work_mode"),
-                  r.get("work_mode_verified", True)))
+                  r.get("work_mode_verified") is True))   # missing -> unverified
 
 
 def persist_advice(run_id, generation, job_id, title, advice_text, suggestions,

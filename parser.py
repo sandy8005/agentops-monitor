@@ -691,6 +691,14 @@ RULES:
             f"parse_resume: expected a JSON object, got "
             f"{type(parsed).__name__} (step_id={step_id})"
         )
+    # An object without the core fields is unusable output, not "a resume with no
+    # skills": normalizing it would yield an empty parse that the router CACHES as
+    # a model parse. The prompt requires every key, so a missing or mistyped
+    # skills/experience field takes the rules fallback instead.
+    if not isinstance(parsed.get("skills"), (list, str)) or \
+            not isinstance(parsed.get("experience", []), list):
+        raise ModelOutputInvalid(
+            f"parse_resume: required fields missing or mistyped (step_id={step_id})")
 
     # --- Normalize each field into the canonical shape --------------------
     skills = parsed.get("skills") or []

@@ -46,8 +46,30 @@ def _skill_in(skill, text_lower, tokens):
     return s in tokens
 
 
+# A count: digits or a spelled-out number (one-twenty), optionally followed by the
+# same value in parentheses ("three (3)", "3 (three)").
+_NUMBER_WORDS = {w: i for i, w in enumerate(
+    "zero one two three four five six seven eight nine ten eleven twelve thirteen "
+    "fourteen fifteen sixteen seventeen eighteen nineteen twenty".split()) if i}
+_NUM = r"(?:\d{1,2}|" + "|".join(sorted(_NUMBER_WORDS, key=len, reverse=True)) + r")\b"
+_PAREN_NUM = r"(?:\s*\(\s*" + _NUM + r"\s*\))?"
 _YEARS_RE = re.compile(
-    r"(\d{1,2})\s*(?:\+|plus)?\s*(?:(?:-|–|to)\s*(\d{1,2})\s*)?(?:years?|yrs?)\b")
+    r"\b(" + _NUM + r")" + _PAREN_NUM + r"\s*(?:\+|plus)?\s*"
+    r"(?:(?:-|–|to)\s*(" + _NUM + r")" + _PAREN_NUM + r"\s*\+?\s*)?"
+    r"(?:or more\s+)?(?:years?|yrs?)\b")
+
+
+def _num_value(token):
+    """int value of a _NUM token ("3" or "three")."""
+    return int(token) if token.isdigit() else _NUMBER_WORDS[token]
+
+
+# A soft UPPER value right after a mention: "3-5 years of experience, ideally 5"
+# or "(preferably 5 years)". It applies to the higher figure only, so the minimum
+# stays the mention's low value (see years_requirement_mentions).
+_SOFT_UPPER_RE = re.compile(
+    r"[^.;,()]{0,60}?(?:,\s*|\s*\(\s*|\s+-\s+)(?:ideally|preferably)\s+(" + _NUM + r")"
+    r"\s*\+?\s*(?:(?:years?|yrs?)\b)?\s*\)?")
 # Sentence-level context that makes a "N years" mention NOT a minimum requirement.
 _YEARS_NOT_REQUIRED = re.compile(
     r"\b(preferred|nice to have|nice-to-have|bonus|a plus|is a plus|ideally|desirable|"
@@ -56,9 +78,9 @@ _YEARS_CONDITIONAL = re.compile(
     r"\b(for (the )?(manager|management|lead|leadership|senior|principal|staff)\b|"
     r"if applying|for this level)")
 _YEARS_NOT_EXPERIENCE = re.compile(
-    r"\b(years? old|years? ago|past \d{1,2} years|last \d{1,2} years|founded|in business|"
-    r"for over \d{1,2} years|we have been|our company|growing for|contract length|"
-    r"(\d{1,2})[- ]year (contract|term|warranty|commitment))")
+    r"\b(years? old|years? ago|past " + _NUM + r" years|last " + _NUM + r" years|founded|"
+    r"in business|for over " + _NUM + r" years|we have been|our company|growing for|"
+    r"contract length|" + _NUM + r"[- ]year (contract|term|warranty|commitment))")
 
 
 # A mention that states the OVERALL requirement for the role, judged within the
@@ -171,7 +193,7 @@ def years_requirement_mentions(text_lower):
         if _YEARS_CONDITIONAL.search(sentence) or _YEARS_NOT_EXPERIENCE.search(sentence):
             continue
         for m in _YEARS_RE.finditer(sentence):
-            n = int(m.group(1))
+            n = _num_value(m.group(1))
             if not 0 < n <= 30:
                 continue
             section = None
@@ -179,9 +201,17 @@ def years_requirement_mentions(text_lower):
                 if line_start > offset + m.start():
                     break
                 section = line_ctx
-            if _years_mention_is_preferred(sentence, m.start(), m.end(), section):
+            hi = _num_value(m.group(2)) if m.group(2) else n
+            # "3-5 years, ideally 5": the soft word is about the HIGHER value only,
+            # so it is blanked (offsets kept) before classifying the minimum.
+            judged = sentence
+            soft = _SOFT_UPPER_RE.match(sentence, m.end())
+            if soft and _num_value(soft.group(1)) > n:
+                kw = list(re.finditer(r"ideally|preferably", sentence[m.end():soft.start(1)]))
+                a, b = m.end() + kw[-1].start(), soft.end()
+                judged = sentence[:a] + " " * (b - a) + sentence[b:]
+            if _years_mention_is_preferred(judged, m.start(), m.end(), section):
                 continue
-            hi = int(m.group(2)) if m.group(2) else n
             is_overall = bool(_YEARS_OVERALL.search(_clause_around(sentence, m.start(), m.end())))
             out.append((float(n), float(max(hi, n)), is_overall))
     return out

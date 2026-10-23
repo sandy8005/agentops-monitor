@@ -50,7 +50,14 @@ def _state():
 
 
 def test_missing_snapshot_fails_the_item_visibly(advice_env, monkeypatch):
+    # Backlog E (round 4) reconstructs a pre-0016 snapshot from the posting; the
+    # visible failure remains when that is impossible (posting text erased).
     monkeypatch.setattr(agent_store, "evaluation_requirements", lambda rid, sid: None)
+    monkeypatch.setattr(agent_store, "load_postings",
+                        lambda ids: {i: {"id": i, "title": "Data Engineer", "company": "Acme",
+                                         "description": ""} for i in ids})
+    monkeypatch.setattr(agent_store, "record_evaluation_requirements",
+                        lambda *a, **k: pytest.fail("nothing to reconstruct from"))
     state = _state()
     ctx = agent_tools.ToolContext(1, 1, GOAL, state, None, 4)
     obs, _sid, _p = agent_tools.execute(ctx, "generate_advice", {"job_ids": [1]})
