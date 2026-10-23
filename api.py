@@ -6,7 +6,7 @@ from fastapi import (FastAPI, HTTPException, UploadFile, File,
 from fastapi.responses import HTMLResponse, FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.sessions import SessionMiddleware
-import os, tempfile
+import json, os, re, tempfile
 from typing import Literal, Optional
 from pydantic import BaseModel, Field, ConfigDict
 from llm import create_run_tx
@@ -155,6 +155,103 @@ def _redact(value):
     if not REDACT_TRACE_PAYLOADS or value is None:
         return value
     return _REDACTED
+
+
+# ---- Grounding summary (read-only; shown on review cards and in the step trace) --
+# A reviewer must see WHY a job paused, but retrieved_context as a whole stays
+# redacted. This is an allow-listed projection of it (and of the step's
+# evaluation_requirements snapshot), built field by field:
+#   * reason / field / classification / status values are backend-produced CODES,
+#     passed through only if they match _CODE_RE;
+#   * numbers are numbers, work_mode is a closed vocabulary;
+#   * skill names of UNCERTAIN and CLASSIFIED requirements are shown even when
+#     redaction is on: the backend verified each one occurs in the public posting
+#     (job-derived, like the job title and company already shown; never
+#     resume-derived), and only skill-like strings (<= _MAX_SKILL_CHARS) are kept;
+#   * skill names of UNGROUNDED requirements are model claims the posting does NOT
+#     contain (model output, which redaction hides): with redaction on only their
+#     field and count are returned.
+# Resume-side grounding is not persisted per step, so it is not part of this.
+_CODE_RE = re.compile(r"^[a-z][a-z0-9_]{0,39}$")
+_MAX_SKILL_CHARS = 40
+_WORK_MODES = {"remote", "hybrid", "onsite", "unknown"}
+
+
+def _code(value):
+    return value if isinstance(value, str) and _CODE_RE.match(value) else None
+
+
+def _skill(value):
+    if not isinstance(value, str):
+        return None
+    v = " ".join(value.split())
+    return v if 0 < len(v) <= _MAX_SKILL_CHARS else None
+
+
+def _num(value):
+    return float(value) if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+def _as_dict(value):
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except ValueError:
+            return None
+    return value if isinstance(value, dict) else None
+
+
+def _grounding_summary(context, requirements=None):
+    """Compact grounding summary of one evaluation step, or None for a step with
+    no evaluation context (resume parse, search, ...). See the policy above."""
+    ctx = _as_dict(context)
+    reqs = _as_dict(requirements) or {}
+    if not ctx or not any(k in ctx for k in ("uncertain_requirements", "ungrounded_requirements",
+                                             "ungrounded_min_years", "work_mode_verified")):
+        return None
+    uncertain = []
+    for u in ctx.get("uncertain_requirements") or []:
+        if isinstance(u, dict):
+            uncertain.append({"skill": _skill(u.get("skill")), "field": _code(u.get("field")),
+                              "reason": _code(u.get("reason"))})
+    ungrounded = []
+    for u in ctx.get("ungrounded_requirements") or []:
+        if isinstance(u, dict):
+            ungrounded.append({"skill": None if REDACT_TRACE_PAYLOADS else _skill(u.get("skill")),
+                               "field": _code(u.get("field"))})
+    classification, class_counts = None, None
+    if isinstance(reqs.get("requirement_classification"), list):
+        classification, class_counts = [], {}
+        for c in reqs["requirement_classification"]:
+            if not isinstance(c, dict):
+                continue
+            cls = _code(c.get("classification")) or "other"
+            class_counts[cls] = class_counts.get(cls, 0) + 1
+            classification.append({"skill": _skill(c.get("skill")), "field": _code(c.get("field")),
+                                   "classification": cls})
+    if "ungrounded_min_years" not in ctx:
+        min_years = {"status": "not_recorded"}
+    else:
+        umy = ctx.get("ungrounded_min_years")
+        if isinstance(umy, dict):
+            min_years = {"status": "ungrounded", "stated": _num(umy.get("stated")),
+                         "used": _num(umy.get("used")) if umy.get("reason") == "range_upper_bound"
+                         else 0.0, "reason": _code(umy.get("reason"))}
+        else:
+            min_years = {"status": "grounded", "used": _num(reqs.get("min_years_experience"))}
+    wm = ctx.get("work_mode")
+    verified = ctx.get("work_mode_verified")
+    return {
+        "uncertain_requirements": uncertain,
+        "ungrounded_requirements": ungrounded,
+        "requirement_classification": classification,
+        "min_years": min_years,
+        "work_mode": wm if wm in _WORK_MODES else None,
+        "work_mode_verified": verified if isinstance(verified, bool) else None,
+        "counts": {"uncertain": len(uncertain), "ungrounded": len(ungrounded),
+                   "classification": class_counts},
+        "skill_names_redacted": {"ungrounded_requirements": REDACT_TRACE_PAYLOADS},
+    }
 
 
 def get_connection():
@@ -551,15 +648,23 @@ def pending_reviews(user: dict = Depends(require_auth)):
     """
     with get_connection() as conn:
         cur = conn.cursor()
+        # The paused step's grounding summary rides along (same single query; the
+        # step and snapshot are joined through the owner-scoped run row).
         cur.execute("""
-            SELECT id, target_role, location, status, pending_review
-            FROM runs
-            WHERE user_id = %s AND status = 'waiting_for_human'
-            ORDER BY id DESC LIMIT 50
+            SELECT r.id, r.target_role, r.location, r.status, r.pending_review,
+                   s.retrieved_context, er.requirements
+            FROM runs r
+            LEFT JOIN steps s
+                   ON s.run_id = r.id AND s.id::text = r.pending_review->>'step_id'
+            LEFT JOIN evaluation_requirements er
+                   ON er.run_id = r.id AND er.step_id = s.id
+            WHERE r.user_id = %s AND r.status = 'waiting_for_human'
+            ORDER BY r.id DESC LIMIT 50
         """, (user["id"],))
         rows = cur.fetchall()
     return [{"run_id": r[0], "target_role": r[1], "location": r[2], "status": r[3],
-             "pending_review": r[4] or {}} for r in rows]
+             "pending_review": r[4] or {},
+             "grounding": _grounding_summary(r[5], r[6])} for r in rows]
 
 
 @app.post("/runs")
@@ -798,6 +903,10 @@ def get_run(run_id: int, user: dict = Depends(require_auth)):
                 "completeness_score": ev[3], "hallucination_detected": ev[4],
                 "hallucinated_claims": _redact(ev[5]), "notes": _redact(ev[6])}
 
+        cur.execute("SELECT step_id, requirements FROM evaluation_requirements WHERE run_id = %s",
+                    (run_id,))
+        reqs_by_step = {r[0]: r[1] for r in cur.fetchall()}
+
         steps = []
         for s in step_rows:
             step_id = s[0]
@@ -808,6 +917,8 @@ def get_run(run_id: int, user: dict = Depends(require_auth)):
                 "needs_human_review": s[6], "review_status": s[7],
                 "error_message": _redact(s[8]),
                 "retrieved_context": _redact(s[9]),
+                # allow-listed projection of the context (see _grounding_summary)
+                "grounding": _grounding_summary(s[9], reqs_by_step.get(step_id)),
                 "reviewer": s[10], "review_comment": s[11], "review_reason": s[12],
                 "score_breakdown": s[13],
                 "final_decision": s[14],

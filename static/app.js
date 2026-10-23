@@ -88,6 +88,41 @@ var NL = String.fromCharCode(10);
         .replace(/"/g,'&quot;').replace(/'/g,'&#39;');
     }
 
+    // Error text for a failed response. Proxies and gateways answer 413 / 502 / 504
+    // with HTML, so the body is parsed defensively: a FastAPI JSON `detail` (a
+    // string, or the 422 validation list) when there is one, otherwise the HTTP
+    // status line. Never throws. The result is plain text: callers put it in
+    // textContent / alert(), or through escapeHtml().
+    async function readError(res, fallback) {
+      var detail = '';
+      try {
+        var body = JSON.parse(await res.text());
+        var d = body && body.detail;
+        if (typeof d === 'string') {
+          detail = d;
+        } else if (Array.isArray(d)) {
+          detail = d.map(function(x) {
+            if (!x || typeof x !== 'object') return String(x);
+            var loc = Array.isArray(x.loc) ? x.loc.filter(function(p) { return p !== 'body'; }).join('.') : '';
+            return (loc ? loc + ': ' : '') + (x.msg || 'invalid value');
+          }).join('; ');
+        }
+      } catch (e) { /* not JSON (HTML error page, empty body, aborted read) */ }
+      if (detail) return detail;
+      return (fallback ? fallback + ': ' : '') + 'HTTP ' + res.status +
+        (res.statusText ? ' ' + res.statusText : '');
+    }
+
+    // Only http(s) URLs become links. A provider URL with any other scheme
+    // (javascript:, data:, ...) or that does not parse is not rendered at all.
+    function safeHttpUrl(u) {
+      if (typeof u !== 'string' || !u) return null;
+      try {
+        var parsed = new URL(u);
+        return (parsed.protocol === 'http:' || parsed.protocol === 'https:') ? parsed.href : null;
+      } catch (e) { return null; }
+    }
+
     async function uploadResume() {
       const fileInput = document.getElementById('resumeFile');
       const msg = document.getElementById('uploadMsg');
@@ -106,7 +141,7 @@ var NL = String.fromCharCode(10);
 
       try {
         const up = await csrfFetch('/upload', { method: 'POST', body: fd });
-        if (!up.ok) { const e = await up.json(); throw new Error(e.detail || 'upload failed'); }
+        if (!up.ok) throw new Error(await readError(up, 'upload failed'));
         const upData = await up.json();
         msg.textContent = upData.truncated
           ? upData.message
@@ -124,7 +159,7 @@ var NL = String.fromCharCode(10);
       const epoch = _sessionEpoch;
       try {
         const res = await fetch('/resumes');
-        if (!res.ok) throw new Error('failed to load resumes');
+        if (!res.ok) throw new Error(await readError(res, 'failed to load resumes'));
         const resumes = await res.json();
         if (epoch !== _sessionEpoch) return;
         if (resumes.length === 0) { div.innerHTML = '<div class="step">No saved resumes yet. Upload one above.</div>'; return; }
@@ -139,12 +174,18 @@ var NL = String.fromCharCode(10);
                 '<div><label>Location <span style="color:#8b8f9c;">(filters Adzuna; remote-only sources ignore it)</span></label><br><input type="text" id="loc_' + r.id + '" placeholder="Michigan" style="width:95%;"></div>' +
               '</div>' +
               '<div class="row" style="margin-top:6px;">' +
-                '<div><label>Work mode</label><br><select id="mode_' + r.id + '" style="width:100%;">' +
+                '<div><label>Work mode</label><br><select id="mode_' + r.id + '" data-workmode-for="' + escapeHtml(r.id) + '" style="width:100%;">' +
                   '<option value="">(any)</option><option value="remote">remote</option><option value="hybrid">hybrid</option><option value="onsite">onsite</option>' +
                 '</select></div>' +
                 '<div><label>Employment type</label><br><select id="emp_' + r.id + '" style="width:100%;">' +
                   '<option value="">(any)</option><option value="full-time">full-time</option><option value="part-time">part-time</option><option value="contract">contract</option><option value="internship">internship</option>' +
                 '</select></div>' +
+              '</div>' +
+              // Work-mode opt-ins (README "Job sources"): enabled by updateWorkModeOpts
+              // only for the modes the API honours them for.
+              '<div style="margin-top:6px;">' +
+                '<label style="color:#e4e6eb;"><input type="checkbox" id="hybrid_' + escapeHtml(r.id) + '" disabled style="width:auto;margin-right:6px;">Also accept hybrid postings (remote or onsite searches)</label><br>' +
+                '<label style="color:#e4e6eb;"><input type="checkbox" id="unknownwm_' + escapeHtml(r.id) + '" disabled style="width:auto;margin-right:6px;">Count postings with unknown work mode toward the goal (remote searches; always labeled "work mode unverified")</label>' +
               '</div>' +
               '<div style="margin-top:8px;">' +
                 '<label style="color:#e4e6eb;"><input type="checkbox" id="eval_' + r.id + '" style="width:auto;margin-right:6px;">Evaluate judged decisions with an LLM (extra API calls)</label>' +
@@ -167,8 +208,8 @@ var NL = String.fromCharCode(10);
                 '<label style="color:#e4e6eb;"><input type="checkbox" id="llmadv_' + r.id + '" style="width:auto;margin-right:6px;">Use Gemini to improve suggestion wording (optional; rules are always used)</label>' +
               '</div>' +
               '<div style="margin-top:8px;">' +
-                '<button class="btn-sm btn-approve" data-action="runResume" data-id="' + r.id + '">Run Search</button>' +
-                '<button class="btn-sm btn-reject" data-action="deleteResume" data-id="' + r.id + '">Delete</button>' +
+                '<button class="btn-sm btn-approve" data-action="runResume" data-id="' + escapeHtml(r.id) + '">Run Search</button>' +
+                '<button class="btn-sm btn-reject" data-action="deleteResume" data-id="' + escapeHtml(r.id) + '">Delete</button>' +
               '</div>' +
             '</div>';
           div.appendChild(el);
@@ -187,8 +228,14 @@ var NL = String.fromCharCode(10);
       const doEval = document.getElementById('eval_' + id).checked;
       // Run configuration goes in a JSON BODY — never in the URL, where it would end
       // up in proxy/access logs and browser history.
+      const hybridEl = document.getElementById('hybrid_' + id);
+      const unknownEl = document.getElementById('unknownwm_' + id);
       const payload = { resume_id: Number(id), target_role: role, location: loc,
                         work_mode: mode, employment_type: emp, evaluate: doEval,
+                        // Sent only for the modes they apply to (the API ignores them
+                        // otherwise; this keeps the request honest about what was asked).
+                        allow_hybrid: !!(hybridEl && hybridEl.checked && (mode === 'remote' || mode === 'onsite')),
+                        accept_unknown_work_mode: !!(unknownEl && unknownEl.checked && mode === 'remote'),
                         model_policy: document.getElementById('policy_' + id).value };
       // Every run uses the controller agent (the only execution engine).
       const costRaw = Number(document.getElementById('cost_' + id).value);
@@ -205,25 +252,50 @@ var NL = String.fromCharCode(10);
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload)
         });
-        if (!run.ok) { const e = await run.json(); throw new Error(e.detail || 'run failed'); }
+        if (!run.ok) throw new Error(await readError(run, 'run failed'));
         const runData = await run.json();
         setTimeout(function() { loadRuns(); selectRun(runData.run_id); }, 1500);
       } catch (err) { alert('Error: ' + err.message); }
     }
 
+    // "Also accept hybrid" applies to remote/onsite searches only; "count unknown
+    // work mode" to remote searches only (api.py _build_agent_goal). A checkbox that
+    // does not apply is disabled AND unchecked, so it can't be sent by accident.
+    function updateWorkModeOpts(id) {
+      var sel = document.getElementById('mode_' + id);
+      if (!sel) return;
+      var mode = sel.value;
+      [['hybrid_', mode === 'remote' || mode === 'onsite'], ['unknownwm_', mode === 'remote']]
+        .forEach(function(p) {
+          var cb = document.getElementById(p[0] + id);
+          if (!cb) return;
+          cb.disabled = !p[1];
+          if (!p[1]) cb.checked = false;
+        });
+    }
+
     async function cancelRun(id) {
       if (!confirm('Cancel run #' + id + '?')) return;
+      const epoch = _sessionEpoch;
       try {
         const res = await csrfFetch('/runs/' + id + '/cancel', { method: 'POST' });
-        if (!res.ok) { const e = await res.json(); throw new Error(e.detail || 'cancel failed'); }
+        if (!res.ok) throw new Error(await readError(res, 'cancel failed'));
       } catch (err) { alert('Error: ' + err.message); }
+      // Refresh right away (success or a 400 "cannot be cancelled" both mean the
+      // view is stale) instead of waiting for the next poll. A cancelled
+      // waiting_for_human run leaves the review set, so the panel must rebuild.
+      if (epoch !== _sessionEpoch) return;   // signed out meanwhile
+      _reviewSignature = null;
+      loadRuns();
+      renderGraphReviews();
+      if (String(_selectedRun) === String(id)) selectRun(_selectedRun);
     }
 
     async function deleteResume(id) {
       if (!confirm('Delete resume #' + id + '?')) return;
       try {
         const res = await csrfFetch('/resumes/' + id, { method: 'DELETE' });
-        if (!res.ok) { const e = await res.json(); throw new Error(e.detail || 'delete failed'); }
+        if (!res.ok) throw new Error(await readError(res, 'delete failed'));
         loadResumes();
       } catch (err) { alert('Error: ' + err.message); }
     }
@@ -233,7 +305,7 @@ var NL = String.fromCharCode(10);
       const epoch = _sessionEpoch;
       try {
         const res = await fetch('/runs');
-        if (!res.ok) throw new Error('failed to load runs');
+        if (!res.ok) throw new Error(await readError(res, 'failed to load runs'));
         const runs = await res.json();
         if (epoch !== _sessionEpoch) return;
         tbody.innerHTML = '';
@@ -282,8 +354,11 @@ var NL = String.fromCharCode(10);
           // The posting states no work mode: not a confirmed match of the constraint.
           html += ' <span class="note" title="the posting does not state its work mode">work mode unverified</span>';
         }
-        if (r.apply_url) {
-          html += ' <a href="' + escapeHtml(r.apply_url) + '" target="_blank" rel="noopener noreferrer">apply &#8599;</a>';
+        // Defense in depth (the API also filters, and the CSP blocks javascript:):
+        // only an http(s) URL becomes a link; anything else shows no link at all.
+        var applyHref = safeHttpUrl(r.apply_url);
+        if (applyHref) {
+          html += ' <a href="' + escapeHtml(applyHref) + '" target="_blank" rel="noopener noreferrer">apply &#8599;</a>';
         }
         var sug = r.suggestions || [];
         if (sug.length) {
@@ -305,6 +380,65 @@ var NL = String.fromCharCode(10);
         html += '</div>';
       }
       return html;
+    }
+
+    // Grounding summary of one evaluation step (api.py _grounding_summary): which
+    // requirements were kept out of the score and why, the min-years check, and
+    // whether the posting states its work mode. Values are backend codes, numbers
+    // or posting-verified skill names; all are escaped.
+    var GROUNDING_REASON = {
+      negated: 'the posting negates it',
+      classified_preferred: 'labeled required, but the posting marks it preferred',
+      classified_required: 'labeled preferred, but the posting marks it required',
+      not_in_posting: 'not stated in the posting',
+      range_upper_bound: 'upper end of a stated range'
+    };
+    var GROUNDING_FIELD = { required_skills: 'required', preferred_skills: 'preferred', required_any_of: 'one-of' };
+
+    function renderGrounding(g) {
+      if (!g) return '';
+      var html = '';
+      var unc = g.uncertain_requirements || [];
+      if (unc.length) {
+        html += '<div class="reason">Uncertain requirements (' + escapeHtml(unc.length) + ', not scored): ' +
+          unc.map(function(u) {
+            return '<strong>' + escapeHtml(u.skill || '(name not shown)') + '</strong> (' +
+              escapeHtml(GROUNDING_FIELD[u.field] || u.field || '?') + ') &mdash; ' +
+              escapeHtml(GROUNDING_REASON[u.reason] || u.reason || 'uncertain');
+          }).join('; ') + '</div>';
+      }
+      var ung = g.ungrounded_requirements || [];
+      if (ung.length) {
+        var names = ung.filter(function(u) { return u.skill; }).map(function(u) { return escapeHtml(u.skill); });
+        html += '<div class="note">' + escapeHtml(ung.length) + ' model-claimed requirement(s) not found in the posting were dropped' +
+          (names.length ? ': ' + names.join(', ') : ' (names hidden by trace redaction)') + '</div>';
+      }
+      var my = g.min_years || {};
+      if (my.status === 'ungrounded') {
+        html += '<div class="note">Min. years: model said ' + escapeHtml(my.stated == null ? '?' : my.stated) +
+          ' &mdash; ' + escapeHtml(GROUNDING_REASON[my.reason] || my.reason || 'not supported by the posting') +
+          (my.used ? '; using ' + escapeHtml(my.used) : '; no minimum applied') + '</div>';
+      } else if (my.status === 'grounded' && my.used) {
+        html += '<div class="note">Min. years: ' + escapeHtml(my.used) + ' (stated in the posting)</div>';
+      }
+      if (g.work_mode_verified === false) {
+        html += '<div><span class="note" title="the posting does not state its work mode">work mode unverified</span></div>';
+      } else if (g.work_mode_verified === true && g.work_mode) {
+        html += '<div class="note">Work mode: ' + escapeHtml(g.work_mode) + ' (stated in the posting)</div>';
+      }
+      var cls = g.requirement_classification;
+      if (cls && cls.length) {
+        var counts = (g.counts && g.counts.classification) || {};
+        html += '<details><summary>' + escapeHtml(cls.length) + ' requirement(s) checked against the posting (' +
+          Object.keys(counts).map(function(k) { return escapeHtml(counts[k]) + ' ' + escapeHtml(k.replace(/_/g, ' ')); }).join(', ') +
+          ')</summary>' +
+          cls.map(function(c) {
+            return '<div>' + escapeHtml(c.skill || '(name not shown)') + ' <span class="note">(' +
+              escapeHtml(GROUNDING_FIELD[c.field] || c.field || '?') + ' &rarr; ' +
+              escapeHtml(String(c.classification || '').replace(/_/g, ' ')) + ')</span></div>';
+          }).join('') + '</details>';
+      }
+      return html ? '<div class="call">' + html + '</div>' : '';
     }
 
     function renderEvidence(ev) {
@@ -379,7 +513,7 @@ var NL = String.fromCharCode(10);
       const signal = _detailAbort.signal;
       try {
         const res = await fetch('/runs/' + id, { signal: signal });
-        if (!res.ok) throw new Error('failed to load run ' + id);
+        if (!res.ok) throw new Error(await readError(res, 'failed to load run ' + id));
         const run = await res.json();
         if (gen !== _detailGen) return;       // a newer selection superseded this one
         var extras = '';
@@ -387,7 +521,7 @@ var NL = String.fromCharCode(10);
           try {
             const rr = await fetch('/runs/' + id + '/rankings', { signal: signal });
             if (rr.ok) extras += renderResults(await rr.json());
-            else extras += '<div class="step call-failed">Could not load results (HTTP ' + escapeHtml(rr.status) + ')</div>';
+            else extras += '<div class="step call-failed">Could not load results: ' + escapeHtml(await readError(rr, '')) + '</div>';
           } catch (e) {
             if (e.name === 'AbortError') return;
             extras += '<div class="step call-failed">Could not load results: ' + escapeHtml(e.message) + '</div>';
@@ -425,7 +559,15 @@ var NL = String.fromCharCode(10);
             escapeHtml(String(run.status).toUpperCase()) + '</strong> &nbsp; ' +
             (run.status === 'retrying' ? 'the last attempt failed with a transient error; waiting to retry'
                                        : 'waiting for a worker to pick this run up') +
-            ' &nbsp; <button class="btn-sm btn-reject" data-action="cancelRun" data-id="' + run.id + '">Cancel</button></div>';
+            ' &nbsp; <button class="btn-sm btn-reject" data-action="cancelRun" data-id="' + escapeHtml(run.id) + '">Cancel</button></div>';
+        }
+
+        if (run.status === 'waiting_for_human') {
+          // Paused at a review: POST /runs/{id}/cancel wakes the graph to cancel it
+          // (README "Cancellation"), so the run can be cancelled without deciding.
+          html += '<div class="step review"><strong class="flag">&#9679; WAITING FOR HUMAN</strong> &nbsp; ' +
+            'paused for your review (see Runs Awaiting Your Review)' +
+            ' &nbsp; <button class="btn-sm btn-reject" data-action="cancelRun" data-id="' + escapeHtml(run.id) + '">Cancel run</button></div>';
         }
 
         if (running) {
@@ -434,7 +576,7 @@ var NL = String.fromCharCode(10);
           html += '<div class="step progress">' +
             '<strong style="color:#60a5fa;">&#9679; RUNNING</strong> &nbsp; ' +
             done + '/' + total + ' steps done &nbsp; | &nbsp; current: ' + escapeHtml(current) +
-            ' &nbsp; <button class="btn-sm btn-reject" data-action="cancelRun" data-id="' + run.id + '">Cancel</button>' +
+            ' &nbsp; <button class="btn-sm btn-reject" data-action="cancelRun" data-id="' + escapeHtml(run.id) + '">Cancel</button>' +
             '</div>';
         }
 
@@ -478,6 +620,7 @@ var NL = String.fromCharCode(10);
           if (s.score_breakdown) {
             html += '<div class="bd">' + renderBreakdown(s.score_breakdown) + '</div>';
           }
+          html += renderGrounding(s.grounding);
           if (s.error_message) {
             html += '<div class="call call-failed">error: ' + escapeHtml(s.error_message) + '</div>';
           }
@@ -532,7 +675,7 @@ var NL = String.fromCharCode(10);
         // every few seconds; it must not pull the full trace of every paused run.)
         const epoch = _sessionEpoch;
         const res = await fetch('/reviews/pending');
-        if (!res.ok) throw new Error('failed to load reviews');
+        if (!res.ok) throw new Error(await readError(res, 'failed to load reviews'));
         const cards = await res.json();
         if (epoch !== _sessionEpoch) return;
         // R21: only rebuild the panel when the SET of pending reviews changed, so a
@@ -552,8 +695,9 @@ var NL = String.fromCharCode(10);
             html += '<div class="step review"><strong>Run #' + escapeHtml(r.id) + '</strong> &mdash; the agent needs your input' +
               '<div style="margin-top:6px;">' + escapeHtml(pr.question) + '</div><div style="margin-top:8px;">';
             for (const opt of (pr.options || [])) {
-              html += '<button class="btn-sm" data-action="answerRun" data-id="' + r.id + '" data-review="' + rid + '" data-answer="' + escapeHtml(opt) + '">' + escapeHtml(opt) + '</button>';
+              html += '<button class="btn-sm" data-action="answerRun" data-id="' + escapeHtml(r.id) + '" data-review="' + rid + '" data-answer="' + escapeHtml(opt) + '">' + escapeHtml(opt) + '</button>';
             }
+            html += ' &nbsp; <button class="btn-sm btn-reject" data-action="cancelRun" data-id="' + escapeHtml(r.id) + '" title="stop the whole run without answering">Cancel run</button>';
             html += '</div></div>';
             continue;
           }
@@ -564,13 +708,15 @@ var NL = String.fromCharCode(10);
             ' | LLM: ' + escapeHtml(pr.llm_decision) +
             '<div class="reason" style="margin-top:6px;">Why this paused: ' +
               escapeHtml(pr.review_reason || 'flagged for review') + '</div>' +
+            renderGrounding(card.grounding) +
             '<div style="margin-top:8px;">' +
               '<input id="grc_' + r.id + '_' + rid.replace(/[^a-zA-Z0-9_]/g, '_') + '" class="rev-input" placeholder="comment (optional)" style="width:260px;">' +
             '</div>' +
             '<div style="margin-top:8px;">' +
-              '<button class="btn-sm btn-approve" data-action="resumeRun" data-id="' + r.id + '" data-review="' + rid + '" data-decision="Apply">Apply</button>' +
-              '<button class="btn-sm" data-action="resumeRun" data-id="' + r.id + '" data-review="' + rid + '" data-decision="Maybe">Maybe</button>' +
-              '<button class="btn-sm btn-reject" data-action="resumeRun" data-id="' + r.id + '" data-review="' + rid + '" data-decision="Skip">Skip</button>' +
+              '<button class="btn-sm btn-approve" data-action="resumeRun" data-id="' + escapeHtml(r.id) + '" data-review="' + rid + '" data-decision="Apply">Apply</button>' +
+              '<button class="btn-sm" data-action="resumeRun" data-id="' + escapeHtml(r.id) + '" data-review="' + rid + '" data-decision="Maybe">Maybe</button>' +
+              '<button class="btn-sm btn-reject" data-action="resumeRun" data-id="' + escapeHtml(r.id) + '" data-review="' + rid + '" data-decision="Skip">Skip</button>' +
+              ' &nbsp; <button class="btn-sm btn-reject" data-action="cancelRun" data-id="' + escapeHtml(r.id) + '" title="stop the whole run without deciding this job">Cancel run</button>' +
             '</div></div>';
         }
         box.innerHTML = html;
@@ -592,7 +738,7 @@ var NL = String.fromCharCode(10);
           method: 'POST', headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(body)
         });
-        if (!res.ok) { const e = await res.json(); throw new Error(e.detail || 'resume failed'); }
+        if (!res.ok) throw new Error(await readError(res, 'resume failed'));
         _reviewSignature = null;
         setTimeout(function() {
           loadRuns(); renderGraphReviews();
@@ -631,7 +777,7 @@ var NL = String.fromCharCode(10);
       fd.append('password', p);
       try {
         const res = await csrfFetch('/login', { method: 'POST', body: fd });
-        if (!res.ok) { const e = await res.json(); throw new Error(e.detail || 'login failed'); }
+        if (!res.ok) throw new Error(await readError(res, 'login failed'));
         const user = await res.json();
         showApp(user);
       } catch (err) {
@@ -704,6 +850,11 @@ var NL = String.fromCharCode(10);
       if (!el) return;
       var fn = ACTIONS[el.dataset.action];
       if (fn) { ev.preventDefault(); fn(el); }
+    });
+    // Same delegation for <select> changes (no inline onchange under the CSP).
+    document.addEventListener('change', function(ev) {
+      var el = ev.target;
+      if (el && el.dataset && el.dataset.workmodeFor) updateWorkModeOpts(el.dataset.workmodeFor);
     });
 
     initApp();

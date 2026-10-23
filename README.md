@@ -252,7 +252,25 @@ A flagged job creates an immutable `review_requests` row and the graph pauses
 (`interrupt()`); the run becomes `waiting_for_human`. The reviewer answers in the
 dashboard (`POST /runs/{id}/resume` with the `review_id` of the card they saw — a
 stale tab gets 409). The human's decision becomes the authoritative
-`final_decision`, recorded with who decided and when.
+`final_decision`, recorded with who decided and when. A paused run can also be
+cancelled from its review card or run detail without deciding (`POST
+/runs/{id}/cancel`, see Cancellation).
+
+So the reviewer can see *why* a job paused, each `GET /reviews/pending` card and
+each evaluation step in `GET /runs/{id}` carries a read-only, owner-scoped
+`grounding` summary (`null` for non-evaluation steps): uncertain requirements
+(skill, field, reason), ungrounded requirements, the requirement classification
+from the step's `evaluation_requirements` snapshot, the min-years check
+(`grounded` / `ungrounded` with stated and applied values), `work_mode` /
+`work_mode_verified`, and counts. It is an allow-listed projection, not the
+context: only backend codes, numbers, the work-mode vocabulary and skill names of
+40 characters or fewer pass through. Uncertain and classified skill names are
+shown even with `REDACT_TRACE_PAYLOADS` on, because the backend verified that each
+occurs in the public posting (job-derived, like the job title; never
+resume-derived). Ungrounded skill names are model claims the posting does not
+contain, so with redaction on only their field and count are returned. Resume-side
+grounding (`ungrounded_experience`, `experience_corrected`, …) is not persisted per
+step and is not part of the summary.
 
 A resume job always leaves the run in a **deterministic** state: waiting (if the
 checkpoint is paused on a different review), repaired from a completed checkpoint,
@@ -307,7 +325,8 @@ wording need the user's confirmation. Rejected suggestions are never returned.
   resume is never routed to review. Fencing is a mitigation, not a security boundary.
 - **Trace redaction** — `REDACT_TRACE_PAYLOADS` (on by default) hides prompts,
   responses, tool I/O, context and free-text errors in API responses. Display control,
-  not deletion.
+  not deletion. The review `grounding` summary is an allow-listed exception (see
+  Human approval workflow).
 
 ### Logging policy
 
@@ -397,7 +416,8 @@ dashboard marks it "work mode unverified". For a **remote** search such matches 
 shown but **do not count toward the goal** unless the user opts in with
 `accept_unknown_work_mode` on `POST /runs`. Onsite and hybrid searches still count
 them (Adzuna rarely states a mode and its search is location-based), labeled the
-same way.
+same way. The dashboard's search form exposes both opt-ins as checkboxes, enabled
+only for the work modes they apply to.
 
 **Geographic eligibility** of remote postings is resolved **structurally**
 (`geo.py`): text becomes ISO countries + regions from a hierarchy, by longest-phrase
