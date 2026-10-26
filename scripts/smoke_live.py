@@ -19,9 +19,12 @@ What it asserts (exit 1 on any failure, 0 when all hold; check_run):
   * no failed LLM call, tool (provider) call, step or agent action attempt that was
     not recovered by a later success, and no error-coded agent action;
   * no judge returned invalid_output;
-  * no rules fallback (rules-decided action, rule-based requirements, judge
-    unavailable) while Gemini was expected, i.e. before the run's LLM call budget
-    was spent;
+  * no provider (search) error that was not recovered by a later success for the
+    same provider and query, whatever the run's status;
+  * every rules fallback (rules-decided action, rule-based requirements, judge
+    unavailable) has an allowed RECORDED reason (ALLOWED_FALLBACK_CODES: the LLM
+    budget was spent, the USD cap refused the request, or the model was degraded);
+    an unrecorded or other reason fails;
   * no reservation is left open;
   * committed spend (known + unknown-cost bounds) is within the cap;
   * cost_ledger_violations(run_id) is empty.
@@ -33,6 +36,7 @@ are left in the database for inspection; erase them like any other run.
 """
 import argparse
 import os
+import re
 import sys
 import uuid
 
@@ -51,50 +55,96 @@ def _fail_setup(msg):
     return 2
 
 
+# Failure detection is NULL-safe: `status IS DISTINCT FROM 'x'` counts a NULL
+# status as not-x (a plain inequality is NULL for it, so the row would drop out).
+# Migration 0019 also makes these status columns NOT NULL.
+RUN_QUERIES = {
+    "llm_calls": "SELECT count(*) FROM llm_calls WHERE run_id = %(r)s",
+    # a failed attempt is recovered only by a later success of the SAME logical call
+    "llm_failed_unrecovered": """
+        SELECT count(*) FROM llm_calls f WHERE f.run_id = %(r)s
+          AND f.status IS DISTINCT FROM 'success'
+          AND NOT EXISTS (SELECT 1 FROM llm_calls s WHERE s.run_id = f.run_id
+                          AND s.logical_call_id = f.logical_call_id
+                          AND s.status = 'success' AND s.id > f.id)""",
+    "tool_failed_unrecovered": """
+        SELECT count(*) FROM tool_calls f WHERE f.run_id = %(r)s
+          AND f.status IS DISTINCT FROM 'success'
+          AND NOT EXISTS (SELECT 1 FROM tool_calls s WHERE s.run_id = f.run_id
+                          AND s.tool_name = f.tool_name
+                          AND s.input_json::text = f.input_json::text
+                          AND s.status = 'success' AND s.id > f.id)""",
+    "failed_steps_unrecovered": """
+        SELECT count(*) FROM steps f WHERE f.run_id = %(r)s
+          AND f.status IS DISTINCT FROM 'success' AND f.status IS DISTINCT FROM 'running'
+          AND NOT (f.retrieved_context ? 'job_id' AND EXISTS (
+              SELECT 1 FROM steps s WHERE s.run_id = f.run_id
+                AND s.step_name = f.step_name AND s.status = 'success' AND s.id > f.id
+                AND s.retrieved_context->>'job_id' = f.retrieved_context->>'job_id'))""",
+    "action_errors": """
+        SELECT (SELECT count(*) FROM agent_actions WHERE run_id = %(r)s AND error IS NOT NULL)
+             + (SELECT count(*) FROM agent_action_attempts t
+                JOIN agent_actions a ON a.id = t.action_id
+                WHERE t.run_id = %(r)s AND t.status = 'failed'
+                AND a.status IS DISTINCT FROM 'executed')""",
+    "judge_invalid_output":
+        "SELECT count(*) FROM steps WHERE run_id = %(r)s AND judge_status = 'invalid_output'",
+    "rules_fallbacks": """
+        SELECT (SELECT count(*) FROM agent_actions WHERE run_id = %(r)s AND decided_by = 'rules')
+             + (SELECT count(*) FROM steps WHERE run_id = %(r)s
+                AND (retrieved_context->>'requirements_method' = 'rule_based'
+                     OR judge_status = 'unavailable'))""",
+    "provider_errors": """
+        SELECT (SELECT count(*) FROM agent_searches WHERE run_id = %(r)s
+                AND provider_status IS DISTINCT FROM 'success')
+             + (SELECT count(*) FROM external_search_attempts WHERE run_id = %(r)s
+                AND status IS DISTINCT FROM 'succeeded')""",
+    # a provider error is recovered only by a LATER success for the same
+    # provider and query (whatever the run's final status)
+    "provider_errors_unrecovered": """
+        SELECT (SELECT count(*) FROM agent_searches f WHERE f.run_id = %(r)s
+                AND f.provider_status IS DISTINCT FROM 'success'
+                AND NOT EXISTS (SELECT 1 FROM agent_searches s WHERE s.run_id = f.run_id
+                                AND s.provider = f.provider AND s.query_norm = f.query_norm
+                                AND s.provider_status = 'success' AND s.id > f.id))
+             + (SELECT count(*) FROM external_search_attempts f WHERE f.run_id = %(r)s
+                AND f.status IS DISTINCT FROM 'succeeded'
+                AND NOT EXISTS (SELECT 1 FROM external_search_attempts s
+                                WHERE s.run_id = f.run_id AND s.provider = f.provider
+                                AND s.query_norm = f.query_norm
+                                AND s.status = 'succeeded' AND s.id > f.id))""",
+    "violations": "SELECT count(*) FROM cost_ledger_violations(%(r)s)",
+}
+
+# Every rules fallback with its recorded reason (llm.fallback_code); NULL when the
+# reason was not recorded. Read as {code: count}, "unrecorded" for NULL.
+FALLBACK_REASONS_SQL = """
+    SELECT code, count(*) FROM (
+        SELECT fallback_code AS code FROM agent_actions
+        WHERE run_id = %(r)s AND decided_by = 'rules'
+        UNION ALL
+        SELECT retrieved_context->>'requirements_fallback_code' FROM steps
+        WHERE run_id = %(r)s AND retrieved_context->>'requirements_method' = 'rule_based'
+        UNION ALL
+        SELECT retrieved_context->>'judge_fallback_code' FROM steps
+        WHERE run_id = %(r)s AND judge_status = 'unavailable') f
+    GROUP BY code"""
+
+# A rules fallback is expected only for these recorded reasons: the run's LLM
+# request budget was spent, the USD cap refused the request, or the model was
+# degraded (outage, rate limit, spent quota, unusable output). Anything else
+# (unrecorded, not configured, unknown cost, rejected/invalid controller output,
+# an unclassified error, a rules-only goal) is unexplained and fails the smoke.
+ALLOWED_FALLBACK_CODES = frozenset({
+    "llm_budget_spent", "cost_limit_reached", "llm_unavailable", "llm_rate_limited",
+    "llm_quota_exhausted", "llm_invalid_response", "model_output_invalid"})
+
+
 def collect_run_record(run_id):
     """Metadata-only facts about one run for check_run (counts, statuses, USD)."""
     import agent_store
     from database import get_connection
-    queries = {
-        "llm_calls": "SELECT count(*) FROM llm_calls WHERE run_id = %(r)s",
-        # a failed attempt is recovered only by a later success of the SAME logical call
-        "llm_failed_unrecovered": """
-            SELECT count(*) FROM llm_calls f WHERE f.run_id = %(r)s AND f.status <> 'success'
-              AND NOT EXISTS (SELECT 1 FROM llm_calls s WHERE s.run_id = f.run_id
-                              AND s.logical_call_id = f.logical_call_id
-                              AND s.status = 'success' AND s.id > f.id)""",
-        "tool_failed_unrecovered": """
-            SELECT count(*) FROM tool_calls f WHERE f.run_id = %(r)s
-              AND f.status IS NOT NULL AND f.status <> 'success'
-              AND NOT EXISTS (SELECT 1 FROM tool_calls s WHERE s.run_id = f.run_id
-                              AND s.tool_name = f.tool_name
-                              AND s.input_json::text = f.input_json::text
-                              AND s.status = 'success' AND s.id > f.id)""",
-        "failed_steps_unrecovered": """
-            SELECT count(*) FROM steps f WHERE f.run_id = %(r)s AND f.status = 'failed'
-              AND NOT (f.retrieved_context ? 'job_id' AND EXISTS (
-                  SELECT 1 FROM steps s WHERE s.run_id = f.run_id
-                    AND s.step_name = f.step_name AND s.status = 'success' AND s.id > f.id
-                    AND s.retrieved_context->>'job_id' = f.retrieved_context->>'job_id'))""",
-        "action_errors": """
-            SELECT (SELECT count(*) FROM agent_actions WHERE run_id = %(r)s AND error IS NOT NULL)
-                 + (SELECT count(*) FROM agent_action_attempts t
-                    JOIN agent_actions a ON a.id = t.action_id
-                    WHERE t.run_id = %(r)s AND t.status = 'failed' AND a.status <> 'executed')""",
-        "judge_invalid_output":
-            "SELECT count(*) FROM steps WHERE run_id = %(r)s AND judge_status = 'invalid_output'",
-        "rules_fallbacks": """
-            SELECT (SELECT count(*) FROM agent_actions WHERE run_id = %(r)s AND decided_by = 'rules')
-                 + (SELECT count(*) FROM steps WHERE run_id = %(r)s
-                    AND (retrieved_context->>'requirements_method' = 'rule_based'
-                         OR judge_status = 'unavailable'))""",
-        "provider_errors": """
-            SELECT (SELECT count(*) FROM agent_searches WHERE run_id = %(r)s
-                    AND provider_status = 'failed')
-                 + (SELECT count(*) FROM external_search_attempts WHERE run_id = %(r)s
-                    AND status <> 'succeeded')""",
-        "violations": "SELECT count(*) FROM cost_ledger_violations(%(r)s)",
-    }
+    queries = RUN_QUERIES
     with get_connection() as conn:
         cur = conn.cursor()
         cur.execute("""SELECT status, error_code, (goal_progress->>'search_exhausted')::boolean,
@@ -106,6 +156,9 @@ def collect_run_record(run_id):
         for name, sql in queries.items():
             cur.execute(sql, {"r": run_id})
             rec[name] = int(cur.fetchone()[0] or 0)
+        cur.execute(FALLBACK_REASONS_SQL, {"r": run_id})
+        rec["rules_fallback_reasons"] = {(code or "unrecorded"): int(k)
+                                         for code, k in cur.fetchall()}
     usage = agent_store.run_usage(run_id)
     rec.update(open_reservations=int(usage["open_reservations"] or 0),
                committed_usd=float(usage["committed_usd"] or 0),
@@ -124,6 +177,20 @@ def check_run(rec, max_cost):
 
     def zero(key):
         return n(key) == 0
+
+    def fallback_check():
+        total, reasons = n("rules_fallbacks"), n("rules_fallback_reasons")
+        if not isinstance(total, int) or not isinstance(reasons, dict):
+            return False, f"every rules fallback has an allowed recorded reason (unknown: {total})"
+        bad = {c: k for c, k in reasons.items() if c not in ALLOWED_FALLBACK_CODES}
+        covered = sum(reasons.values()) == total
+        # codes are our own metadata; anything not shaped like one is not echoed
+        shown = ", ".join(f"{c if re.fullmatch(r'[a-z_]{1,40}', str(c)) else 'other'}={k}"
+                          for c, k in sorted(bad.items(), key=lambda x: str(x[0])))
+        return (not bad and covered,
+                f"every rules fallback has an allowed recorded reason ({total} fallbacks"
+                f"{'' if covered else ', reasons do not cover all'}; "
+                f"unexplained: {shown or 'none'})")
 
     status, code = n("status"), n("error_code")
     exhausted_no_matches = (status == "no_matches" and code == "no_matches"
@@ -144,9 +211,10 @@ def check_run(rec, max_cost):
          f"no unrecovered failed step ({n('failed_steps_unrecovered')})"),
         (zero("action_errors"), f"no error-coded agent action ({n('action_errors')})"),
         (zero("judge_invalid_output"), f"no judge invalid_output ({n('judge_invalid_output')})"),
-        (zero("rules_fallbacks") or n("llm_budget_spent") is True,
-         f"no rules fallback while Gemini was expected ({n('rules_fallbacks')}, "
-         f"llm budget spent={n('llm_budget_spent')})"),
+        fallback_check(),
+        (zero("provider_errors_unrecovered"),
+         f"no unrecovered provider error ({n('provider_errors_unrecovered')} of "
+         f"{n('provider_errors')})"),
         (zero("open_reservations"), f"no open cost reservation ({n('open_reservations')})"),
         (isinstance(committed, (int, float)) and committed <= max_cost + 1e-9,
          f"committed spend ${committed} within the ${max_cost} cap"),

@@ -396,19 +396,23 @@ def get_action(run_id, iteration):
             "attempt_count": int(row[9] or 0)}
 
 
-def record_proposed_action(run_id, generation, iteration, action, arguments, reason, decided_by):
+def record_proposed_action(run_id, generation, iteration, action, arguments, reason, decided_by,
+                           fallback_code=None):
     """Insert the DECISION. ON CONFLICT DO NOTHING: a replayed iteration keeps the
-    ORIGINAL decision; executions are recorded as attempts, never as new decisions."""
+    ORIGINAL decision; executions are recorded as attempts, never as new decisions.
+    `fallback_code` (rules decisions only, migration 0020) says why the rules
+    policy decided (llm.fallback_code); metadata only."""
     with get_connection() as conn:
         cur = conn.cursor()
         _check_generation(cur, run_id, generation)
         cur.execute("""
             INSERT INTO agent_actions (run_id, iteration, execution_generation, action,
-                                       arguments, reason, decided_by, status)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, 'proposed')
+                                       arguments, reason, decided_by, status, fallback_code)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, 'proposed', %s)
             ON CONFLICT (run_id, iteration) DO NOTHING
         """, (run_id, iteration, generation, action, json.dumps(arguments, default=str),
-              (reason or "")[:500], decided_by))
+              (reason or "")[:500], decided_by,
+              (fallback_code or None) if decided_by == "rules" else None))
 
 
 def _ensure_attempt(cur, run_id, generation, iteration, replayed):

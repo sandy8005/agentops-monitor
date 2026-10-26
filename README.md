@@ -152,6 +152,13 @@ reservation settles exactly one call); a reservation's `status` and `settled_at`
 agree; costs are stored as `NUMERIC(18,10)` so small calls are not rounded to $0.
 `SELECT * FROM cost_ledger_violations(<run_id>)` reconciles a run (empty = clean).
 
+**A status is never NULL** (migration `0019`): `runs`, `steps`, `llm_calls` and
+`tool_calls` statuses are `NOT NULL`. A trace row written without a status gets
+`'unknown'` (never `'success'`, the old `llm_calls` default); legacy NULLs were
+backfilled to `'unknown'` (a NULL-status run to `failed` / `internal_error`).
+Failure-detection queries use `status IS DISTINCT FROM 'success'`, so even a NULL
+would count as a failure, not drop out of the count.
+
 **Price overrides are both-or-neither.** `LLM_INPUT_PRICE_PER_MILLION` and
 `LLM_OUTPUT_PRICE_PER_MILLION` must be set together; one alone is a startup error
 (and treated as an unknown price if it ever reaches the pricing code).
@@ -420,9 +427,19 @@ Anything else is treated as **no URL**: deduplication falls back to the fingerpr
 the posting is stored without an `apply_url`, and the API returns no link. Validation
 never raises, so one malformed posting can't abort a search. An internationalized
 host is normalized to punycode (`idna`), and the rankings API returns the link's
-registered domain as `apply_domain` (an approximation without the public suffix
-list), which the dashboard shows next to the link ("apply ↗ evil.com"), so a
-lookalike host is visible. The dashboard applies the same rules client-side.
+registered domain as `apply_domain`, which the dashboard shows next to the link
+("apply ↗ evil.com"), so a lookalike host is visible (`apple.com.evil.com` shows
+`evil.com`). The domain is an approximation of the public suffix list: ICANN
+two-level suffixes like `co.uk`, plus a curated, vendored subset of the list's
+**private** section (`job_source._PRIVATE_SUFFIXES`: `github.io`, `herokuapp.com`,
+`netlify.app`, `vercel.app`, `pages.dev`, `web.app`, `firebaseapp.com`,
+`azurewebsites.net`, `cloudfront.net`, `blogspot.com`, ...), so a shared-host
+tenant is named: `company.github.io`, not `github.io`. Nothing is fetched at runtime.
+ATS platforms are not shared-host suffixes: `jobs.lever.co` shows `lever.co` and
+`boards.greenhouse.io` shows `greenhouse.io`, the platform that really serves the
+page. The dashboard re-checks the URL scheme and host client-side but shows the
+API's `apply_domain` rather than recomputing it, so server and browser always agree
+(no domain, no link).
 
 Within a run, each `search_jobs` action is credited **only with the postings that
 search returned** (the `job_searches` rows its provider recorded for that query,
@@ -459,7 +476,11 @@ only when it says so plainly ("Remote", "Remote - Europe", "US (Remote)",
 "Work from home optional") states no mode. An uppercase US state or country code
 after a separator is a place, not a word (`geo.blank_place_codes`): "Remote, OR" is a
 remote role in Oregon and "Remote, NO" one in Norway, while "Remote or onsite" stays
-mixed. "Worldwide" or "Anywhere" alone is a geographic scope, not a work mode, so it
+mixed. An "or" joining two places geo resolves (countries, US states, regions) is a
+place list, not hedging (`geo.blank_place_list_connectors`): "Remote - US or Canada",
+"Remote (UK or Ireland)" and "Remote - EMEA or APAC" are remote, while "Remote or
+hybrid - US" and "Remote - US or onsite" stay mixed (cities geo does not know, as in
+"Portland or Seattle", are not treated as places). "Worldwide" or "Anywhere" alone is a geographic scope, not a work mode, so it
 states no mode unless the posting's own `work_mode` or location also says remote
 ("Remote - Worldwide").
 A kept posting with no stated mode is **never presented as a confirmed match**: it
@@ -580,8 +601,12 @@ required/preferred skill cases) and measure precision, recall, false-Apply and
 false-Skip rates, reviewer agreement and calibration by score band.
 
 The **rules-based requirements fallback** (`rule_requirements.py`) is a degraded
-path: it reads "N years" per sentence, skipping conditional and non-experience
-sentences, and classifies each mention as required or preferred **within its own
+path: it reads "N years" per sentence, skipping non-experience sentences. A
+conditional ("for the senior/lead/manager track", "if applying") skips only the
+mention in its own clause (clauses end at `,` `;` `:` and/but/while/...): "3 years
+Python required, 5 years for the manager track" is 3. A conditional clause with no
+mention ("For the senior track, 5+ years") applies to the nearest clause with one;
+between mentions on both sides it applies to all of them (conservative). It classifies each mention as required or preferred **within its own
 clause** first — "3+ years Python required, while 5+ years Java preferred" is 3 —
 then its sentence, then the section heading it sits under ("Requirements:" keeps
 it, "Nice to have:" drops it); an unmarked mention in a sentence that marks
@@ -671,8 +696,17 @@ the network. The live check is a separate operator script, never collected by
 pytest: `python scripts/smoke_live.py` runs one tiny capped run (`max_cost_usd` ≤
 0.05) against the real API and passes only on a clean outcome (`success` /
 `partial_success`, or an exhausted `no_matches` with no provider errors; no
-unrecovered failed call, error-coded action, judge `invalid_output`, unexpected rules
-fallback, open reservation, overspend or ledger violation). `python
+unrecovered failed call, error-coded action, judge `invalid_output`, open
+reservation, overspend or ledger violation; no provider error without a later
+success for the same provider and query, whatever the status; and every rules
+fallback has an allowed **recorded** reason: the LLM budget was spent
+(`llm_budget_spent`), the USD cap refused the request (`cost_limit_reached`), or the
+model was degraded (`llm_unavailable`, `llm_rate_limited`, `llm_quota_exhausted`,
+`llm_invalid_response`, `model_output_invalid`). The reason is recorded where the
+fallback happens (`llm.fallback_code`): `agent_actions.fallback_code` (migration
+`0020`) for a rules-decided controller action, `requirements_fallback_code` /
+`judge_fallback_code` in a job step's context. An unrecorded reason, a missing key,
+unknown cost or rejected/invalid controller output fails). `python
 scripts/verify_ci_status.py` prints the GitHub Actions result for a commit. See the
 [production readiness checklist](docs/production-readiness.md) for the full
 deploy sequence and sign-off steps.

@@ -166,7 +166,7 @@ def _retire_legacy_run(run_id, reason="pipeline_engine"):
             "stop_reason = CASE WHEN cancel_requested THEN 'cancelled by user' ELSE "
             "'engine_retired: this run''s goal uses a retired engine or job source and was not "
             "executed; start a new run' END "
-            "WHERE id = %s AND status NOT IN ('success', 'partial_success', 'no_matches', "
+            "WHERE id = %s AND COALESCE(status, '') NOT IN ('success', 'partial_success', 'no_matches', "
             "'completed_with_errors', 'cancelled', 'failed')",
             (reason, ErrorCode.CANCELLED.value, ErrorCode.ENGINE_RETIRED.value, run_id))
     log.warning("retired run closed without executing (%s)", reason, extra={"run_id": run_id})

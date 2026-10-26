@@ -7,6 +7,7 @@ and simple required-vs-preferred signal phrases. Cruder than the LLM, but it
 means a job always gets SOME requirements and never drops out of the pipeline
 just because Gemini quota ran out. Zero LLM calls.
 """
+import bisect
 import re
 
 # A practical skills vocabulary. Multi-word entries are matched as phrases;
@@ -211,19 +212,67 @@ def _years_mention_is_preferred(sentence, start, end, section):
     return section == "preferred"
 
 
+# Clause boundaries for scoping a conditional ("for the manager track") to the
+# years mention it belongs to.
+_YEARS_SEGMENT_CUT = re.compile(r"[,;:]|\b(?:and|but|while|whereas|however|although)\b")
+
+
+def _conditional_mention_starts(sentence):
+    """Start offsets of the "N years" mentions in `sentence` that a conditional
+    ("for the senior/lead/manager track", "if applying", "for this level")
+    applies to (round 6, backlog A). The sentence is cut into clauses at
+    commas/semicolons/colons and and/but/while/...:
+      * a conditional in a clause that holds mentions applies to those mentions:
+        "3 years Python required, 5 years for the manager track" skips only the 5;
+      * a conditional clause without a mention ("For the senior track, 5 years",
+        "5 years of Python and Django, for the lead role") applies to the nearest
+        clause with a mention, when mentions sit on one side of it only;
+      * with mentions on both sides it is ambiguous and applies to every mention
+        in the sentence (the conservative, former sentence-level behavior)."""
+    conds = list(_YEARS_CONDITIONAL.finditer(sentence))
+    if not conds:
+        return set()
+    cuts = [c.start() for c in _YEARS_SEGMENT_CUT.finditer(sentence)]
+
+    def seg(pos):
+        return bisect.bisect_right(cuts, pos)
+
+    by_seg = {}
+    for m in _YEARS_RE.finditer(sentence):
+        by_seg.setdefault(seg(m.start()), []).append(m.start())
+    out = set()
+    for c in conds:
+        s = seg(c.start())
+        if s in by_seg:
+            out.update(by_seg[s])
+            continue
+        left = [k for k in by_seg if k < s]
+        right = [k for k in by_seg if k > s]
+        if left and right:
+            for starts in by_seg.values():
+                out.update(starts)
+        elif left or right:
+            out.update(by_seg[max(left) if left else min(right)])
+    return out
+
+
 def years_requirement_mentions(text_lower):
     """[(low, high, is_overall)] for every "N years" / "N yrs" mention that states a
-    years REQUIREMENT. Conditional and non-experience SENTENCES are skipped as a
-    whole; whether a mention is preferred is judged within its own CLAUSE, then
-    its sentence, then the posting section it sits under
-    (_years_mention_is_preferred). `high` is the upper end of a range
+    years REQUIREMENT. Non-experience SENTENCES are skipped as a whole; a
+    conditional ("for the manager track") skips only the mention whose clause it
+    belongs to (_conditional_mention_starts); whether a mention is preferred is
+    judged within its own CLAUSE, then its sentence, then the posting section it
+    sits under (_years_mention_is_preferred). `high` is the upper end of a range
     ("3-5 years" -> (3.0, 5.0)), else equal to `low`."""
     out = []
     contexts = _line_contexts(text_lower)
     for offset, sentence in _sentences_with_offsets(text_lower):
-        if _YEARS_CONDITIONAL.search(sentence) or _YEARS_NOT_EXPERIENCE.search(sentence):
+        if _YEARS_NOT_EXPERIENCE.search(sentence):
             continue
+        conditional = _conditional_mention_starts(sentence)
         for m in _YEARS_RE.finditer(sentence):
+            if m.start() in conditional:
+                continue
             n = _num_value(m.group(1))
             if not 0 < n <= 30:
                 continue

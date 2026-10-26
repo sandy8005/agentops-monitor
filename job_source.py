@@ -339,6 +339,24 @@ _TLD_RE = re.compile(r"[a-z]{2,63}|xn--[a-z0-9-]{1,59}")
 # Second-level labels under which a country TLD registers names ("acme.co.uk").
 # An approximation without the public suffix list; only used for DISPLAY.
 _SECOND_LEVEL_LABELS = {"co", "com", "org", "net", "gov", "ac", "edu", "ne", "or", "go"}
+# Shared-hosting suffixes from the PRIVATE section of the Public Suffix List
+# (https://publicsuffix.org/list/public_suffix_list.dat, "===BEGIN PRIVATE
+# DOMAINS==="): each customer gets a subdomain, so the registrable domain is one
+# label below the suffix ("company.github.io"). A curated, vendored subset (round 6,
+# backlog D; compiled 2026-10-26, every entry checked against the live list that
+# day) of hosts an apply page plausibly lives on; it is never fetched at runtime. A host under a suffix missing here falls back to the
+# shared domain ("github.io"-style), which names the platform, never a lookalike.
+# ATS platforms (lever.co, greenhouse.io, myworkdayjobs.com, ...) are deliberately
+# NOT listed (nor are they on the PSL): their apply links show the platform domain.
+_PRIVATE_SUFFIXES = frozenset({
+    "github.io", "githubusercontent.com", "gitlab.io", "bitbucket.io",
+    "herokuapp.com", "netlify.app", "vercel.app", "now.sh", "pages.dev", "workers.dev",
+    "web.app", "firebaseapp.com", "appspot.com", "azurewebsites.net",
+    "azurestaticapps.net", "cloudfront.net", "blogspot.com", "onrender.com",
+    "fly.dev", "surge.sh", "readthedocs.io", "myshopify.com",
+    "webflow.io", "notion.site", "carrd.co", "wixsite.com",
+})
+_PRIVATE_SUFFIX_MAX_LABELS = max(s.count(".") + 1 for s in _PRIVATE_SUFFIXES)
 
 
 def _public_ascii_host(host):
@@ -407,13 +425,22 @@ def safe_http_url(u):
 
 def apply_url_domain(u):
     """The registered domain of a safe apply URL ("jobs.example.com" ->
-    "example.com", "careers.acme.co.uk" -> "acme.co.uk"), in ASCII/punycode, for
-    display next to the apply link; None when the URL is not safe."""
+    "example.com", "careers.acme.co.uk" -> "acme.co.uk", a shared host
+    "company.github.io" -> "company.github.io" via _PRIVATE_SUFFIXES), in
+    ASCII/punycode, for display next to the apply link; None when the URL is not
+    safe. The dashboard shows this value (api._apply_link -> apply_domain); it does
+    not recompute it."""
     from urllib.parse import urlsplit
     s = safe_http_url(u)
     if s is None:
         return None
     labels = urlsplit(s).hostname.rstrip(".").split(".")
+    # A shared host (PSL private section): the tenant label is the identity,
+    # "company.github.io", not "github.io". Longest matching suffix wins; it must
+    # end the host on a label boundary, so "github.io.evil.com" is still evil.com.
+    for n in range(min(len(labels), _PRIVATE_SUFFIX_MAX_LABELS), 0, -1):
+        if ".".join(labels[-n:]) in _PRIVATE_SUFFIXES:
+            return ".".join(labels[-(n + 1):])     # the suffix alone is shown as is
     keep = 3 if (len(labels) >= 3 and len(labels[-1]) == 2
                  and labels[-2] in _SECOND_LEVEL_LABELS) else 2
     return ".".join(labels[-keep:])
@@ -617,6 +644,9 @@ def work_mode_status(job, work_mode, allow_hybrid=False):
 # doubt check, so it is not read as the word "or"/"no". "Worldwide"/"Anywhere"
 # alone are a geographic SCOPE, not a work mode: unknown unless the posting's own
 # work_mode (or the location text) also says remote.
+# Round 6 (backlog B): an "or" between two places geo resolves ("Remote - US or
+# Canada", "Remote (EMEA or APAC)") is a place list and is blanked too
+# (geo.blank_place_list_connectors); "or" next to a work mode stays hedging.
 _LOC_REMOTE_RE = re.compile(
     r"\bremote\b|\bwork(?:ing)?[\s-]from[\s-]home\b|\bwfh\b|\btelecommut\w*")
 _LOC_REMOTE_DOUBT_RE = re.compile(
@@ -626,8 +656,8 @@ _LOC_REMOTE_DOUBT_RE = re.compile(
 
 
 def _location_says_remote(location):
-    from geo import blank_place_codes
-    loc = blank_place_codes(location).lower()
+    from geo import blank_place_codes, blank_place_list_connectors
+    loc = blank_place_codes(blank_place_list_connectors(location)).lower()
     return bool(_LOC_REMOTE_RE.search(loc)) and not _LOC_REMOTE_DOUBT_RE.search(loc)
 
 

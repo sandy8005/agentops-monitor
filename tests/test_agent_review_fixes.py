@@ -186,7 +186,7 @@ class FakeStore:
         mp.setattr(agent_store, "set_controller_mode", lambda *a: None)
         mp.setattr(agent_store, "get_action", lambda rid, i: s.actions.get(i))
         mp.setattr(agent_store, "record_proposed_action",
-                   lambda rid, g, i, a, args, r, d: s.actions.setdefault(i, {
+                   lambda rid, g, i, a, args, r, d, fallback_code=None: s.actions.setdefault(i, {
                        "action": a, "arguments": args, "reason": r, "decided_by": d,
                        "status": "proposed", "observation": None, "error": None}))
         mp.setattr(agent_store, "record_action_outcome",

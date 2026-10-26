@@ -54,7 +54,8 @@ def _good(**over):
     rec = {"status": "success", "error_code": None, "search_exhausted": False,
            "llm_budget_spent": False, "llm_calls": 4, "llm_failed_unrecovered": 0,
            "tool_failed_unrecovered": 0, "failed_steps_unrecovered": 0, "action_errors": 0,
-           "judge_invalid_output": 0, "rules_fallbacks": 0, "provider_errors": 0,
+           "judge_invalid_output": 0, "rules_fallbacks": 0, "rules_fallback_reasons": {},
+           "provider_errors": 0, "provider_errors_unrecovered": 0,
            "open_reservations": 0, "committed_usd": 0.01, "known_cost_usd": 0.01,
            "unknown_cost_calls": 0, "violations": 0}
     rec.update(over)
@@ -69,7 +70,9 @@ def _failed(rec, cap=0.05):
     {},
     {"status": "partial_success"},
     {"status": "no_matches", "error_code": "no_matches", "search_exhausted": True},
-    {"rules_fallbacks": 3, "llm_budget_spent": True},   # budget spent: rules expected
+    # budget spent, recorded on each fallback: rules expected (round 6, backlog C)
+    {"rules_fallbacks": 3, "rules_fallback_reasons": {"llm_budget_spent": 3},
+     "llm_budget_spent": True},
 ])
 def test_clean_runs_pass(over):
     assert _failed(_good(**over)) == []
@@ -106,7 +109,7 @@ def test_report_prints_metadata_only_lines(capsys):
     n = _load().report(_good(status="completed_with_errors", llm_failed_unrecovered=1), 0.05)
     out = capsys.readouterr().out
     assert n == 2
-    assert out.count("[FAIL]") == 2 and out.count("[ok]") == 9
+    assert out.count("[FAIL]") == 2 and out.count("[ok]") == 10
     assert all(len(line) < 200 for line in out.splitlines())
 
 

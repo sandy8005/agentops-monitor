@@ -18,7 +18,7 @@ stored on each row so you can query/prune by version.
 from settings import settings
 
 PARSER_VERSION = "6"   # bumped: verified employment records (only experience-section dates count), experience entries grounded, stated 0 corrected, project windows end at headings
-REQS_VERSION = "8"   # bumped: a preferred word is scoped to the mention it modifies (parenthetical numbers, "ideally <skill>"), "preferably N years" is soft
+REQS_VERSION = "9"   # bumped: a conditional ("for the manager track") skips only the years mention in its own clause, not the whole sentence
 SCHEMA_VERSION = "2"   # bumped: non-finite numbers rejected, years bounded at MAX_YEARS (60)
 
 

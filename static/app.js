@@ -143,18 +143,6 @@ var NL = String.fromCharCode(10);
       } catch (e) { return null; }
     }
 
-    // The registered domain of a safe link (job_source.apply_url_domain), shown next
-    // to "apply" so the real destination (and a punycode lookalike) is visible.
-    var SECOND_LEVEL_LABELS = ['co', 'com', 'org', 'net', 'gov', 'ac', 'edu', 'ne', 'or', 'go'];
-    function linkDomain(href) {
-      try {
-        var labels = new URL(href).hostname.toLowerCase().replace(/\.$/, '').split('.');
-        var keep = (labels.length >= 3 && labels[labels.length - 1].length === 2 &&
-                    SECOND_LEVEL_LABELS.indexOf(labels[labels.length - 2]) !== -1) ? 3 : 2;
-        return labels.slice(-keep).join('.');
-      } catch (e) { return ''; }
-    }
-
     async function uploadResume() {
       const fileInput = document.getElementById('resumeFile');
       const msg = document.getElementById('uploadMsg');
@@ -389,10 +377,12 @@ var NL = String.fromCharCode(10);
         // Defense in depth (the API also filters, and the CSP blocks javascript:):
         // only an http(s) URL becomes a link; anything else shows no link at all.
         var applyHref = safeHttpUrl(r.apply_url);
-        if (applyHref) {
-          // The domain comes from the href itself, so it always names the real destination.
+        if (applyHref && r.apply_domain) {
+          // The domain is the API's apply_domain (job_source.apply_url_domain, computed
+          // from this same URL, shared hosts like company.github.io included), so the
+          // server and the browser never disagree. No domain -> no link (fail closed).
           html += ' <a href="' + escapeHtml(applyHref) + '" target="_blank" rel="noopener noreferrer">apply &#8599;</a>' +
-            ' <span class="note" title="registered domain of the apply link">' + escapeHtml(linkDomain(applyHref)) + '</span>';
+            ' <span class="note" title="registered domain of the apply link">' + escapeHtml(r.apply_domain) + '</span>';
         }
         if (r.advice_requirements === 'reconstructed') {
           // Advice for a run evaluated before requirement snapshots existed.

@@ -1052,6 +1052,9 @@ def get_run_rankings(run_id: int, user: dict = Depends(require_auth)):
         # is a real failure and surfaces as one; it is never shown as "no
         # suggestions".
         suggestions_by_job = {}
+        # Display filter, not failure detection: resume_suggestions.status is NOT
+        # NULL with a CHECK (validated / needs_confirmation / rejected), so
+        # `<> 'rejected'` cannot hide a NULL row (tests/test_status_null_safety.py).
         cur.execute("""
             SELECT job_id, kind, original_text, suggested_text, reason, evidence, method,
                    status, validation_notes

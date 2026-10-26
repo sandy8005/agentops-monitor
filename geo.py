@@ -298,6 +298,49 @@ def blank_place_codes(text):
     return "".join(chars)
 
 
+def _is_place_only(text):
+    """True when every word of `text` is part of a place name geo resolves (a
+    country, US state, region or worldwide phrase; "the" allowed): "US",
+    "United States", "EMEA", "the UK". A work mode ("remote", "onsite") or an
+    unresolved word (a city geo does not know) makes it False."""
+    words = [w.rstrip(".") if w.count(".") == 1 and w.endswith(".") else w
+             for w in _words(text) if w != "the"]
+    if not words:
+        return False
+    i = 0
+    while i < len(words):
+        for n in range(min(_MAX_WORDS, len(words) - i), 0, -1):
+            key = tuple(words[i:i + n])
+            if key in _PHRASES and not (n == 1 and key[0] in _AMBIGUOUS):
+                i += n
+                break
+        else:
+            return False
+    return True
+
+
+# A place-list item ends at a separator or at another list connector.
+_LIST_BOUNDARY_RE = re.compile(r"[,;:()/|]|\s[-–—]\s|\b(?:or|and)\b", re.I)
+_LIST_OR_RE = re.compile(r"\bor\b", re.I)
+
+
+def blank_place_list_connectors(text):
+    """`text` with each "or" that joins two PLACES ("US or Canada", "EMEA or APAC",
+    "Canada or Mexico" in "US, Canada or Mexico") replaced by spaces (offsets
+    kept), so a word-level hedging check does not read a place list as hedged
+    wording. An "or" with a work mode or an unresolved word on either side
+    ("remote or onsite", "US or onsite") is left alone (round 6, backlog B)."""
+    raw = str(text or "")
+    chars = list(raw)
+    bounds = list(_LIST_BOUNDARY_RE.finditer(raw))
+    for m in _LIST_OR_RE.finditer(raw):
+        left = max((b.end() for b in bounds if b.end() <= m.start()), default=0)
+        right = min((b.start() for b in bounds if b.start() >= m.end()), default=len(raw))
+        if _is_place_only(raw[left:m.start()]) and _is_place_only(raw[m.end():right]):
+            chars[m.start():m.end()] = " " * (m.end() - m.start())
+    return "".join(chars)
+
+
 def _covers_country(posting, code):
     return code in posting.countries or bool(country_regions(code) & posting.regions)
 

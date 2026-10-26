@@ -130,6 +130,27 @@ def is_degraded_model_error(exc):
     return (type(exc).__module__ or "").startswith(_PROVIDER_MODULES)
 
 
+def fallback_code(exc):
+    """Metadata-only code for WHY a caller took its rules fallback after `exc` (a
+    degraded-model error, is_degraded_model_error). Recorded with the fallback
+    (agent_actions.fallback_code, a job step's requirements/judge_fallback_code) so
+    an allowed fallback can be told from an unexplained one (scripts/smoke_live.py):
+      llm_budget_spent      the run's LLM request budget was spent (BudgetExceeded)
+      cost_limit_reached    the USD cap refused this request (CostLimitReached)
+      cost_unknown          a cap is set but the cost cannot be accounted for
+      model_output_invalid  the model answered with unusable output
+      otherwise the ErrorCode value (llm_unavailable, llm_rate_limited, ...)."""
+    if isinstance(exc, CostLimitReached):
+        return "cost_limit_reached"
+    if isinstance(exc, CostUnknown):
+        return ErrorCode.COST_UNKNOWN.value
+    if isinstance(exc, BudgetExceeded):
+        return "llm_budget_spent"
+    if isinstance(exc, ModelOutputInvalid):
+        return "model_output_invalid"
+    return classify_exception(exc).value
+
+
 def llm_available():
     """True only if a model call could be attempted now: credentials are configured
     AND the quota breaker is closed. Callers use this to take their rules path

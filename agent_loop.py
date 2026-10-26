@@ -81,6 +81,9 @@ class LoopState(TypedDict, total=False):
     ranked: bool
     controller_mode: str
     controller_note: Optional[str]
+    # Why the controller is on rules (llm.fallback_code; None when by choice):
+    # recorded on every rules-decided action (agent_actions.fallback_code).
+    controller_fallback: Optional[str]
     rejection_streak: int
     failure_streak: int
     no_progress: int
@@ -336,19 +339,23 @@ def node_setup(state: LoopState, config):
         return {"stop": dict(_CANCEL_STOP), "cancel_seen": True}
     if s.error:
         return {"stop": {"by": "error", "reason": s.error, "setup_failed": True}}
-    from llm import llm_available
+    from llm import llm_available, quota_blocked
+    fallback = None
     if goal.model_policy == "rules_only":
-        mode, note = "rules", "rules-only run: no model calls by choice"
+        mode, note, fallback = "rules", "rules-only run: no model calls by choice", "rules_only"
     elif goal.use_llm_controller and llm_available():
         mode, note = "llm", None
     elif goal.use_llm_controller:
         mode, note = "rules", "controller uses rules: model not configured or quota exhausted"
+        fallback = (ErrorCode.LLM_QUOTA_EXHAUSTED.value if quota_blocked()
+                    else ErrorCode.LLM_NOT_CONFIGURED.value)
     else:
-        mode, note = "rules", None
+        mode, note, fallback = "rules", None, "rules_controller"
     if (s.parsed_resume or {}).get("extraction_method") == "rule_based":
         note = ((note + "; ") if note else "") + "resume parsed by rules (degraded)"
     return {"resume_text": s.resume_text, "parsed_resume": s.parsed_resume, "setup_done": True,
             "iteration": 1, "controller_mode": mode, "controller_note": note,
+            "controller_fallback": fallback,
             "stop": None, "final": None, "pending": None, "cancel_seen": False,
             "limit_stop": None, "advised": [], "advice_attempted": [], "ranked": False,
             "input_requests": 0, "output_failures": 0, "discovered": {}, "evaluated": {},
@@ -377,15 +384,19 @@ def node_decide(state: LoopState, config):
     allowed = allowed_actions_for(goal, state, qualified)
     mode = state.get("controller_mode") or "rules"
     note = state.get("controller_note")
+    fallback = state.get("controller_fallback")
+    this_call = None             # a one-iteration fallback reason (mode stays 'llm')
     updates = {}
     decision, decided_by = None, "rules"
 
-    from llm import quota_blocked
+    from llm import quota_blocked, fallback_code
     if mode == "llm":
         if quota_blocked():
             mode, note = "rules", "controller switched to rules: LLM quota exhausted"
+            fallback = ErrorCode.LLM_QUOTA_EXHAUSTED.value
         elif budget.exhausted():
             mode, note = "rules", "controller switched to rules: LLM budget exhausted"
+            fallback = "llm_budget_spent"
         else:
             from llm import create_step, finish_step, fail_step
             step_id = create_step(run_id, "agent_controller", i)
@@ -402,10 +413,12 @@ def node_decide(state: LoopState, config):
                 return {"stop": dict(_CANCEL_STOP), "cancel_seen": True}
             except ControllerOutputInvalid as e:
                 fail_step(step_id, e)
+                this_call = "controller_output_invalid"
                 streak = int(state.get("rejection_streak") or 0) + 1
                 updates["rejection_streak"] = streak
                 if streak >= MAX_REJECTION_STREAK:
                     mode, note = "rules", "controller switched to rules: repeated invalid output"
+                    fallback = "controller_output_invalid"
             except Exception as e:
                 fail_step(step_id, e)
                 code = classify_exception(e)
@@ -420,6 +433,7 @@ def node_decide(state: LoopState, config):
                             reason="model unavailable; the user chose to be asked")
                         decided_by = "backend"
                     mode, note = "rules", f"controller switched to rules: model unavailable ({code})"
+                    fallback = fallback_code(e)
                 else:
                     raise
 
@@ -427,10 +441,13 @@ def node_decide(state: LoopState, config):
         decision = rules_decide(goal, state, qualified)
         decided_by = "rules"
     store.record_proposed_action(run_id, gen, i, decision.action, decision.arguments,
-                                 decision.reason, decided_by)
+                                 decision.reason, decided_by,
+                                 fallback_code=((this_call or fallback)
+                                                if decided_by == "rules" else None))
     updates.update({"pending": {**decision.model_dump(), "decided_by": decided_by,
                                 "replayed": False},
-                    "controller_mode": mode, "controller_note": note})
+                    "controller_mode": mode, "controller_note": note,
+                    "controller_fallback": fallback})
     return updates
 
 
@@ -481,6 +498,7 @@ def node_act(state: LoopState, config):
             if streak >= MAX_REJECTION_STREAK:
                 work["controller_mode"] = "rules"
                 work["controller_note"] = "controller switched to rules: repeated rejected actions"
+                work["controller_fallback"] = "controller_actions_rejected"
         else:
             # The rules policy should never be rejected; if it is, count it as no
             # progress so the run cannot spin.

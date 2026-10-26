@@ -96,6 +96,21 @@ def _llm_allowed(state):
             and llm_available() and not state.budget_exceeded())
 
 
+def _llm_unavailable_code(state):
+    """fallback_code for a model call that was not attempted because _llm_allowed
+    is False (see llm.fallback_code for the codes)."""
+    from llm import quota_blocked
+    if getattr(state, "model_policy", "auto") == "rules_only":
+        return "rules_only"
+    if state.budget_exceeded():
+        return "llm_budget_spent"
+    if quota_blocked():
+        return ErrorCode.LLM_QUOTA_EXHAUSTED.value
+    if not settings.gemini_api_key:
+        return ErrorCode.LLM_NOT_CONFIGURED.value
+    return ErrorCode.LLM_UNAVAILABLE.value
+
+
 def load_resume(state, run_id):
     """Load the resume document from DB (0 LLM calls)."""
     with get_connection() as conn:
@@ -301,10 +316,11 @@ def _reqs_cache_put(desc_hash, reqs, extraction_method):
               extraction_method, source_model, expires_at))
 
 
-def _get_requirements(state, job, run_id, step_id):
+def _get_requirements(state, job, run_id, step_id, fallback=None):
     """
     Requirements for one job, cache-aware and quality-aware. Returns
-    (requirements, cache_hit, method).
+    (requirements, cache_hit, method). When the rules fallback is used and
+    `fallback` is a dict, fallback["code"] says why (llm.fallback_code).
 
       * durable LLM cache hit            -> use it, 0 LLM calls
       * rule-based cache hit             -> try to UPGRADE via the LLM when budget
@@ -319,8 +335,9 @@ def _get_requirements(state, job, run_id, step_id):
         log.info("requirements served from cache [llm] — 0 LLM calls", extra={"step_id": step_id})
         return cached, True, "llm"
 
+    why = None
     if _llm_allowed(state):
-        from llm import is_degraded_model_error
+        from llm import is_degraded_model_error, fallback_code
         try:
             reqs = extract_requirements(job, run_id, step_id, budget=state)
         except Exception as extract_err:
@@ -329,6 +346,7 @@ def _get_requirements(state, job, run_id, step_id):
             # a programming error or lost ownership propagates and fails visibly.
             if not is_degraded_model_error(extract_err):
                 raise
+            why = fallback_code(extract_err)
             from error_codes import summarize_error
             log.warning("requirements LLM extraction degraded (%s) — rules fallback",
                         summarize_error(extract_err), extra={"step_id": step_id})
@@ -339,6 +357,10 @@ def _get_requirements(state, job, run_id, step_id):
             if cached is not None:
                 log.info("requirements upgraded rule_based -> llm", extra={"step_id": step_id})
             return reqs, False, "llm"
+    else:
+        why = _llm_unavailable_code(state)
+    if fallback is not None:
+        fallback["code"] = why
 
     if cached is not None:
         # Degraded but still valid fallback that hasn't expired — reuse it, don't rewrite.
@@ -487,7 +509,9 @@ def do_process_job(state, run_id):
             step_id, source="job", run_id=run_id)
 
         # 1. requirements — structured, optional-aware, cache- and quality-aware.
-        requirements, cache_hit, _method = _get_requirements(state, job, run_id, step_id)
+        _reqs_fallback = {}
+        requirements, cache_hit, _method = _get_requirements(state, job, run_id, step_id,
+                                                             fallback=_reqs_fallback)
 
         # 1a. Snapshot the EXACT requirements this evaluation decides on (with
         #     provenance), so later advice never depends on a cache row that can
@@ -547,6 +571,7 @@ def do_process_job(state, run_id):
         result = None
         judge_status = "not_needed"
         judge_skip_reason = None
+        judge_fallback_code = None       # why the judge was unavailable (llm.fallback_code)
         in_uncertain_band = 20 <= score <= 80
         if not in_uncertain_band:
             # Extreme score — judge adds little; skip it (honest, not faked).
@@ -572,6 +597,7 @@ def do_process_job(state, run_id):
                 why = "unavailable"
             judge_status = "skipped_budget" if why == "budget" else "unavailable"
             judge_skip_reason = why
+            judge_fallback_code = _llm_unavailable_code(state)
             llm_decision = f"skipped ({why})"
             flag_for_review(step_id, reason=f"judge_unavailable({why})")
         else:
@@ -607,6 +633,8 @@ def do_process_job(state, run_id):
                 # second opinion goes to a human. Other jobs keep processing.
                 judge_status = "unavailable"
                 judge_skip_reason = "judge_unavailable"
+                from llm import fallback_code
+                judge_fallback_code = fallback_code(judge_err)
                 llm_decision = "skipped (judge_unavailable)"
                 flag_for_review(step_id, reason="judge_unavailable")
                 from error_codes import summarize_error
@@ -674,10 +702,13 @@ def do_process_job(state, run_id):
             "judge_skipped": judge_status != "ran",
             "judge_status": judge_status,
             "judge_skip_reason": judge_skip_reason,
+            "judge_fallback_code": judge_fallback_code,
             "score_breakdown": score_result["breakdown"],
             "experience_basis": score_result.get("experience_basis"),
             "candidate_years_used": score_result.get("candidate_years_used"),
             "requirements_method": _method,
+            # Why the rules fallback was used (None for a model extraction).
+            "requirements_fallback_code": _reqs_fallback.get("code"),
             # Model-extracted skills the posting does not mention (dropped, not scored).
             "ungrounded_requirements": requirements.get("ungrounded_requirements") or [],
             # Negated / contradicted requirements (not scored; flagged for review).

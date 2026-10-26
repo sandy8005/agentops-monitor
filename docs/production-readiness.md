@@ -87,8 +87,10 @@ Pass: exit 0 and `smoke_live: PASSED`. It passes only on `success` /
 (error code `no_matches`) with zero provider errors; `completed_with_errors`, a
 limit-stopped `no_matches` or any run error code fails. It also fails on any failed
 LLM call, provider (tool) call, step or agent action attempt that a later success
-didn't recover, any error-coded action, any judge `invalid_output`, any rules
-fallback while Gemini was expected (before the run's LLM call budget was spent), at
+didn't recover, any provider (search) error not recovered by a later success for
+the same provider and query (whatever the run status), any error-coded action, any
+judge `invalid_output`, any rules fallback without an allowed recorded reason (LLM
+budget spent, USD cap reached, or a degraded model; see README "Tests and CI"), at
 least one model call missing, an open reservation, committed spend over the cap,
 or a non-empty `cost_ledger_violations(run_id)`. Exit 2 means it didn't start (no
 real key, database unreachable or not migrated) and made no request. Exit 1 prints
