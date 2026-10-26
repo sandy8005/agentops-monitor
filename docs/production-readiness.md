@@ -37,6 +37,20 @@ python scripts/ci_summary.py reports/pure.xml reports/db.xml reports/e2e.xml   #
 Pass: every command exits 0. Step 2.9 fails on any failure, any skip, or any
 collected test missing from the reports.
 
+Then confirm the same commit is green **on GitHub** (Python 3.12, the version CI
+pins; a local run on another Python version doesn't prove it):
+
+```bash
+git push                                         # CI runs on push
+python scripts/verify_ci_status.py               # latest CI run for local HEAD
+python scripts/verify_ci_status.py --sha <full-40-char-sha>
+```
+
+Pass: exit 0 and `verify_ci_status: GREEN`. Exit 3 means the run hasn't finished,
+4 means no run exists for that commit (not pushed), 1 means it finished red, 2
+means the API couldn't be reached. Set `GITHUB_TOKEN` for a higher rate limit; it is
+never printed.
+
 What 2.7–2.8 prove beyond unit logic:
 
 * **Recovery** (`tests/test_recovery_e2e.py`): a worker killed mid-tool leaves its
@@ -68,12 +82,20 @@ python scripts/smoke_live.py                 # one run, max_cost_usd 0.05, <= 6 
 python scripts/smoke_live.py --max-cost 0.02 --max-llm-calls 4
 ```
 
-Pass: exit 0 and `smoke_live: PASSED`. It asserts a terminal non-failed status, at
-least one model call, no open reservation, committed spend within the cap and an
-empty `cost_ledger_violations(run_id)`. Exit 2 means it didn't start (no real
-key, database unreachable or not migrated) and made no request. Exit 1 lists the
-failed checks. It prints metadata only. The synthetic `smoke_<hex>` user, resume
-and run stay in the database for inspection.
+Pass: exit 0 and `smoke_live: PASSED`. It passes only on `success` /
+`partial_success`, or `no_matches` when the search space was genuinely exhausted
+(error code `no_matches`) with zero provider errors; `completed_with_errors`, a
+limit-stopped `no_matches` or any run error code fails. It also fails on any failed
+LLM call, provider (tool) call, step or agent action attempt that a later success
+didn't recover, any error-coded action, any judge `invalid_output`, any rules
+fallback while Gemini was expected (before the run's LLM call budget was spent), at
+least one model call missing, an open reservation, committed spend over the cap,
+or a non-empty `cost_ledger_violations(run_id)`. Exit 2 means it didn't start (no
+real key, database unreachable or not migrated) and made no request. Exit 1 prints
+one `[FAIL]` line per failed check. It prints metadata only. The synthetic
+`smoke_<hex>` user, resume and run stay in the database for inspection.
+
+The user runs this step; CI never has a real key.
 
 ## 5. Process supervision and restart policy
 
@@ -108,3 +130,27 @@ latency.
 * `SELECT * FROM cost_ledger_violations(<run_id>)` is empty for recent runs.
 * Worker logs: metadata only (ids, counts, codes). Alert on repeated
   `llm_unavailable` or `database_unavailable` error codes.
+
+## 7. Sign-off
+
+Production readiness is **not** claimed by the repository or by any agent. Sign off
+only when you have seen each of these yourself, for the commit you deploy:
+
+1. **CI green on GitHub** for that exact commit: `python scripts/verify_ci_status.py
+   --sha <sha>` exits 0 (section 2).
+2. **Local CI sequence** (section 2) passed against PostgreSQL 16, including
+   `scripts/check_migrations.py` and `scripts/ci_summary.py` with no skips.
+3. **Live smoke test passed with a real key** (section 4): `python
+   scripts/smoke_live.py` printed `smoke_live: PASSED` against the staging database.
+4. **Staging deploy:**
+   * `python migrate.py --status`, `python migrate.py`, then `--status` shows
+     nothing PENDING (section 3);
+   * API and worker started under the supervisor with the restart policy in
+     section 5; kill the worker once (`kill -9`) during a run and confirm the run
+     goes `retrying` and finishes after `ORPHAN_AFTER`, with an empty
+     `cost_ledger_violations(<run_id>)`;
+   * **one manual dashboard run**: log in, upload a synthetic resume, start a
+     small capped run (e.g. `max_cost_usd` 0.05), answer a review if one appears,
+     and check the ranked results show each apply link's registered domain, the
+     "work mode unverified" label where it applies, and the cost line;
+   * the checks in section 6.

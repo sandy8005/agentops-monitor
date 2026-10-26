@@ -29,6 +29,7 @@ langgraph-checkpoint-postgres==3.1.2
 pydantic==2.13.4                  # validation throughout
 beautifulsoup4==4.15.0            # scraper + HTML description cleaning
 requests==2.34.2                  # Adzuna / Remotive APIs, scraper
+idna==3.18                        # IDN host normalization for apply URLs (job_source.safe_http_url)
 pypdf==6.14.2                     # resume PDF reading
 
 # --- Auth ---

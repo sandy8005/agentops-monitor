@@ -412,10 +412,17 @@ title + company + location fingerprint.
 
 Provider URLs are untrusted data (`job_source.safe_http_url`). A URL counts only if
 it is a string with no whitespace or control characters, an `http`/`https` scheme, a
-non-empty well-formed host (valid IPv6 brackets) and a port in 1–65535. Anything else
-is treated as **no URL**: deduplication falls back to the fingerprint, the posting is
-stored without an `apply_url`, and the API returns no link. Validation never raises,
-so one malformed posting can't abort a search.
+non-empty well-formed host and a port in 1–65535. Deceptive forms are rejected too:
+userinfo (`https://apply.example.com@evil.com/` really goes to evil.com), any
+backslash, IP-literal hosts (IPv4, IPv6 and the integer/hex/short IPv4 forms),
+`localhost`/`.local`/`.internal`-style and dotless hosts, and labels IDNA rejects.
+Anything else is treated as **no URL**: deduplication falls back to the fingerprint,
+the posting is stored without an `apply_url`, and the API returns no link. Validation
+never raises, so one malformed posting can't abort a search. An internationalized
+host is normalized to punycode (`idna`), and the rankings API returns the link's
+registered domain as `apply_domain` (an approximation without the public suffix
+list), which the dashboard shows next to the link ("apply ↗ evil.com"), so a
+lookalike host is visible. The dashboard applies the same rules client-side.
 
 Within a run, each `search_jobs` action is credited **only with the postings that
 search returned** (the `job_searches` rows its provider recorded for that query,
@@ -445,27 +452,38 @@ onsite returns onsite, hybrid returns hybrid. "Remote (or onsite) preferred, hyb
 acceptable" is an explicit opt-in, `allow_hybrid` on `POST /runs` (stored in the
 goal's fixed constraints); it never widens a hybrid search. Postings that state no
 work mode are kept (providers often omit it). A location counts as stating remote
-only when it says so plainly ("Remote", "Remote - Europe", "US (Remote)"); negated,
-hedged or mixed wording ("Not remote", "Remote-friendly", "Remote possible",
-"Hybrid (remote 2 days)", "Remote or onsite") states no mode.
+only when it says so plainly ("Remote", "Remote - Europe", "US (Remote)",
+"Remote-first", "Remote-only", "100% remote", "Work from home", "WFH",
+"Telecommute"); negated, hedged or mixed wording ("Not remote", "Remote-friendly",
+"Remote possible", "Hybrid (remote 2 days)", "Hybrid-remote", "Remote or onsite",
+"Work from home optional") states no mode. An uppercase US state or country code
+after a separator is a place, not a word (`geo.blank_place_codes`): "Remote, OR" is a
+remote role in Oregon and "Remote, NO" one in Norway, while "Remote or onsite" stays
+mixed. "Worldwide" or "Anywhere" alone is a geographic scope, not a work mode, so it
+states no mode unless the posting's own `work_mode` or location also says remote
+("Remote - Worldwide").
 A kept posting with no stated mode is **never presented as a confirmed match**: it
 is labeled `work_mode: "unknown"`, `work_mode_verified: false` in discovery, the
 search observation (`unknown_work_mode`), the evaluation's step context, the
 persisted ranking (migration `0017`) and `GET /runs/{id}/rankings`, and the
-dashboard marks it "work mode unverified". For a **remote** search such matches are
-shown but **do not count toward the goal** unless the user opts in with
-`accept_unknown_work_mode` on `POST /runs`. Onsite and hybrid searches still count
-them (Adzuna rarely states a mode and its search is location-based), labeled the
-same way. The dashboard's search form exposes both opt-ins as checkboxes, enabled
-only for the work modes they apply to.
+dashboard marks it "work mode unverified". For **every constrained work mode**
+(remote, onsite and hybrid) such matches are evaluated and shown but **do not count
+toward the goal** unless the user opts in with `accept_unknown_work_mode` on
+`POST /runs` (`agent_goal.require_verified_work_mode`). Because Adzuna rarely states
+a work mode, an onsite or hybrid search on Adzuna will usually count fewer matches
+than before this rule; the opt-in restores the old counting, still labeled. The
+dashboard's search form exposes both opt-ins as checkboxes, enabled only for the
+work modes they apply to ("also accept hybrid" for remote/onsite, "count postings
+that state no work mode" for any work-mode search).
 
 The label **fails closed** (`job_source.work_mode_verified`): a posting, a
 discovered entry from an older checkpoint, a ranking row or a step context that
 reaches the backend without the flag is never assumed verified. The flag is
 computed from the stored posting's stated mode against the goal's constraint; a
 ranking row without it is stored as unverified; and when goal counting meets a step
-context without the flag, the job counts toward a remote goal only if its stored
-posting states `remote`.
+context without the flag, the job counts toward a constrained goal only if its
+stored posting states a confirming mode (the constrained mode, plus `hybrid` with
+`allow_hybrid`).
 
 **Geographic eligibility** of remote postings is resolved **structurally**
 (`geo.py`): text becomes ISO countries + regions from a hierarchy, by longest-phrase
@@ -571,7 +589,11 @@ something else preferred is still skipped (conservative). Counts may be digits o
 spelled out (one–twenty), with or without a parenthesized digit ("three (3) years"),
 and "N or more years" reads as N. A soft "ideally/preferably M" right after a mention
 ("3-5 years of experience, ideally 5") applies to the higher value only, so the
-minimum stays 3. A mention marked
+minimum stays 3. A preferred word is scoped to what it modifies: a parenthetical
+holding another number is about that number ("3+ years experience (5+ preferred)" is
+3), and "ideally/preferably" after a mention modifies what follows it ("3+ years of
+experience who would ideally also have Go" is 3), while "Ideally 5 years" or
+"5+ years (preferred)" stay preferred. A mention marked
 overall/total/professional/industry in its own clause wins, so "3 years Python, 5
 years overall" is 5, otherwise the smallest mention is used but cannot build any-of groups. Extractions are tagged
 `requirements_method = rule_based`, and `require_verified_matches` excludes matches
@@ -647,9 +669,13 @@ JSON, missing fields, a safety block, 429, 5xx and a timeout, asserting the
 classification, the rules fallback and the cost-ledger rows. No test needs a key or
 the network. The live check is a separate operator script, never collected by
 pytest: `python scripts/smoke_live.py` runs one tiny capped run (`max_cost_usd` ≤
-0.05) against the real API. See the
+0.05) against the real API and passes only on a clean outcome (`success` /
+`partial_success`, or an exhausted `no_matches` with no provider errors; no
+unrecovered failed call, error-coded action, judge `invalid_output`, unexpected rules
+fallback, open reservation, overspend or ledger violation). `python
+scripts/verify_ci_status.py` prints the GitHub Actions result for a commit. See the
 [production readiness checklist](docs/production-readiness.md) for the full
-deploy sequence.
+deploy sequence and sign-off steps.
 
 Migration paths are checked with the real CLI against throwaway databases (the
 `DB_USER` needs `CREATEDB`):

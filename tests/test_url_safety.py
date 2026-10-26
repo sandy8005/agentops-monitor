@@ -42,7 +42,8 @@ def test_non_string_url_is_no_url(u):
 @pytest.mark.parametrize("u", [
     "https://example.com/jobs/1",
     "http://example.com:8080/jobs?id=2",
-    "https://[2001:db8::1]/jobs/3",
+    # (IP-literal hosts such as https://[2001:db8::1]/ are rejected since round 5,
+    # backlog C: see test_apply_url_deception.py)
     "  https://ats.example.org/Job/9  ",
 ])
 def test_valid_urls_kept(u):

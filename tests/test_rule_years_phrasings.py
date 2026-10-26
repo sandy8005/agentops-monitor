@@ -38,7 +38,22 @@ CASES = [
     ("We need someone with 3-5 years of experience.", 3.0),
     ("3+ years Python experience required, while 5+ years Java experience preferred.", 3.0),
     ("We need 3-5 years of experience; ideally 7 years.", 3.0),
+    # --- round 5 (A): a preferred/soft word scoped to what it modifies ---
+    ("3+ years experience (5+ preferred).", 3.0),
+    ("We are looking for an engineer with 3+ years of experience who would ideally also have Go.", 3.0),
+    ("3+ years of experience (5+ years preferred).", 3.0),
+    ("3+ years required (5+ preferred).", 3.0),
+    ("4+ years of experience (six preferred), Python required.", 4.0),
+    ("3+ years of experience, ideally with Kubernetes.", 3.0),
+    ("2+ years of experience with Python, preferably in a startup.", 2.0),
+    ("Candidates with 5 years of experience who ideally know Rust.", 5.0),
+    ("You bring 3+ years of experience and would preferably have used Terraform.", 3.0),
     # --- controls: must stay 0 ---
+    ("5+ years of experience (preferred).", 0.0),
+    ("Python (3+ years preferred).", 0.0),
+    ("Ideally 3+ years of experience with Go.", 0.0),
+    ("5 years of experience, ideally.", 0.0),
+    ("Preferably 4 years of experience in fintech.", 0.0),
     ("5 years of experience preferred.", 0.0),
     ("Five years of experience is a plus.", 0.0),
     ("Ideally 5 years of experience.", 0.0),
@@ -69,6 +84,8 @@ def test_table_is_large_enough():
 
 
 @pytest.mark.parametrize("text", [
+    "3+ years experience (5+ preferred).",
+    "We are looking for an engineer with 3+ years of experience who would ideally also have Go.",
     "At least three (3) years of experience.",
     "You have 3 or more years of experience",
     "We need someone with 3-5 years of experience, ideally 5.",

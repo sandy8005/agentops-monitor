@@ -80,9 +80,9 @@ class FixedConstraints(BaseModel):
     # Explicit relaxation of work_mode: a remote/onsite search also accepts HYBRID
     # postings. Off by default — work mode is otherwise matched exactly.
     allow_hybrid: bool = False
-    # A remote search keeps postings that state no work mode, labeled
-    # work_mode_verified = False. They count toward the goal only if the user
-    # explicitly accepts that (otherwise they are shown, not counted).
+    # A work-mode-constrained search (remote, onsite or hybrid) keeps postings that
+    # state no work mode, labeled work_mode_verified = False. They count toward the
+    # goal only if the user explicitly accepts that (otherwise shown, not counted).
     accept_unknown_work_mode: bool = False
     employment_type: Literal["", "full-time", "part-time", "contract", "internship"] = ""
     seniority: Seniority = ""
@@ -157,12 +157,19 @@ class AgentGoal(BaseModel):
 
 
 def require_verified_work_mode(goal: AgentGoal):
-    """True when only matches whose work mode is CONFIRMED count toward the goal:
-    a remote search, unless the user accepted unknown-mode postings. (Onsite /
-    hybrid searches keep counting unknown-mode postings: Adzuna rarely states a
-    mode and its search is location-based; they are still labeled unverified.)"""
+    """The stated work modes that CONFIRM a match when only confirmed matches count
+    toward the goal, else () (falsy). Every constrained mode (remote, onsite,
+    hybrid) requires confirmation unless the user accepted unknown-mode postings
+    (round 5, backlog E); allow_hybrid adds "hybrid" for a remote/onsite search.
+    Unknown-mode postings are still evaluated, shown and labeled unverified.
+    agent_store.qualified_job_ids uses the modes for legacy step contexts that
+    carry no work_mode_verified flag."""
     c = goal.constraints
-    return c.work_mode == "remote" and not c.accept_unknown_work_mode
+    if not c.work_mode or c.accept_unknown_work_mode:
+        return ()
+    if c.allow_hybrid and c.work_mode in ("remote", "onsite"):
+        return (c.work_mode, "hybrid")
+    return (c.work_mode,)
 
 
 def validate_search_query(query, goal: AgentGoal):

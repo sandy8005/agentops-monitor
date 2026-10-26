@@ -576,20 +576,26 @@ def qualified_job_ids(run_id, qualifying_decisions, verified_only=False,
     """BACKEND-VERIFIED progress: distinct jobs whose persisted AUTHORITATIVE final
     decision qualifies and which are not still awaiting a human review. With
     verified_only, matches that rest ONLY on rule-based requirement extraction (no
-    judge, no human) are excluded. With require_work_mode_verified, matches whose
-    posting states no work mode (work_mode_verified = false in the step context)
-    are excluded — shown, not counted; a context WITHOUT the flag counts only when
-    the stored posting states remote (fail closed). Raises on database errors — an unknown
-    count is never reported as zero (N07)."""
+    judge, no human) are excluded. With require_work_mode_verified (the stated
+    modes that confirm a match, agent_goal.require_verified_work_mode; a bare True
+    means ("remote",) for older callers), matches whose posting states no work
+    mode (work_mode_verified = false in the step context) are excluded — shown,
+    not counted; a context WITHOUT the flag counts only when the stored posting
+    states one of those modes (fail closed). Raises on database errors — an
+    unknown count is never reported as zero (N07)."""
     extra = f" AND NOT {_UNVERIFIED_SQL}" if verified_only else ""
+    params = [run_id, list(qualifying_decisions)]
     if require_work_mode_verified:
+        modes = (["remote"] if require_work_mode_verified is True
+                 else [str(m).lower() for m in require_work_mode_verified])
         # Fail closed: a context without the flag (older steps) counts only when
-        # the stored posting states remote; anything else is unverified.
+        # the stored posting states a confirming mode; anything else is unverified.
         extra += """ AND CASE WHEN retrieved_context->>'work_mode_verified' IS NOT NULL
                               THEN retrieved_context->>'work_mode_verified' = 'true'
                               ELSE EXISTS (SELECT 1 FROM job_postings p
                                            WHERE p.id::text = retrieved_context->>'job_id'
-                                             AND lower(btrim(p.work_mode)) = 'remote') END"""
+                                             AND lower(btrim(p.work_mode)) = ANY(%s)) END"""
+        params.append(modes)
     with get_connection() as conn:
         cur = conn.cursor()
         cur.execute(f"""
@@ -602,7 +608,7 @@ def qualified_job_ids(run_id, qualifying_decisions, verified_only=False,
               AND status = 'success'
               AND NOT (COALESCE(needs_human_review, FALSE) AND review_status IS NULL)
               {extra}
-        """, (run_id, list(qualifying_decisions)))
+        """, tuple(params))
         return sorted(r[0] for r in cur.fetchall())
 
 
@@ -708,7 +714,9 @@ def mark_review_consumed(review_id, generation, run_id):
 # ---------------------------------------------------------------------- output --
 
 def persist_rankings(run_id, generation, ranked):
-    """Replace the run's ranking in ONE fenced transaction; raises on failure (R03)."""
+    """Replace the run's ranking in ONE fenced transaction; raises on failure (R03).
+    apply_url is stored only when job_source.safe_http_url accepts it (backlog C)."""
+    from job_source import safe_http_url
     with get_connection() as conn:
         cur = conn.cursor()
         _check_generation(cur, run_id, generation, lock="FOR UPDATE")
@@ -721,7 +729,7 @@ def persist_rankings(run_id, generation, ranked):
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             """, (run_id, r.get("job_id"), pos, r.get("title"), r.get("company"),
                   r.get("score"), r.get("final_decision") or r.get("decision"),
-                  r.get("apply_url"), r.get("work_mode"),
+                  safe_http_url(r.get("apply_url")), r.get("work_mode"),
                   r.get("work_mode_verified") is True))   # missing -> unverified
 
 

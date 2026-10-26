@@ -569,8 +569,8 @@ class StartRunRequest(BaseModel):
     work_mode: WorkMode = ""
     # remote/onsite search: also accept hybrid postings (explicit; default strict)
     allow_hybrid: bool = False
-    # remote search: let postings that state NO work mode count toward the goal
-    # (they are always labeled work_mode_verified=false; default: shown, not counted)
+    # remote/onsite/hybrid search: let postings that state NO work mode count toward
+    # the goal (always labeled work_mode_verified=false; default: shown, not counted)
     accept_unknown_work_mode: bool = False
     employment_type: EmploymentType = ""
     evaluate: bool = False
@@ -611,7 +611,7 @@ def _build_agent_goal(body):
                          "allow_hybrid": bool(body.allow_hybrid and body.work_mode
                                               in ("remote", "onsite")),
                          "accept_unknown_work_mode": bool(body.accept_unknown_work_mode
-                                                          and body.work_mode == "remote"),
+                                                          and body.work_mode),
                          "employment_type": body.employment_type, "seniority": g.seniority},
             limits={"max_iterations": g.max_iterations, "max_searches": g.max_searches,
                     "max_llm_calls": g.max_llm_calls,
@@ -1094,7 +1094,7 @@ def get_run_rankings(run_id: int, user: dict = Depends(require_auth)):
         rankings.append({
             "rank": pos, "job_id": job_id, "title": title, "company": company,
             "score": float(score) if score is not None else None,
-            "final_decision": final_decision, "apply_url": _safe_url(apply_url),
+            "final_decision": final_decision, **_apply_link(apply_url),
             # false = the posting states no work mode: NOT a confirmed match of the
             # run's work-mode constraint (null = ranked before labels existed).
             "work_mode": wm, "work_mode_verified": wm_ok,
@@ -1149,6 +1149,15 @@ def _safe_url(url):
     bad scheme, host, IPv6 bracket or port means no link (job_source.safe_http_url)."""
     from job_source import safe_http_url
     return safe_http_url(url)
+
+
+def _apply_link(url):
+    """apply_url (job_source.safe_http_url: no userinfo, backslash, IP literal or
+    local host; IDN as punycode) plus its registered domain, which the dashboard
+    shows next to the link so the real destination is visible (backlog C)."""
+    from job_source import apply_url_domain
+    safe = _safe_url(url)
+    return {"apply_url": safe, "apply_domain": apply_url_domain(safe) if safe else None}
 
 
 @app.get("/runs/{run_id}/agent")

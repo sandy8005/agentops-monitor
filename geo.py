@@ -281,6 +281,23 @@ def resolve(text):
     return GeoScope(frozenset(countries), frozenset(regions), world, excluded)
 
 
+# An UPPERCASE two-letter place code after a separator: "Remote, OR", "Remote (NO)",
+# "Remote / CA". Lowercase "or"/"no" is a word, never a code.
+_PLACE_CODE_RE = re.compile(r"(?:[,(/|]|\s-)\s*([A-Z]{2})(?=\s*(?:[,;)/|]|$))")
+
+
+def blank_place_codes(text):
+    """`text` with each separated uppercase US state / country code ("Remote, OR"
+    is Oregon) replaced by spaces, so word-level checks do not read it as "or"/"no"."""
+    raw = str(text or "")
+    chars = list(raw)
+    for m in _PLACE_CODE_RE.finditer(raw):
+        code = m.group(1).lower()
+        if code in US_STATES or code in COUNTRIES:
+            chars[m.start(1):m.end(1)] = "  "
+    return "".join(chars)
+
+
 def _covers_country(posting, code):
     return code in posting.countries or bool(country_regions(code) & posting.regions)
 

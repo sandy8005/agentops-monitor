@@ -72,8 +72,8 @@ _SOFT_UPPER_RE = re.compile(
     r"\s*\+?\s*(?:(?:years?|yrs?)\b)?\s*\)?")
 # Sentence-level context that makes a "N years" mention NOT a minimum requirement.
 _YEARS_NOT_REQUIRED = re.compile(
-    r"\b(preferred|nice to have|nice-to-have|bonus|a plus|is a plus|ideally|desirable|"
-    r"advantageous|would be great)\b")
+    r"\b(preferred|nice to have|nice-to-have|bonus|a plus|is a plus|ideally|preferably|"
+    r"desirable|advantageous|would be great)\b")
 _YEARS_CONDITIONAL = re.compile(
     r"\b(for (the )?(manager|management|lead|leadership|senior|principal|staff)\b|"
     r"if applying|for this level)")
@@ -149,6 +149,37 @@ def _sentences_with_offsets(text):
     yield pos, text[pos:]
 
 
+_HAS_NUMBER_RE = re.compile(r"\d|\b" + _NUM)
+_PAREN_GROUP_RE = re.compile(r"\([^()]*\)")
+# A soft ADVERB modifies what FOLLOWS it ("ideally also have Go"), up to the end of
+# its clause; it needs at least one word after it to modify something else.
+_SOFT_ADVERB_AFTER_RE = re.compile(r"\b(?:ideally|preferably|optionally)\b(?=[^,;.()]*\w)[^,;.()]*")
+
+
+def _scope_to_mention(sentence, start, end):
+    """The sentence as seen by ONE "N years" mention (round 5, backlog A), with
+    offsets kept (blanked text becomes spaces):
+      * a parenthetical that contains another number and not this mention is
+        about THAT number: "3+ years experience (5+ preferred)" -> the 3 does
+        not inherit "preferred";
+      * "ideally/preferably/optionally" AFTER the mention modifies what follows
+        it, not the years: "3+ years of experience who would ideally also have
+        Go" keeps the 3. A trailing bare "..., ideally." still applies.
+    A parenthetical without a number ("5+ years (preferred)") and a soft word
+    BEFORE the mention ("Ideally 5 years") are left alone, so they still mark it."""
+    chars = list(sentence)
+
+    def blank(a, b):
+        chars[a:b] = " " * (b - a)
+
+    for g in _PAREN_GROUP_RE.finditer(sentence):
+        if (g.end() <= start or g.start() >= end) and _HAS_NUMBER_RE.search(g.group(0)):
+            blank(g.start(), g.end())
+    for adv in _SOFT_ADVERB_AFTER_RE.finditer(sentence, end):
+        blank(adv.start(), adv.end())
+    return "".join(chars)
+
+
 def _years_mention_is_preferred(sentence, start, end, section):
     """Classify ONE "N years" mention by its own clause first (backlog C), so
     "3+ years Python required, while 5+ years Java preferred" keeps the 3:
@@ -210,6 +241,7 @@ def years_requirement_mentions(text_lower):
                 kw = list(re.finditer(r"ideally|preferably", sentence[m.end():soft.start(1)]))
                 a, b = m.end() + kw[-1].start(), soft.end()
                 judged = sentence[:a] + " " * (b - a) + sentence[b:]
+            judged = _scope_to_mention(judged, m.start(), m.end())
             if _years_mention_is_preferred(judged, m.start(), m.end(), section):
                 continue
             is_overall = bool(_YEARS_OVERALL.search(_clause_around(sentence, m.start(), m.end())))

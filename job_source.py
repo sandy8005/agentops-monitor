@@ -331,6 +331,40 @@ def _is_tracking_param(key):
 
 
 _URL_BAD_HOST_CHARS = set('<>"\\^`{|}')
+# Hosts that never belong to a public employer/ATS (round 5, backlog C).
+_LOCAL_HOST_SUFFIXES = ("localhost", "local", "internal", "lan", "home.arpa")
+# A public TLD is letters only (or an IDN "xn--" label): this also rejects the
+# integer/hex/short IPv4 forms browsers accept ("2130706433", "0x7f.1", "127.1").
+_TLD_RE = re.compile(r"[a-z]{2,63}|xn--[a-z0-9-]{1,59}")
+# Second-level labels under which a country TLD registers names ("acme.co.uk").
+# An approximation without the public suffix list; only used for DISPLAY.
+_SECOND_LEVEL_LABELS = {"co", "com", "org", "net", "gov", "ac", "edu", "ne", "or", "go"}
+
+
+def _public_ascii_host(host):
+    """The host as lowercase ASCII (IDN -> punycode) when it is a public DNS name,
+    else None: IP literals, localhost/.local-style names, dotless names and labels
+    that IDNA rejects (bad punycode, underscores, edge hyphens) are not."""
+    import ipaddress
+    import idna
+    host = host.rstrip(".")
+    if not host or ":" in host or any(c in _URL_BAD_HOST_CHARS for c in host):
+        return None
+    try:
+        ipaddress.ip_address(host)
+        return None
+    except ValueError:
+        pass
+    try:
+        ascii_host = idna.encode(host, uts46=True).decode("ascii").lower()
+    except (idna.IDNAError, UnicodeError, ValueError):
+        return None
+    labels = ascii_host.split(".")
+    if len(labels) < 2 or not _TLD_RE.fullmatch(labels[-1]):
+        return None
+    if any(ascii_host == s or ascii_host.endswith("." + s) for s in _LOCAL_HOST_SUFFIXES):
+        return None
+    return ascii_host
 
 
 def safe_http_url(u):
@@ -340,12 +374,17 @@ def safe_http_url(u):
     characters anywhere, a non-http(s) scheme, an empty/malformed host, a bad IPv6
     bracket or an out-of-range port all mean "no URL". Used for dedupe identity,
     for the stored apply_url and for every URL the API returns.
+
+    Deceptive forms are also "no URL" (round 5, backlog C): userinfo
+    ("https://apply.example.com@evil.com/" really goes to evil.com), any backslash,
+    IP-literal hosts, localhost/.local-style and dotless hosts. An IDN host is
+    returned in its punycode form, so a lookalike is visible (apply_url_domain).
     """
-    from urllib.parse import urlsplit
+    from urllib.parse import urlsplit, urlunsplit
     if not isinstance(u, str):
         return None
     u = u.strip()
-    if not u or any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in u):
+    if not u or "\\" in u or any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in u):
         return None
     try:
         parts = urlsplit(u)
@@ -353,13 +392,31 @@ def safe_http_url(u):
         port = parts.port
     except ValueError:
         return None
-    if parts.scheme.lower() not in ("http", "https") or not host:
-        return None
-    if any(c in _URL_BAD_HOST_CHARS for c in host):
+    if parts.scheme.lower() not in ("http", "https") or not host or "@" in parts.netloc:
         return None
     if port is not None and not (1 <= port <= 65535):
         return None
+    ascii_host = _public_ascii_host(host)
+    if ascii_host is None:
+        return None
+    if not host.isascii():
+        netloc = ascii_host + (f":{port}" if port is not None else "")
+        u = urlunsplit((parts.scheme, netloc, parts.path, parts.query, parts.fragment))
     return u
+
+
+def apply_url_domain(u):
+    """The registered domain of a safe apply URL ("jobs.example.com" ->
+    "example.com", "careers.acme.co.uk" -> "acme.co.uk"), in ASCII/punycode, for
+    display next to the apply link; None when the URL is not safe."""
+    from urllib.parse import urlsplit
+    s = safe_http_url(u)
+    if s is None:
+        return None
+    labels = urlsplit(s).hostname.rstrip(".").split(".")
+    keep = 3 if (len(labels) >= 3 and len(labels[-1]) == 2
+                 and labels[-2] in _SECOND_LEVEL_LABELS) else 2
+    return ".".join(labels[-keep:])
 
 
 def _canonical_url(job):
@@ -554,15 +611,23 @@ def work_mode_status(job, work_mode, allow_hybrid=False):
 # "Remote - Europe", "US (Remote)", "Fully remote". Negated, hedged or mixed
 # wording ("Not remote", "Remote-friendly", "Remote possible", "Hybrid (remote 2
 # days)", "Remote or onsite") states no mode, so the posting stays "unknown".
-_LOC_REMOTE_RE = re.compile(r"\bremote\b")
+# Round 5 (backlog B): "Remote-first", "Remote-only", "100% remote", "Work from
+# home", "WFH", "Telecommute" are also plain remote, and an uppercase place code
+# ("Remote, OR" = Oregon, "Remote, NO" = Norway) is blanked via geo.py before the
+# doubt check, so it is not read as the word "or"/"no". "Worldwide"/"Anywhere"
+# alone are a geographic SCOPE, not a work mode: unknown unless the posting's own
+# work_mode (or the location text) also says remote.
+_LOC_REMOTE_RE = re.compile(
+    r"\bremote\b|\bwork(?:ing)?[\s-]from[\s-]home\b|\bwfh\b|\btelecommut\w*")
 _LOC_REMOTE_DOUBT_RE = re.compile(
     r"\b(?:not|non|no|without|hybrid|on-?site|in[- ]office|office|partial(?:ly)?|"
     r"possible|optional|option|friendly|flexible|occasional(?:ly)?|negotiable|"
-    r"considered|available|may|some|or)\b|remote-")
+    r"considered|available|may|some|or)\b|remote-(?!(?:first|only)\b)")
 
 
 def _location_says_remote(location):
-    loc = (location or "").lower()
+    from geo import blank_place_codes
+    loc = blank_place_codes(location).lower()
     return bool(_LOC_REMOTE_RE.search(loc)) and not _LOC_REMOTE_DOUBT_RE.search(loc)
 
 

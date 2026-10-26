@@ -120,12 +120,39 @@ var NL = String.fromCharCode(10);
 
     // Only http(s) URLs become links. A provider URL with any other scheme
     // (javascript:, data:, ...) or that does not parse is not rendered at all.
+    // Same rules as job_source.safe_http_url: no userinfo ("apply.example.com@evil.com"),
+    // no backslash, no IP-literal, localhost/.local-style or dotless host.
+    var LOCAL_HOST_SUFFIXES = ['localhost', 'local', 'internal', 'lan', 'home.arpa'];
     function safeHttpUrl(u) {
-      if (typeof u !== 'string' || !u) return null;
+      if (typeof u !== 'string' || !u || u.indexOf('\\') !== -1 || /[\s\x00-\x1f\x7f]/.test(u)) return null;
       try {
         var parsed = new URL(u);
-        return (parsed.protocol === 'http:' || parsed.protocol === 'https:') ? parsed.href : null;
+        if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') return null;
+        if (parsed.username || parsed.password || /^[^\/]*\/\/[^\/?#]*@/.test(u)) return null;
+        // The URL parser gives IDN hosts in punycode and IPv4 forms as dotted digits.
+        var host = parsed.hostname.toLowerCase().replace(/\.$/, '');
+        if (!host || host.indexOf('[') !== -1 || host.indexOf(':') !== -1) return null;
+        var labels = host.split('.');
+        if (labels.length < 2) return null;
+        if (!/^(?:[a-z]{2,63}|xn--[a-z0-9-]{1,59})$/.test(labels[labels.length - 1])) return null;
+        for (var i = 0; i < LOCAL_HOST_SUFFIXES.length; i++) {
+          var s = LOCAL_HOST_SUFFIXES[i];
+          if (host === s || host.slice(-(s.length + 1)) === '.' + s) return null;
+        }
+        return parsed.href;
       } catch (e) { return null; }
+    }
+
+    // The registered domain of a safe link (job_source.apply_url_domain), shown next
+    // to "apply" so the real destination (and a punycode lookalike) is visible.
+    var SECOND_LEVEL_LABELS = ['co', 'com', 'org', 'net', 'gov', 'ac', 'edu', 'ne', 'or', 'go'];
+    function linkDomain(href) {
+      try {
+        var labels = new URL(href).hostname.toLowerCase().replace(/\.$/, '').split('.');
+        var keep = (labels.length >= 3 && labels[labels.length - 1].length === 2 &&
+                    SECOND_LEVEL_LABELS.indexOf(labels[labels.length - 2]) !== -1) ? 3 : 2;
+        return labels.slice(-keep).join('.');
+      } catch (e) { return ''; }
     }
 
     async function uploadResume() {
@@ -190,7 +217,7 @@ var NL = String.fromCharCode(10);
               // only for the modes the API honours them for.
               '<div style="margin-top:6px;">' +
                 '<label style="color:#e4e6eb;"><input type="checkbox" id="hybrid_' + escapeHtml(r.id) + '" disabled style="width:auto;margin-right:6px;">Also accept hybrid postings (remote or onsite searches)</label><br>' +
-                '<label style="color:#e4e6eb;"><input type="checkbox" id="unknownwm_' + escapeHtml(r.id) + '" disabled style="width:auto;margin-right:6px;">Count postings with unknown work mode toward the goal (remote searches; always labeled "work mode unverified")</label>' +
+                '<label style="color:#e4e6eb;"><input type="checkbox" id="unknownwm_' + escapeHtml(r.id) + '" disabled style="width:auto;margin-right:6px;">Count postings that state no work mode toward the goal (any work-mode search; otherwise they are shown, not counted, and always labeled "work mode unverified")</label>' +
               '</div>' +
               '<div style="margin-top:8px;">' +
                 '<label style="color:#e4e6eb;"><input type="checkbox" id="eval_' + r.id + '" style="width:auto;margin-right:6px;">Evaluate judged decisions with an LLM (extra API calls)</label>' +
@@ -240,7 +267,7 @@ var NL = String.fromCharCode(10);
                         // Sent only for the modes they apply to (the API ignores them
                         // otherwise; this keeps the request honest about what was asked).
                         allow_hybrid: !!(hybridEl && hybridEl.checked && (mode === 'remote' || mode === 'onsite')),
-                        accept_unknown_work_mode: !!(unknownEl && unknownEl.checked && mode === 'remote'),
+                        accept_unknown_work_mode: !!(unknownEl && unknownEl.checked && mode !== ''),
                         model_policy: document.getElementById('policy_' + id).value };
       // Every run uses the controller agent (the only execution engine).
       const costRaw = Number(document.getElementById('cost_' + id).value);
@@ -264,13 +291,13 @@ var NL = String.fromCharCode(10);
     }
 
     // "Also accept hybrid" applies to remote/onsite searches only; "count unknown
-    // work mode" to remote searches only (api.py _build_agent_goal). A checkbox that
+    // work mode" to any work-mode search (api.py _build_agent_goal). A checkbox that
     // does not apply is disabled AND unchecked, so it can't be sent by accident.
     function updateWorkModeOpts(id) {
       var sel = document.getElementById('mode_' + id);
       if (!sel) return;
       var mode = sel.value;
-      [['hybrid_', mode === 'remote' || mode === 'onsite'], ['unknownwm_', mode === 'remote']]
+      [['hybrid_', mode === 'remote' || mode === 'onsite'], ['unknownwm_', mode !== '']]
         .forEach(function(p) {
           var cb = document.getElementById(p[0] + id);
           if (!cb) return;
@@ -363,7 +390,9 @@ var NL = String.fromCharCode(10);
         // only an http(s) URL becomes a link; anything else shows no link at all.
         var applyHref = safeHttpUrl(r.apply_url);
         if (applyHref) {
-          html += ' <a href="' + escapeHtml(applyHref) + '" target="_blank" rel="noopener noreferrer">apply &#8599;</a>';
+          // The domain comes from the href itself, so it always names the real destination.
+          html += ' <a href="' + escapeHtml(applyHref) + '" target="_blank" rel="noopener noreferrer">apply &#8599;</a>' +
+            ' <span class="note" title="registered domain of the apply link">' + escapeHtml(linkDomain(applyHref)) + '</span>';
         }
         if (r.advice_requirements === 'reconstructed') {
           // Advice for a run evaluated before requirement snapshots existed.
